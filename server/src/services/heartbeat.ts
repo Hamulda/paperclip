@@ -85,6 +85,7 @@ const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT = 2;
+const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX = 8;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -522,6 +523,12 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
   if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
+}
+
+function normalizeMaxConcurrentHotCodingRuns(value: unknown) {
+  const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT));
+  if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT;
+  return Math.max(1, Math.min(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX, parsed));
 }
 
 async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
@@ -2599,6 +2606,7 @@ export function heartbeatService(db: Db) {
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      maxHotCodingRuns: normalizeMaxConcurrentHotCodingRuns(heartbeat.maxHotCodingRuns),
     };
   }
 
@@ -3219,9 +3227,9 @@ export function heartbeatService(db: Db) {
       const agentIsHotCoding = isTrackedLocalChildProcessAdapter(agent.adapterType);
       let runningHotCodingCount = agentIsHotCoding ? await countRunningHotCodingRuns() : 0;
       for (const queuedRun of queuedRuns) {
-        if (agentIsHotCoding && runningHotCodingCount >= HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT) {
+        if (agentIsHotCoding && runningHotCodingCount >= policy.maxHotCodingRuns) {
           logger.info(
-            { agentId, adapterType: agent.adapterType, runId: queuedRun.id, runningHotCodingCount },
+            { agentId, adapterType: agent.adapterType, runId: queuedRun.id, runningHotCodingCount, maxHotCodingRuns: policy.maxHotCodingRuns },
             "heartbeat run deferred: hot coding concurrency limit reached",
           );
           continue;
