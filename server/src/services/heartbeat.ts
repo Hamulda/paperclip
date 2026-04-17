@@ -11,6 +11,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   companySkills as companySkillsTable,
+  fileClaims,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -27,6 +28,8 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { buildSwarmDigest, formatSwarmDigestForPrompt, buildHandoffComment } from "./swarm-digest.js";
+import { acquireClaims, releaseClaims, listConflicts } from "./file-claims.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -81,6 +84,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT = 2;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -2606,6 +2610,20 @@ export function heartbeatService(db: Db) {
     return Number(count ?? 0);
   }
 
+  async function countRunningHotCodingRuns() {
+    const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
+    if (hotCodingTypes.length === 0) return 0;
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(heartbeatRuns.status, "running"),
+        inArray(agents.adapterType, hotCodingTypes),
+      ));
+    return Number(count ?? 0);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -3198,9 +3216,21 @@ export function heartbeatService(db: Db) {
       if (queuedRuns.length === 0) return [];
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      const agentIsHotCoding = isTrackedLocalChildProcessAdapter(agent.adapterType);
+      let runningHotCodingCount = agentIsHotCoding ? await countRunningHotCodingRuns() : 0;
       for (const queuedRun of queuedRuns) {
+        if (agentIsHotCoding && runningHotCodingCount >= HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT) {
+          logger.info(
+            { agentId, adapterType: agent.adapterType, runId: queuedRun.id, runningHotCodingCount },
+            "heartbeat run deferred: hot coding concurrency limit reached",
+          );
+          continue;
+        }
         const claimed = await claimQueuedRun(queuedRun);
-        if (claimed) claimedRuns.push(claimed);
+        if (claimed) {
+          claimedRuns.push(claimed);
+          if (agentIsHotCoding) runningHotCodingCount++;
+        }
       }
       if (claimedRuns.length === 0) return [];
 
@@ -3627,9 +3657,9 @@ export function heartbeatService(db: Db) {
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     const runtimeServiceIntents = (() => {
-      const runtimeConfig = parseObject(resolvedConfig.workspaceRuntime);
-      return Array.isArray(runtimeConfig.services)
-        ? runtimeConfig.services.filter(
+      const runtimeServicesConfig = parseObject(runtimeConfig.workspaceRuntime);
+      return Array.isArray(runtimeServicesConfig.services)
+        ? runtimeServicesConfig.services.filter(
             (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
           )
         : [];
@@ -3806,7 +3836,7 @@ export function heartbeatService(db: Db) {
         issue: issueRef,
         workspace: executionWorkspace,
         executionWorkspaceId: persistedExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
-        config: effectiveResolvedConfig,
+        config: runtimeConfig,
         adapterEnv,
         onLog,
       });
@@ -3853,6 +3883,59 @@ export function heartbeatService(db: Db) {
           payload: meta as unknown as Record<string, unknown>,
         });
       };
+
+      // Build swarm digest for collaborator awareness
+      const swarmDigest = await buildSwarmDigest(db, {
+        companyId: agent.companyId,
+        projectId: resolvedProjectId,
+        currentRunId: run.id,
+        currentAgentId: agent.id,
+      });
+      context.paperclipSwarmDigest = swarmDigest;
+      context.paperclipSwarmDigestFormatted = formatSwarmDigestForPrompt(swarmDigest);
+
+      // Acquire file/directory claims for this run
+      const fileClaimsInput = parseObject(context.fileClaims);
+      if (Array.isArray(fileClaimsInput) && fileClaimsInput.length > 0) {
+        const claimsToAcquire = fileClaimsInput
+          .filter((c): c is { claimType: string; claimPath: string } =>
+            typeof c === "object" && c !== null &&
+            typeof c.claimType === "string" && ["file", "directory", "glob"].includes(c.claimType) &&
+            typeof c.claimPath === "string" && c.claimPath.length > 0,
+          )
+          .map((c) => ({ claimType: c.claimType as "file" | "directory" | "glob", claimPath: c.claimPath }));
+
+        if (claimsToAcquire.length > 0) {
+          const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes default
+          const { acquired, conflicts } = await acquireClaims(db, {
+            companyId: run.companyId,
+            projectId: resolvedProjectId,
+            issueId: issueId ?? null,
+            agentId: agent.id,
+            runId: run.id,
+            claims: claimsToAcquire,
+            expiresAt,
+          });
+
+          // Store acquired claims in context for later refresh/release
+          context.paperclipFileClaims = acquired.map((c) => c.id);
+
+          // Add conflict warnings to swarm digest if any
+          if (conflicts.length > 0) {
+            const conflictWarnings = conflicts.map((c) => ({
+              claimPath: c.claimPath,
+              claimType: c.claimType,
+              conflictingAgentId: c.agentId,
+              conflictingRunId: c.runId,
+            }));
+            context.paperclipFileClaimWarnings = conflictWarnings;
+            await onLog(
+              "stderr",
+              `[paperclip] File claim conflicts detected: ${conflictWarnings.length} overlapping claims from other agents\n`,
+            );
+          }
+        }
+      }
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
@@ -4097,6 +4180,27 @@ export function heartbeatService(db: Db) {
               lastRunId: finalizedRun.id,
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
             });
+
+            // Emit structured handoff comment for non-terminal task state
+            if (outcome === "succeeded" && issueId) {
+              const handoffData = persistedResultJson as Record<string, unknown> | null;
+              const existingHandoff = await findRunIssueComment(finalizedRun.id, finalizedRun.companyId, issueId);
+              if (!existingHandoff) {
+                const handoffComment = buildHandoffComment({
+                  agentId: agent.id,
+                  agentName: agent.name,
+                  runId: finalizedRun.id,
+                  issueId,
+                  summary: typeof handoffData?.summary === "string" ? handoffData.summary : "",
+                  filesTouched: Array.isArray(handoffData?.filesTouched) ? handoffData.filesTouched as string[] : [],
+                  currentState: typeof handoffData?.currentState === "string" ? handoffData.currentState : "",
+                  remainingWork: Array.isArray(handoffData?.remainingWork) ? handoffData.remainingWork as string[] : [],
+                  blockers: Array.isArray(handoffData?.blockers) ? handoffData.blockers as string[] : [],
+                  recommendedNextStep: typeof handoffData?.recommendedNextStep === "string" ? handoffData.recommendedNextStep as string : "",
+                });
+                await issuesSvc.addComment(issueId, handoffComment, { agentId: agent.id, runId: finalizedRun.id });
+              }
+            }
           }
         }
       }
@@ -4202,6 +4306,12 @@ export function heartbeatService(db: Db) {
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
         } finally {
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // Release file/directory claims for this run
+          await releaseClaims(db, {
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+          }).catch((err) => logger.warn({ err, runId: run.id }, "failed to release file claims"));
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }

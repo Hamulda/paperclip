@@ -167,4 +167,57 @@ describe("execution workspace policy helpers", () => {
       ),
     ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
   });
+
+  it("parses project policy with workspaceRuntime services", () => {
+    const parsed = parseProjectExecutionWorkspacePolicy({
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceRuntime: {
+        services: [
+          { name: "web", command: "pnpm dev", cwd: "/app" },
+          { name: "api", command: "python -m http.server 8080" },
+        ],
+      },
+    });
+    expect(parsed.workspaceRuntime).toEqual({
+      services: [
+        { name: "web", command: "pnpm dev", cwd: "/app" },
+        { name: "api", command: "python -m http.server 8080" },
+      ],
+    });
+  });
+
+  it("builds execution workspace adapter config with workspaceRuntime from project policy", () => {
+    const projectPolicy = {
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceRuntime: {
+        services: [{ name: "web", command: "pnpm dev" }],
+      },
+    };
+    const result = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: { workspaceStrategy: { type: "project_primary" } },
+      projectPolicy,
+      issueSettings: null,
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(result.workspaceRuntime).toEqual({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+  });
+
+  it("clears workspaceRuntime when switching to agent_default", () => {
+    const result = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {
+        workspaceStrategy: { type: "git_worktree" },
+        workspaceRuntime: { services: [{ name: "web" }] },
+      },
+      projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+      issueSettings: { mode: "agent_default" },
+      mode: "agent_default",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(result.workspaceRuntime).toBeUndefined();
+  });
 });

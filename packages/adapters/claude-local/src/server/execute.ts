@@ -411,10 +411,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const swarmDigestFormatted = asString(context.paperclipSwarmDigestFormatted, "").trim();
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    swarmDigestFormatted,
     renderedPrompt,
   ]);
   const promptMetrics = {
@@ -422,6 +424,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    swarmDigestChars: swarmDigestFormatted.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
 
