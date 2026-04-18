@@ -71,21 +71,26 @@ export async function acquireClaims(
 ): Promise<{ acquired: FileClaim[]; conflicts: ClaimWithConflict[] }> {
   const { companyId, projectId, issueId, agentId, runId, claims, expiresAt } = input;
 
-  const acquired: FileClaim[] = [];
+  const now = new Date();
   const conflicts: ClaimWithConflict[] = [];
 
-  for (const claim of claims) {
-    const existingClaims = await db
-      .select()
-      .from(fileClaims)
-      .where(
-        and(
-          eq(fileClaims.companyId, companyId),
-          eq(fileClaims.status, "active"),
-          lte(fileClaims.expiresAt, expiresAt),
-        ),
-      );
+  // Single query: fetch all active, non-expired claims for this company
+  const existingClaims = await db
+    .select()
+    .from(fileClaims)
+    .where(
+      and(
+        eq(fileClaims.companyId, companyId),
+        eq(fileClaims.status, "active"),
+        gte(fileClaims.expiresAt, now),
+      ),
+    );
 
+  // Separate claims into conflicting and non-conflicting upfront
+  const conflictClaimInputs: ClaimInput[] = [];
+  const nonConflictClaimInputs: ClaimInput[] = [];
+
+  for (const claim of claims) {
     const overlapping = existingClaims.filter(
       (c) =>
         c.agentId !== agentId &&
@@ -93,43 +98,58 @@ export async function acquireClaims(
     );
 
     if (overlapping.length > 0) {
-      const [newClaim] = await db
-        .insert(fileClaims)
-        .values({
-          companyId,
-          projectId: projectId ?? null,
-          issueId: issueId ?? null,
-          agentId,
-          runId,
-          claimType: claim.claimType,
-          claimPath: claim.claimPath,
-          status: "active",
-          expiresAt,
-        })
-        .returning();
-
-      if (newClaim) {
-        conflicts.push({ ...newClaim, conflictingClaims: overlapping });
-      }
+      conflictClaimInputs.push(claim);
     } else {
-      const [newClaim] = await db
-        .insert(fileClaims)
-        .values({
-          companyId,
-          projectId: projectId ?? null,
-          issueId: issueId ?? null,
-          agentId,
-          runId,
-          claimType: claim.claimType,
-          claimPath: claim.claimPath,
-          status: "active",
-          expiresAt,
-        })
-        .returning();
+      nonConflictClaimInputs.push(claim);
+    }
+  }
 
-      if (newClaim) {
-        acquired.push(newClaim);
-      }
+  // Batch insert all non-conflicting claims in a single query
+  let acquired: FileClaim[] = [];
+  if (nonConflictClaimInputs.length > 0) {
+    const values = nonConflictClaimInputs.map((claim) => ({
+      companyId,
+      projectId: projectId ?? null,
+      issueId: issueId ?? null,
+      agentId,
+      runId,
+      claimType: claim.claimType,
+      claimPath: claim.claimPath,
+      status: "active" as const,
+      expiresAt,
+    }));
+
+    acquired = await db
+      .insert(fileClaims)
+      .values(values)
+      .returning();
+  }
+
+  // Insert conflicting claims individually and track their overlaps
+  for (const claim of conflictClaimInputs) {
+    const overlapping = existingClaims.filter(
+      (c) =>
+        c.agentId !== agentId &&
+        pathsOverlap(claim.claimPath, claim.claimType, c.claimPath, c.claimType as ClaimType),
+    );
+
+    const [newClaim] = await db
+      .insert(fileClaims)
+      .values({
+        companyId,
+        projectId: projectId ?? null,
+        issueId: issueId ?? null,
+        agentId,
+        runId,
+        claimType: claim.claimType,
+        claimPath: claim.claimPath,
+        status: "active",
+        expiresAt,
+      })
+      .returning();
+
+    if (newClaim) {
+      conflicts.push({ ...newClaim, conflictingClaims: overlapping });
     }
   }
 
@@ -209,10 +229,12 @@ export async function listConflicts(
   input: ListConflictsInput,
 ): Promise<ClaimWithConflict[]> {
   const { companyId, projectId, paths, excludeAgentId, excludeRunId } = input;
+  const now = new Date();
 
   const conditions = [
     eq(fileClaims.companyId, companyId),
     eq(fileClaims.status, "active"),
+    gte(fileClaims.expiresAt, now),
   ];
 
   if (projectId) {
@@ -232,24 +254,33 @@ export async function listConflicts(
     .from(fileClaims)
     .where(and(...conditions));
 
-  const conflicts: ClaimWithConflict[] = [];
+  // Use Map to avoid duplicate entries for the same claim
+  const conflictsMap = new Map<string, ClaimWithConflict>();
 
-  for (const claim of activeClaims) {
-    const conflicting = activeClaims.filter(
-      (c) =>
-        c.id !== claim.id &&
-        pathsOverlap(claim.claimPath, claim.claimType as ClaimType, c.claimPath, c.claimType as ClaimType),
+  for (const path of paths) {
+    // Find all active claims that overlap with this path
+    const claimsOnPath = activeClaims.filter(
+      (c) => pathsOverlap(c.claimPath, c.claimType as ClaimType, path, "file"),
     );
 
-    for (const path of paths) {
-      if (pathsOverlap(claim.claimPath, claim.claimType as ClaimType, path, "file")) {
-        conflicts.push({ ...claim, conflictingClaims: conflicting });
-        break;
+    // For each claim, find OTHER claims on the same path from different runs
+    for (const claim of claimsOnPath) {
+      const conflicting = claimsOnPath.filter(
+        (c) =>
+          c.id !== claim.id &&
+          c.runId !== claim.runId &&
+          pathsOverlap(claim.claimPath, claim.claimType as ClaimType, c.claimPath, c.claimType as ClaimType),
+      );
+
+      if (conflicting.length > 0) {
+        if (!conflictsMap.has(claim.id)) {
+          conflictsMap.set(claim.id, { ...claim, conflictingClaims: conflicting });
+        }
       }
     }
   }
 
-  return conflicts;
+  return Array.from(conflictsMap.values());
 }
 
 export async function expireOldClaims(db: Db, companyId: string): Promise<number> {
@@ -274,15 +305,20 @@ export async function getActiveClaimsForRun(
   db: Db,
   companyId: string,
   runId: string,
+  projectId?: string | null,
 ): Promise<FileClaim[]> {
+  const conditions = [
+    eq(fileClaims.companyId, companyId),
+    eq(fileClaims.runId, runId),
+    eq(fileClaims.status, "active"),
+  ];
+
+  if (projectId) {
+    conditions.push(eq(fileClaims.projectId, projectId));
+  }
+
   return db
     .select()
     .from(fileClaims)
-    .where(
-      and(
-        eq(fileClaims.companyId, companyId),
-        eq(fileClaims.runId, runId),
-        eq(fileClaims.status, "active"),
-      ),
-    );
+    .where(and(...conditions));
 }

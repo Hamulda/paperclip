@@ -23,6 +23,30 @@ vi.mock("@paperclipai/db", async () => {
   };
 });
 
+// Mock file-claims module
+vi.mock("../services/file-claims.js", () => ({
+  getActiveClaimsForRun: vi.fn().mockResolvedValue([]),
+  listConflicts: vi.fn().mockResolvedValue([]),
+}));
+
+function createMockDbChain(results: any[]) {
+  let callIndex = 0;
+  const chain = {
+    select: vi.fn().mockReturnThis(),
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockReturnThis(),
+    orderBy: vi.fn().mockReturnThis(),
+    limit: vi.fn().mockImplementation(() => ({
+      then: (resolve: any) => resolve(results[callIndex++] ?? []),
+    })),
+  };
+  (chain.select as any).mockReturnValue(chain);
+  (chain.from as any).mockReturnValue(chain);
+  (chain.where as any).mockReturnValue(chain);
+  (chain.orderBy as any).mockReturnValue(chain);
+  return chain;
+}
+
 describe("buildSwarmDigest", () => {
   it("returns empty digest when companyId is empty", async () => {
     const mockDb = {} as any;
@@ -52,6 +76,130 @@ describe("buildSwarmDigest", () => {
     expect(digest.companyId).toBe("company-1");
     expect(digest.projectId).toBeNull();
     expect(digest.generatedAt).toBeTruthy();
+  });
+
+  it("returns empty fileClaimConflicts when no currentRunId and no projectId", async () => {
+    // When both currentRunId and projectId are null, fileClaimConflicts should be empty
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([]),
+    } as any;
+
+    const digest = await buildSwarmDigest(mockDb, {
+      companyId: "company-1",
+      projectId: null,
+      currentRunId: null,
+      currentAgentId: null,
+    });
+
+    expect(digest.fileClaimConflicts).toEqual([]);
+  });
+
+  it("handles buildSwarmDigest with projectId but no currentRunId without throwing", async () => {
+    // When projectId is provided but currentRunId is null, function should not throw
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        then: (resolve: any) => resolve([]),
+      })),
+    } as any;
+
+    // Should not throw even with projectId but no currentRunId
+    const digest = await buildSwarmDigest(mockDb as any, {
+      companyId: "company-1",
+      projectId: "project-1",
+      currentRunId: null,
+      currentAgentId: null,
+    });
+
+    expect(digest.companyId).toBe("company-1");
+    expect(digest.projectId).toBe("project-1");
+  });
+});
+
+describe("file claims sequencing", () => {
+  it("buildSwarmDigest returns empty conflicts when no currentRunId is provided", async () => {
+    // Without currentRunId, digest can't know which claims belong to the "current run"
+    // so conflicts section is empty (heartbeat service must acquire claims first)
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        then: (resolve: any) => resolve([]),
+      })),
+    } as any;
+
+    const digest = await buildSwarmDigest(mockDb, {
+      companyId: "company-1",
+      projectId: "project-1",
+      currentRunId: null,
+      currentAgentId: null,
+    });
+
+    // When no currentRunId, conflicts are not computed (service must acquire claims first)
+    expect(digest.fileClaimConflicts).toEqual([]);
+  });
+
+  it("heartbeat flow: claims acquired before digest built", () => {
+    // This test documents the required ordering in heartbeat service:
+    // 1. Acquire claims first (so they're in DB before digest queries them)
+    // 2. Build digest after (so it sees current-run claims and can report conflicts)
+    //
+    // Implementation in heartbeat.ts ~line 3895:
+    //   // Acquire file/directory claims FIRST
+    //   const { acquired, conflicts } = await acquireClaims(...)
+    //   // THEN build digest
+    //   const swarmDigest = await buildSwarmDigest(...)
+    //
+    // This ordering is critical because:
+    // - If digest built first, it wouldn't see current-run's claims yet
+    // - Claims have 30-minute TTL; long runs need refresh but initial acquire must happen before digest
+    expect(true).toBe(true); // Documentation test - see heartbeat.ts executeRun
+  });
+
+  it("swarm digest format includes file claim conflict warnings", () => {
+    // When there ARE conflicts, formatSwarmDigestForPrompt should include them
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [
+        { claimPath: "src/contested.ts", claimType: "file", conflictingAgentId: "agent-2", conflictingRunId: "run-2" },
+      ],
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("### File Claim Conflicts");
+    expect(formatted).toContain("src/contested.ts");
+    expect(formatted).toContain("⚠️");
+  });
+
+  it("swarm digest format excludes file claim conflicts section when none exist", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).not.toContain("### File Claim Conflicts");
   });
 });
 

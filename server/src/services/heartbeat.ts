@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -29,7 +29,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { buildSwarmDigest, formatSwarmDigestForPrompt, buildHandoffComment } from "./swarm-digest.js";
-import { acquireClaims, releaseClaims, listConflicts } from "./file-claims.js";
+import { acquireClaims, refreshClaims, releaseClaims, listConflicts } from "./file-claims.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -43,6 +43,24 @@ import {
   HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
+import {
+  deriveTaskKey,
+  deriveTaskKeyWithHeartbeatFallback,
+  shouldResetTaskSessionForWake,
+  shouldRequireIssueCommentForWake,
+  enrichWakeContextSnapshot,
+  mergeCoalescedContextSnapshot,
+  buildPaperclipWakePayload,
+  extractWakeCommentIds,
+  shouldAutoCheckoutIssueForWake,
+  describeSessionResetReason,
+  WAKE_COMMENT_IDS_KEY,
+  PAPERCLIP_WAKE_PAYLOAD_KEY,
+  PAPERCLIP_HARNESS_CHECKOUT_KEY,
+  MAX_INLINE_WAKE_COMMENTS,
+  MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+  MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS,
+} from "./run-context-builder.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -82,21 +100,16 @@ import { extractSkillMentionIds } from "@paperclipai/shared";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
+
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT = 2;
 const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX = 8;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
-const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
-const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_INLINE_WAKE_COMMENTS = 8;
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -951,79 +964,6 @@ function parseIssueAssigneeAdapterOverrides(
   };
 }
 
-/**
- * Synthetic task key for timer/heartbeat wakes that have no issue context.
- * This allows timer wakes to participate in the `agentTaskSessions` system
- * and benefit from robust session resume, instead of relying solely on the
- * simpler `agentRuntimeState.sessionId` fallback.
- */
-const HEARTBEAT_TASK_KEY = "__heartbeat__";
-
-function deriveTaskKey(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown> | null | undefined,
-) {
-  return (
-    readNonEmptyString(contextSnapshot?.taskKey) ??
-    readNonEmptyString(contextSnapshot?.taskId) ??
-    readNonEmptyString(contextSnapshot?.issueId) ??
-    readNonEmptyString(payload?.taskKey) ??
-    readNonEmptyString(payload?.taskId) ??
-    readNonEmptyString(payload?.issueId) ??
-    null
-  );
-}
-
-/**
- * Extended task key derivation that falls back to a stable synthetic key
- * for timer/heartbeat wakes. This ensures timer wakes can resume their
- * previous session via `agentTaskSessions` instead of starting fresh.
- *
- * The synthetic key is only used when:
- * - No explicit task/issue key exists in the context
- * - The wake source is "timer" (scheduled heartbeat)
- */
-export function deriveTaskKeyWithHeartbeatFallback(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown> | null | undefined,
-) {
-  const explicit = deriveTaskKey(contextSnapshot, payload);
-  if (explicit) return explicit;
-
-  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return HEARTBEAT_TASK_KEY;
-
-  return null;
-}
-
-export function shouldResetTaskSessionForWake(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-) {
-  if (contextSnapshot?.forceFreshSession === true) return true;
-
-  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (
-    wakeReason === "issue_assigned" ||
-    wakeReason === "execution_review_requested" ||
-    wakeReason === "execution_approval_requested" ||
-    wakeReason === "execution_changes_requested"
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function shouldRequireIssueCommentForWake(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-) {
-  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  return (
-    wakeReason === "issue_assigned" ||
-    wakeReason === "execution_review_requested" ||
-    wakeReason === "execution_approval_requested" ||
-    wakeReason === "execution_changes_requested"
-  );
-}
 
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
   return {
@@ -1032,307 +972,8 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
   };
 }
 
-function describeSessionResetReason(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-) {
-  if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
-
-  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
-  if (wakeReason === "execution_review_requested") return "wake reason is execution_review_requested";
-  if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
-  if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
-  return null;
-}
-
-function shouldAutoCheckoutIssueForWake(input: {
-  contextSnapshot: Record<string, unknown> | null | undefined;
-  issueStatus: string | null;
-  issueAssigneeAgentId: string | null;
-  agentId: string;
-}) {
-  if (input.issueAssigneeAgentId !== input.agentId) return false;
-
-  const issueStatus = readNonEmptyString(input.issueStatus);
-  if (
-    issueStatus !== "todo" &&
-    issueStatus !== "backlog" &&
-    issueStatus !== "blocked" &&
-    issueStatus !== "in_progress"
-  ) {
-    return false;
-  }
-
-  const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
-  if (!wakeReason) return false;
-  if (wakeReason === "issue_comment_mentioned") return false;
-  if (wakeReason.startsWith("execution_")) return false;
-
-  return true;
-}
-
 function isCheckoutConflictError(error: unknown): boolean {
   return error instanceof HttpError && error.status === 409 && error.message === "Issue checkout conflict";
-}
-
-function deriveCommentId(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown> | null | undefined,
-) {
-  const batchedCommentId = extractWakeCommentIds(contextSnapshot).at(-1);
-  return (
-    batchedCommentId ??
-    readNonEmptyString(contextSnapshot?.wakeCommentId) ??
-    readNonEmptyString(contextSnapshot?.commentId) ??
-    readNonEmptyString(payload?.commentId) ??
-    null
-  );
-}
-
-export function extractWakeCommentIds(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-): string[] {
-  const raw = contextSnapshot?.[WAKE_COMMENT_IDS_KEY];
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  for (const entry of raw) {
-    const value = readNonEmptyString(entry);
-    if (!value || out.includes(value)) continue;
-    out.push(value);
-  }
-  return out;
-}
-
-function mergeWakeCommentIds(...values: Array<unknown>): string[] {
-  const merged: string[] = [];
-  const append = (value: unknown) => {
-    const normalized = readNonEmptyString(value);
-    if (!normalized || merged.includes(normalized)) return;
-    merged.push(normalized);
-  };
-
-  for (const value of values) {
-    if (Array.isArray(value)) {
-      for (const entry of value) append(entry);
-      continue;
-    }
-    if (typeof value === "object" && value !== null) {
-      const candidate = value as Record<string, unknown>;
-      const batched = extractWakeCommentIds(candidate);
-      if (batched.length > 0) {
-        for (const entry of batched) append(entry);
-        continue;
-      }
-      append(candidate.wakeCommentId);
-      append(candidate.commentId);
-      continue;
-    }
-    append(value);
-  }
-
-  return merged;
-}
-
-function enrichWakeContextSnapshot(input: {
-  contextSnapshot: Record<string, unknown>;
-  reason: string | null;
-  source: WakeupOptions["source"];
-  triggerDetail: WakeupOptions["triggerDetail"] | null;
-  payload: Record<string, unknown> | null;
-}) {
-  const { contextSnapshot, reason, source, triggerDetail, payload } = input;
-  const issueIdFromPayload = readNonEmptyString(payload?.["issueId"]);
-  const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
-  const taskKey = deriveTaskKey(contextSnapshot, payload);
-  const wakeCommentId = deriveCommentId(contextSnapshot, payload);
-  const wakeCommentIds = mergeWakeCommentIds(contextSnapshot, commentIdFromPayload);
-
-  if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
-    contextSnapshot.wakeReason = reason;
-  }
-  if (!readNonEmptyString(contextSnapshot["issueId"]) && issueIdFromPayload) {
-    contextSnapshot.issueId = issueIdFromPayload;
-  }
-  if (!readNonEmptyString(contextSnapshot["taskId"]) && issueIdFromPayload) {
-    contextSnapshot.taskId = issueIdFromPayload;
-  }
-  if (!readNonEmptyString(contextSnapshot["taskKey"]) && taskKey) {
-    contextSnapshot.taskKey = taskKey;
-  }
-  if (!readNonEmptyString(contextSnapshot["commentId"]) && commentIdFromPayload) {
-    contextSnapshot.commentId = commentIdFromPayload;
-  }
-  if (wakeCommentIds.length > 0) {
-    const latestCommentId = wakeCommentIds[wakeCommentIds.length - 1];
-    contextSnapshot[WAKE_COMMENT_IDS_KEY] = wakeCommentIds;
-    contextSnapshot.commentId = latestCommentId;
-    contextSnapshot.wakeCommentId = latestCommentId;
-    // Once comment ids are normalized into the snapshot, rebuild the structured
-    // wake payload from those ids later instead of carrying forward stale data.
-    delete contextSnapshot[PAPERCLIP_WAKE_PAYLOAD_KEY];
-  } else if (!readNonEmptyString(contextSnapshot["wakeCommentId"]) && wakeCommentId) {
-    contextSnapshot.wakeCommentId = wakeCommentId;
-  }
-  if (!readNonEmptyString(contextSnapshot["wakeSource"]) && source) {
-    contextSnapshot.wakeSource = source;
-  }
-  if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
-    contextSnapshot.wakeTriggerDetail = triggerDetail;
-  }
-
-  return {
-    contextSnapshot,
-    issueIdFromPayload,
-    commentIdFromPayload,
-    taskKey,
-    wakeCommentId,
-  };
-}
-
-export function mergeCoalescedContextSnapshot(
-  existingRaw: unknown,
-  incoming: Record<string, unknown>,
-) {
-  const existing = parseObject(existingRaw);
-  const merged: Record<string, unknown> = {
-    ...existing,
-    ...incoming,
-  };
-  const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
-  if (mergedCommentIds.length > 0) {
-    const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
-    merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
-    merged.commentId = latestCommentId;
-    merged.wakeCommentId = latestCommentId;
-    // The merged context should carry canonical comment ids; the next wake will
-    // regenerate any structured payload from those ids.
-    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
-  }
-  return merged;
-}
-
-async function buildPaperclipWakePayload(input: {
-  db: Db;
-  companyId: string;
-  contextSnapshot: Record<string, unknown>;
-  issueSummary?:
-    | {
-        id: string;
-        identifier: string | null;
-        title: string;
-        status: string;
-        priority: string;
-      }
-    | null;
-}) {
-  const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
-  const issueId = readNonEmptyString(input.contextSnapshot.issueId);
-  const issueSummary =
-    input.issueSummary ??
-    (issueId
-      ? await input.db
-          .select({
-            id: issues.id,
-            identifier: issues.identifier,
-            title: issues.title,
-            status: issues.status,
-            priority: issues.priority,
-          })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
-          .then((rows) => rows[0] ?? null)
-      : null);
-  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
-
-  const commentRows =
-    commentIds.length === 0
-      ? []
-      : await input.db
-          .select({
-            id: issueComments.id,
-            issueId: issueComments.issueId,
-            body: issueComments.body,
-            authorAgentId: issueComments.authorAgentId,
-            authorUserId: issueComments.authorUserId,
-            createdAt: issueComments.createdAt,
-          })
-          .from(issueComments)
-          .where(
-            and(
-              eq(issueComments.companyId, input.companyId),
-              inArray(issueComments.id, commentIds),
-            ),
-          );
-
-  const commentsById = new Map(commentRows.map((comment) => [comment.id, comment]));
-  const comments: Array<Record<string, unknown>> = [];
-  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
-  let truncated = false;
-  let missingCommentCount = 0;
-
-  for (const commentId of commentIds) {
-    const row = commentsById.get(commentId);
-    if (!row) {
-      truncated = true;
-      missingCommentCount += 1;
-      continue;
-    }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
-      truncated = true;
-      break;
-    }
-
-    const fullBody = row.body;
-    const allowedBodyChars = Math.min(MAX_INLINE_WAKE_COMMENT_BODY_CHARS, remainingBodyChars);
-    if (allowedBodyChars <= 0) {
-      truncated = true;
-      break;
-    }
-
-    const body = fullBody.length > allowedBodyChars ? fullBody.slice(0, allowedBodyChars) : fullBody;
-    const bodyTruncated = body.length < fullBody.length;
-    if (bodyTruncated) truncated = true;
-    remainingBodyChars -= body.length;
-
-    comments.push({
-      id: row.id,
-      issueId: row.issueId,
-      body,
-      bodyTruncated,
-      createdAt: row.createdAt.toISOString(),
-      author: row.authorAgentId
-        ? { type: "agent", id: row.authorAgentId }
-        : row.authorUserId
-          ? { type: "user", id: row.authorUserId }
-          : { type: "system", id: null },
-    });
-  }
-
-  return {
-    reason: readNonEmptyString(input.contextSnapshot.wakeReason),
-    issue: issueSummary
-      ? {
-          id: issueSummary.id,
-          identifier: issueSummary.identifier,
-          title: issueSummary.title,
-          status: issueSummary.status,
-          priority: issueSummary.priority,
-        }
-      : null,
-    checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
-    executionStage: Object.keys(executionStage).length > 0 ? executionStage : null,
-    commentIds,
-    latestCommentId: commentIds[commentIds.length - 1] ?? null,
-    comments,
-    commentWindow: {
-      requestedCount: commentIds.length,
-      includedCount: comments.length,
-      missingCount: missingCommentCount,
-    },
-    truncated,
-    fallbackFetchNeeded: truncated || missingCommentCount > 0,
-  };
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -2618,17 +2259,21 @@ export function heartbeatService(db: Db) {
     return Number(count ?? 0);
   }
 
-  async function countRunningHotCodingRuns() {
+  async function countRunningHotCodingRuns(companyId?: string) {
     const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
     if (hotCodingTypes.length === 0) return 0;
+    const conditions = [
+      eq(heartbeatRuns.status, "running"),
+      inArray(agents.adapterType, hotCodingTypes),
+    ];
+    if (companyId) {
+      conditions.push(eq(agents.companyId, companyId));
+    }
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(and(
-        eq(heartbeatRuns.status, "running"),
-        inArray(agents.adapterType, hotCodingTypes),
-      ));
+      .where(and(...conditions));
     return Number(count ?? 0);
   }
 
@@ -2760,6 +2405,64 @@ export function heartbeatService(db: Db) {
           outcome,
         },
       });
+    }
+  }
+
+  // Refresh file claims for active runs that are about to expire
+  // Claims are acquired with 30-minute TTL; we refresh when < 10 minutes remain
+  async function refreshExpiringClaims(now: Date) {
+    const REFRESH_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+    const BATCH_SIZE = 50;
+
+    try {
+      // Find all active claims expiring within the threshold
+      const expiringClaims = await db
+        .select({
+          id: fileClaims.id,
+          companyId: fileClaims.companyId,
+          agentId: fileClaims.agentId,
+          runId: fileClaims.runId,
+          expiresAt: fileClaims.expiresAt,
+        })
+        .from(fileClaims)
+        .where(
+          and(
+            eq(fileClaims.status, "active"),
+            lte(fileClaims.expiresAt, new Date(now.getTime() + REFRESH_THRESHOLD_MS)),
+            gt(fileClaims.expiresAt, now),
+          ),
+        )
+        .limit(BATCH_SIZE);
+
+      if (expiringClaims.length === 0) return;
+
+      // Group claims by company+agent+run
+      const byKey = new Map<string, { companyId: string; agentId: string; runId: string; claimIds: string[] }>();
+      for (const claim of expiringClaims) {
+        const key = `${claim.companyId}:${claim.agentId}:${claim.runId}`;
+        let entry = byKey.get(key);
+        if (!entry) {
+          entry = { companyId: claim.companyId ?? "", agentId: claim.agentId ?? "", runId: claim.runId ?? "", claimIds: [] };
+          byKey.set(key, entry);
+        }
+        entry.claimIds.push(claim.id);
+      }
+
+      // Refresh each group
+      const newExpiresAt = new Date(now.getTime() + 30 * 60 * 1000); // another 30 minutes
+      for (const entry of byKey.values()) {
+        if (!entry.claimIds.length) continue;
+        await refreshClaims(db, {
+          companyId: entry.companyId,
+          agentId: entry.agentId,
+          runId: entry.runId,
+          claimIds: entry.claimIds,
+          expiresAt: newExpiresAt,
+        });
+      }
+    } catch (err) {
+      // Non-critical: log and continue
+      logger.warn({ err }, "failed to refresh expiring file claims");
     }
   }
 
@@ -3225,7 +2928,7 @@ export function heartbeatService(db: Db) {
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       const agentIsHotCoding = isTrackedLocalChildProcessAdapter(agent.adapterType);
-      let runningHotCodingCount = agentIsHotCoding ? await countRunningHotCodingRuns() : 0;
+      let runningHotCodingCount = agentIsHotCoding ? await countRunningHotCodingRuns(agent.companyId) : 0;
       for (const queuedRun of queuedRuns) {
         if (agentIsHotCoding && runningHotCodingCount >= policy.maxHotCodingRuns) {
           logger.info(
@@ -3240,15 +2943,50 @@ export function heartbeatService(db: Db) {
           if (agentIsHotCoding) runningHotCodingCount++;
         }
       }
-      if (claimedRuns.length === 0) return [];
+      if (claimedRuns.length === 0) {
+        return [];
+      }
 
       for (const claimedRun of claimedRuns) {
         void executeRun(claimedRun.id).catch((err) => {
           logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
         });
       }
+      // Fairness sweep: even when this agent claimed runs, if it filled hot slots
+      // it didn't previously own (i.e. it expanded the running count beyond what it
+      // already had), give a queued hot run from another agent the chance to run
+      // in case this agent's slots are better used by queued work from elsewhere.
+      if (agentIsHotCoding) {
+        void tryPromoteNextHotCodingRun(agent.companyId, agentId).catch((err) =>
+          logger.warn({ err, agentId }, "fairness sweep failed"),
+        );
+      }
       return claimedRuns;
     });
+  }
+
+  async function tryPromoteNextHotCodingRun(companyId: string, excludeAgentId: string) {
+    const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
+    if (hotCodingTypes.length === 0) return;
+
+    // Find agents in the same company with queued hot runs, excluding the agent
+    // that just released a slot. Pick the one with the oldest queued run.
+    const candidateRows = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(heartbeatRuns.status, "queued"),
+        eq(agents.companyId, companyId),
+        ne(agents.id, excludeAgentId),
+        inArray(agents.adapterType, hotCodingTypes),
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(1);
+
+    if (candidateRows.length > 0) {
+      await startNextQueuedRunForAgent(candidateRows[0].agentId);
+    }
   }
 
   async function executeRun(runId: string) {
@@ -3892,17 +3630,7 @@ export function heartbeatService(db: Db) {
         });
       };
 
-      // Build swarm digest for collaborator awareness
-      const swarmDigest = await buildSwarmDigest(db, {
-        companyId: agent.companyId,
-        projectId: resolvedProjectId,
-        currentRunId: run.id,
-        currentAgentId: agent.id,
-      });
-      context.paperclipSwarmDigest = swarmDigest;
-      context.paperclipSwarmDigestFormatted = formatSwarmDigestForPrompt(swarmDigest);
-
-      // Acquire file/directory claims for this run
+      // Acquire file/directory claims for this run FIRST (before digest so digest reflects claim state)
       const fileClaimsInput = parseObject(context.fileClaims);
       if (Array.isArray(fileClaimsInput) && fileClaimsInput.length > 0) {
         const claimsToAcquire = fileClaimsInput
@@ -3928,7 +3656,7 @@ export function heartbeatService(db: Db) {
           // Store acquired claims in context for later refresh/release
           context.paperclipFileClaims = acquired.map((c) => c.id);
 
-          // Add conflict warnings to swarm digest if any
+          // Add conflict warnings to context (swarm digest rebuilt after this block will include them)
           if (conflicts.length > 0) {
             const conflictWarnings = conflicts.map((c) => ({
               claimPath: c.claimPath,
@@ -3944,6 +3672,16 @@ export function heartbeatService(db: Db) {
           }
         }
       }
+
+      // Build swarm digest for collaborator awareness (AFTER claims acquired so it reflects current claim state)
+      const swarmDigest = await buildSwarmDigest(db, {
+        companyId: agent.companyId,
+        projectId: resolvedProjectId,
+        currentRunId: run.id,
+        currentAgentId: agent.id,
+      });
+      context.paperclipSwarmDigest = swarmDigest;
+      context.paperclipSwarmDigestFormatted = formatSwarmDigestForPrompt(swarmDigest);
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
@@ -5450,6 +5188,10 @@ export function heartbeatService(db: Db) {
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+
+      // Refresh file claims for runs that are about to expire
+      // Claims are acquired with 30-min expiry; refresh when < 10 minutes remain
+      await refreshExpiringClaims(now);
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;

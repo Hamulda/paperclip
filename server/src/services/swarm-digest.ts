@@ -1,7 +1,18 @@
+// Re-export handoff comments for backward compatibility
+export {
+  buildHandoffComment,
+  parseHandoffComment,
+  isHandoffComment,
+  HANDOFF_COMMENT_PREFIX,
+  HANDOFF_COMMENT_VERSION,
+  type StructuredHandoff,
+} from "./handoff-comments.js";
+
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns, executionWorkspaces, workspaceRuntimeServices, issues } from "@paperclipai/db";
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { agents, heartbeatRuns, executionWorkspaces, workspaceRuntimeServices, issues, fileClaims } from "@paperclipai/db";
+import { and, desc, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import { asString, parseObject } from "../adapters/utils.js";
+import { getActiveClaimsForRun, listConflicts } from "./file-claims.js";
 
 export interface SwarmDigestAgent {
   id: string;
@@ -110,6 +121,11 @@ export async function buildSwarmDigest(
     inArray(heartbeatRuns.status, ["running", "queued"]),
   ];
 
+  // Filter by projectId from contextSnapshot when provided
+  if (projectId) {
+    activeRunConditions.push(sql`${heartbeatRuns.contextSnapshot} ->> 'projectId' = ${projectId}`);
+  }
+
   // Filter out the current run itself
   if (currentRunId) {
     activeRunConditions.push(ne(heartbeatRuns.id, currentRunId));
@@ -119,6 +135,7 @@ export async function buildSwarmDigest(
   let activeRuns: SwarmDigestRun[] = [];
   if (activeAgents.length > 0) {
     const agentIds = activeAgents.map((a) => a.id);
+    activeRunConditions.push(inArray(heartbeatRuns.agentId, agentIds));
 
     const runRows = await db
       .select({
@@ -129,7 +146,7 @@ export async function buildSwarmDigest(
         startedAt: heartbeatRuns.startedAt,
       })
       .from(heartbeatRuns)
-      .where(and(inArray(heartbeatRuns.agentId, agentIds), inArray(heartbeatRuns.status, ["running", "queued"])))
+      .where(and(...activeRunConditions))
       .orderBy(desc(heartbeatRuns.startedAt))
       .limit(50);
 
@@ -232,6 +249,82 @@ export async function buildSwarmDigest(
     }));
   }
 
+  // 5. File claim conflicts
+  // When currentRunId is provided, find conflicts with the current run's claims.
+  // Otherwise, find all active conflicts in the project (for overview/diagnostics).
+  let fileClaimConflicts: SwarmDigestFileClaimConflict[] = [];
+
+  if (currentRunId) {
+    // Current run context: get claims for this run and find what they conflict with
+    const currentClaims = await getActiveClaimsForRun(db, companyId, currentRunId, projectId);
+    const paths = currentClaims.map((c) => c.claimPath);
+
+    if (paths.length > 0) {
+      const currentRunIds = [...new Set(currentClaims.map((c) => c.runId))];
+
+      const conflicts = await listConflicts(db, {
+        companyId,
+        projectId,
+        paths,
+        excludeAgentId: currentAgentId,
+        excludeRunId: currentRunId,
+      });
+
+      // Filter out same-run conflicts
+      const crossRunConflicts = conflicts.filter(
+        (c) => !currentRunIds.includes(c.runId),
+      );
+
+      fileClaimConflicts = crossRunConflicts.map((c): SwarmDigestFileClaimConflict => ({
+        claimPath: c.claimPath,
+        claimType: c.claimType,
+        conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
+        conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
+      }));
+    }
+  } else if (projectId) {
+    // No current run context: show all active conflicts in the project for diagnostics
+    // Get all paths with active claims in this project
+    const allProjectClaims = await db
+      .select({
+        id: fileClaims.id,
+        claimPath: fileClaims.claimPath,
+        claimType: fileClaims.claimType,
+        agentId: fileClaims.agentId,
+        runId: fileClaims.runId,
+      })
+      .from(fileClaims)
+      .where(
+        and(
+          eq(fileClaims.companyId, companyId),
+          eq(fileClaims.projectId, projectId),
+          eq(fileClaims.status, "active"),
+          gte(fileClaims.expiresAt, new Date()),
+        ),
+      );
+
+    // Find all paths that have claims
+    const pathsWithClaims = [...new Set(allProjectClaims.map((c) => c.claimPath))];
+
+    if (pathsWithClaims.length > 0) {
+      // Get all conflicts for these paths (excluding nothing since no current run)
+      const conflicts = await listConflicts(db, {
+        companyId,
+        projectId,
+        paths: pathsWithClaims,
+        excludeAgentId: null,
+        excludeRunId: null,
+      });
+
+      fileClaimConflicts = conflicts.map((c): SwarmDigestFileClaimConflict => ({
+        claimPath: c.claimPath,
+        claimType: c.claimType,
+        conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
+        conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
+      }));
+    }
+  }
+
   return {
     companyId,
     projectId,
@@ -240,7 +333,7 @@ export async function buildSwarmDigest(
     activeRuns,
     workspaces,
     services,
-    fileClaimConflicts: [],
+    fileClaimConflicts,
   };
 }
 
@@ -304,170 +397,4 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
   }
 
   return lines.join("\n");
-}
-
-// =============================================================================
-// Structured Handoff Comment Template & Parser
-// =============================================================================
-
-export const HANDOFF_COMMENT_PREFIX = "<!-- SWARM_HANDOFF";
-export const HANDOFF_COMMENT_VERSION = "1.0";
-
-export interface StructuredHandoff {
-  version: string;
-  agentId: string;
-  agentName: string;
-  runId: string;
-  issueId: string | null;
-  summary: string;
-  filesTouched: string[];
-  currentState: string;
-  remainingWork: string[];
-  blockers: string[];
-  recommendedNextStep: string;
-  emittedAt: string;
-}
-
-function escapeHandoffValue(value: string): string {
-  return value.replace(/<!--/g, "<!--~").replace(/-->/g, "~-->");
-}
-
-function unescapeHandoffValue(value: string): string {
-  return value.replace(/<!--~/g, "<!--").replace(/~-->/g, "-->");
-}
-
-function parseHandoffList(value: string | null | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split("\n")
-    .map((line) => line.replace(/^[\s-]+/, "").trim())
-    .filter(Boolean);
-}
-
-export function buildHandoffComment(input: {
-  agentId: string;
-  agentName: string;
-  runId: string;
-  issueId: string | null;
-  summary: string;
-  filesTouched: string[];
-  currentState: string;
-  remainingWork: string[];
-  blockers: string[];
-  recommendedNextStep: string;
-}): string {
-  const escaped = {
-    summary: escapeHandoffValue(input.summary),
-    currentState: escapeHandoffValue(input.currentState),
-    recommendedNextStep: escapeHandoffValue(input.recommendedNextStep),
-  };
-
-  const lines: string[] = [
-    `<!-- SWARM_HANDOFF v${HANDOFF_COMMENT_VERSION} -->`,
-    `<!-- AGENT_ID:${input.agentId} -->`,
-    `<!-- AGENT_NAME:${input.agentName} -->`,
-    `<!-- RUN_ID:${input.runId} -->`,
-    `<!-- ISSUE_ID:${input.issueId ?? ""} -->`,
-    ``,
-    `## Summary`,
-    `${escaped.summary}`,
-    ``,
-    `## Files touched`,
-    ...input.filesTouched.map((f) => `- ${f}`),
-    ``,
-    `## Current state`,
-    `${escaped.currentState}`,
-    ``,
-    `## Remaining work`,
-    ...input.remainingWork.map((r) => `- ${r}`),
-    ``,
-    ...(input.blockers.length > 0
-      ? [`## Blockers`, ...input.blockers.map((b) => `- ${b}`), ``]
-      : []),
-    `## Recommended next step`,
-    `${escaped.recommendedNextStep}`,
-    ``,
-    `<!-- EMITTED_AT:${new Date().toISOString()} -->`,
-  ];
-
-  return lines.join("\n");
-}
-
-export function parseHandoffComment(body: string): StructuredHandoff | null {
-  if (!body.includes(HANDOFF_COMMENT_PREFIX)) {
-    return null;
-  }
-
-  const lines = body.split("\n");
-  const metadata: Record<string, string> = {};
-  const sectionOrder: string[] = [];
-  const sections: Record<string, string[]> = {};
-
-  let currentSection: string | null = null;
-  let inSection = false;
-
-  for (const rawLine of lines) {
-    const line = rawLine;
-
-    // Parse SWARM_HANDOFF version line: <!-- SWARM_HANDOFF v1.0 -->
-    const versionMatch = line.match(/^<!--\s*SWARM_HANDOFF\s+v([\d.]+)\s*-->$/);
-    if (versionMatch) {
-      metadata["VERSION"] = versionMatch[1];
-      continue;
-    }
-
-    // Parse metadata comments: <!-- KEY:value -->
-    const metaMatch = line.match(/^<!--\s*([A-Z_]+):(.+)\s*-->$/);
-    if (metaMatch) {
-      metadata[metaMatch[1]] = metaMatch[2].trim();
-      continue;
-    }
-
-    // Section headers
-    const sectionMatch = line.match(/^##\s+(.+)$/);
-    if (sectionMatch) {
-      currentSection = sectionMatch[1].trim();
-      sectionOrder.push(currentSection);
-      sections[currentSection] = [];
-      inSection = true;
-      continue;
-    }
-
-    // Content lines
-    if (inSection && currentSection) {
-      if (line.match(/^<!-- .+ -->$/)) {
-        // End marker or other metadata comment
-        continue;
-      }
-      sections[currentSection].push(line);
-    }
-  }
-
-  // Extract raw section content and unescape
-  const getRawSection = (name: string): string =>
-    unescapeHandoffValue(sections[name]?.join("\n").trim() ?? "");
-
-  const getListSection = (name: string): string[] => {
-    const raw = getRawSection(name);
-    return parseHandoffList(raw);
-  };
-
-  return {
-    version: metadata["VERSION"] ?? "1.0",
-    agentId: metadata["AGENT_ID"] ?? "",
-    agentName: metadata["AGENT_NAME"] ?? "",
-    runId: metadata["RUN_ID"] ?? "",
-    issueId: metadata["ISSUE_ID"] || null,
-    summary: getRawSection("Summary"),
-    filesTouched: getListSection("Files touched"),
-    currentState: getRawSection("Current state"),
-    remainingWork: getListSection("Remaining work"),
-    blockers: getListSection("Blockers"),
-    recommendedNextStep: getRawSection("Recommended next step"),
-    emittedAt: metadata["EMITTED_AT"] ?? "",
-  };
-}
-
-export function isHandoffComment(body: string): boolean {
-  return body.includes(HANDOFF_COMMENT_PREFIX);
 }
