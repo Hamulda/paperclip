@@ -21,6 +21,7 @@ import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { DraftInput } from "./agent-config-primitives";
 import { InlineEditor } from "./InlineEditor";
 import { EnvVarEditor } from "./EnvVarEditor";
+import { WorkspaceServicesEditor } from "./WorkspaceServicesEditor";
 
 const PROJECT_STATUSES = [
   { value: "backlog", label: "Backlog" },
@@ -1118,27 +1119,16 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
                               <SaveIndicator state={fieldState("execution_workspace_runtime")} />
                             </label>
                           </div>
-                          <textarea
-                            value={executionWorkspaceRuntime ? JSON.stringify(executionWorkspaceRuntime, null, 2) : ""}
-                            onChange={(e) => {
-                              try {
-                                const parsed = e.target.value ? JSON.parse(e.target.value) : null;
-                                commitField("execution_workspace_runtime", {
-                                  ...updateExecutionWorkspacePolicy({
-                                    workspaceRuntime: parsed,
-                                  })!,
-                                });
-                              } catch {
-                                // invalid JSON, ignore until valid
-                              }
+                          <WorkspaceServicesEditor
+                            value={executionWorkspaceRuntime}
+                            onChange={(workspaceRuntime) => {
+                              commitField("execution_workspace_runtime", {
+                                ...updateExecutionWorkspacePolicy({
+                                  workspaceRuntime,
+                                })!,
+                              });
                             }}
-                            rows={4}
-                            className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs font-mono outline-none resize-none"
-                            placeholder={'{"services": [{"name": "web", "command": "pnpm dev"}]}'}
                           />
-                          <p className="text-[11px] text-muted-foreground">
-                            JSON object with services array for isolated execution workspaces.
-                          </p>
                         </div>
                       </div>
                     ) : null}
