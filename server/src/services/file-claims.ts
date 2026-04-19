@@ -362,3 +362,83 @@ export async function getActiveClaimsForRun(
     .from(fileClaims)
     .where(and(...conditions));
 }
+
+/**
+ * Extract claim path suggestions from issue labels and description.
+ * Supports:
+ * - Label pattern: "claims:src/foo/**" or "claim:src/bar/file.ts"
+ * - Description pattern: lines starting with "- claim:" or "* claim:"
+ */
+export function extractClaimPathsFromIssue(input: {
+  labels?: string[];
+  description?: string | null;
+}): ClaimInput[] {
+  const claims: ClaimInput[] = [];
+  const seen = new Set<string>();
+
+  function addClaim(path: string, type: ClaimType) {
+    const normalized = normalizePath(path);
+    const key = `${type}:${normalized}`;
+    if (!seen.has(key) && normalized) {
+      seen.add(key);
+      claims.push({ claimPath: normalized, claimType: type });
+    }
+  }
+
+  function parsePathFromLabel(label: string): { path: string; type: ClaimType } | null {
+    // Handle "claims:" or "claim:" prefix
+    const match = label.match(/^(?:claims?|claim):\s*(.+)$/i);
+    if (!match) return null;
+    const rawPath = match[1].trim();
+    if (!rawPath) return null;
+
+    // Determine claim type BEFORE normalization (since normalization removes trailing slashes)
+    let type: ClaimType = "file";
+    if (rawPath.includes("**") || rawPath.includes("*")) {
+      type = "glob";
+    } else if (rawPath.endsWith("/")) {
+      type = "directory";
+    }
+
+    const path = normalizePath(rawPath);
+    return { path, type };
+  }
+
+  function parseClaimFromLine(line: string): string | null {
+    // Lines like "- claim:path/to/file.ts", "* claim:src/**", or "- * claim:src/utils/"
+    // Handles multiple optional bullet markers (e.g., "- *" or "*") before claim:
+    const match = line.match(/^[\s]*[-*]+(?:\s+[-*]+)*\s*(?:claim|claims?):\s*(.+)$/i);
+    return match ? match[1].trim() : null;
+  }
+
+  // Parse labels
+  if (input.labels) {
+    for (const label of input.labels) {
+      const parsed = parsePathFromLabel(label);
+      if (parsed) {
+        addClaim(parsed.path, parsed.type);
+      }
+    }
+  }
+
+  // Parse description
+  if (input.description) {
+    const lines = input.description.split("\n");
+    for (const line of lines) {
+      const rawPath = parseClaimFromLine(line);
+      if (rawPath) {
+        // Determine type BEFORE normalization (since normalization removes trailing slashes)
+        let type: ClaimType = "file";
+        if (rawPath.includes("**") || rawPath.includes("*")) {
+          type = "glob";
+        } else if (rawPath.endsWith("/")) {
+          type = "directory";
+        }
+        const path = normalizePath(rawPath);
+        addClaim(path, type);
+      }
+    }
+  }
+
+  return claims;
+}

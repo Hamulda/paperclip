@@ -14,107 +14,20 @@ import { and, asc, desc, eq, gte, inArray, ne, sql, lt, isNotNull, or } from "dr
 import { asString, parseObject } from "../adapters/utils.js";
 import { getActiveClaimsForRun, listConflicts } from "./file-claims.js";
 import { parseHandoffComment, isHandoffComment, HANDOFF_COMMENT_PREFIX } from "./handoff-comments.js";
-
-export interface SwarmDigestAgent {
-  id: string;
-  name: string;
-  status: string;
-}
-
-export interface SwarmDigestRun {
-  id: string;
-  agentId: string;
-  issueId: string | null;
-  issueIdentifier: string | null;
-  issueTitle: string | null;
-  status: string;
-  startedAt: string | null;
-}
-
-export interface SwarmDigestWorkspace {
-  id: string;
-  name: string;
-  branchName: string | null;
-  worktreePath: string | null;
-  status: string;
-  sourceIssueId: string | null;
-}
-
-export interface SwarmDigestService {
-  id: string;
-  serviceName: string;
-  status: string;
-  url: string | null;
-  ownerAgentId: string | null;
-}
-
-export interface SwarmDigestFileClaimConflict {
-  claimPath: string;
-  claimType: string;
-  conflictingAgentId: string;
-  conflictingRunId: string;
-}
-
-export interface SwarmDigestFileClaimStale {
-  id: string;
-  claimPath: string;
-  claimType: string;
-  agentId: string | null;
-  runId: string | null;
-  expiresAt: string;
-  minutesUntilExpiry: number;
-}
-
-export interface SwarmDigestServiceDegraded {
-  id: string;
-  serviceName: string;
-  status: string;
-  healthStatus: string;
-  url: string | null;
-  ownerAgentId: string | null;
-}
-
-export interface SwarmDigestRunStuck {
-  id: string;
-  agentId: string;
-  issueId: string | null;
-  issueIdentifier: string | null;
-  issueTitle: string | null;
-  status: string;
-  startedAt: string | null;
-  minutesWaiting: number;
-}
-
-export interface SwarmDigestHandoff {
-  id: string;
-  agentId: string;
-  agentName: string;
-  runId: string;
-  issueId: string | null;
-  issueIdentifier: string | null;
-  summary: string;
-  filesTouched: string[];
-  currentState: string;
-  remainingWork: string[];
-  blockers: string[];
-  recommendedNextStep: string;
-  emittedAt: string;
-}
-
-export interface SwarmDigest {
-  companyId: string;
-  projectId: string | null;
-  generatedAt: string;
-  activeAgents: SwarmDigestAgent[];
-  activeRuns: SwarmDigestRun[];
-  workspaces: SwarmDigestWorkspace[];
-  services: SwarmDigestService[];
-  fileClaimConflicts: SwarmDigestFileClaimConflict[];
-  fileClaimStale: SwarmDigestFileClaimStale[];
-  servicesDegraded: SwarmDigestServiceDegraded[];
-  runsStuck: SwarmDigestRunStuck[];
-  recentHandoffs: SwarmDigestHandoff[];
-}
+import type {
+  SwarmDigest,
+  SwarmDigestAgent,
+  SwarmDigestRun,
+  SwarmDigestWorkspace,
+  SwarmDigestService,
+  SwarmDigestFileClaimConflict,
+  SwarmDigestFileClaimStale,
+  SwarmDigestServiceDegraded,
+  SwarmDigestRunStuck,
+  SwarmDigestHandoff,
+  SwarmDigestClaimedPathsSummary,
+  SwarmDigestRecommendedAvoidPaths,
+} from "@paperclipai/shared";
 
 function readNonEmptyString(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -135,6 +48,9 @@ function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDig
     servicesDegraded: [],
     runsStuck: [],
     recentHandoffs: [],
+    latestHandoff: null,
+    claimedPathsSummary: { byAgent: [] },
+    recommendedAvoidPaths: { paths: [], reasons: [] },
   };
 }
 
@@ -159,6 +75,7 @@ export async function buildSwarmDigest(
       id: agents.id,
       name: agents.name,
       status: agents.status,
+      role: agents.role,
     })
     .from(agents)
     .where(and(
@@ -170,6 +87,7 @@ export async function buildSwarmDigest(
         id: row.id,
         name: row.name,
         status: row.status,
+        role: row.role ?? null,
       })),
     );
 
@@ -230,6 +148,7 @@ export async function buildSwarmDigest(
         const context = parseObject(run.contextSnapshot);
         const issueId = readNonEmptyString(context.issueId) || null;
         const issueInfo = issueId ? issueMap.get(issueId) : null;
+        const swarmRole = activeAgents.find((a) => a.id === run.agentId)?.role ?? null;
         return {
           id: run.id,
           agentId: run.agentId,
@@ -238,6 +157,7 @@ export async function buildSwarmDigest(
           issueTitle: issueInfo?.title ?? null,
           status: run.status,
           startedAt: run.startedAt?.toISOString() ?? null,
+          swarmRole,
         };
       })
       .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
@@ -557,6 +477,7 @@ export async function buildSwarmDigest(
       id: row.id,
       agentId: parsed.agentId,
       agentName: parsed.agentName,
+      swarmRole: parsed.swarmRole,
       runId: parsed.runId,
       issueId: parsed.issueId,
       issueIdentifier,
@@ -566,9 +487,72 @@ export async function buildSwarmDigest(
       remainingWork: parsed.remainingWork,
       blockers: parsed.blockers,
       recommendedNextStep: parsed.recommendedNextStep,
+      avoidPaths: parsed.avoidPaths,
       emittedAt: parsed.emittedAt,
     });
   }
+
+  // 10. Build claimed paths summary (aggregate active claims by agent)
+  const allActiveClaims = projectId
+    ? await db
+        .select({
+          claimPath: fileClaims.claimPath,
+          claimType: fileClaims.claimType,
+          agentId: fileClaims.agentId,
+          issueId: fileClaims.issueId,
+        })
+        .from(fileClaims)
+        .where(
+          and(
+            eq(fileClaims.companyId, companyId),
+            eq(fileClaims.projectId, projectId),
+            eq(fileClaims.status, "active"),
+            gte(fileClaims.expiresAt, new Date()),
+          ),
+        )
+    : [];
+
+  // Build agent name map from activeAgents
+  const agentNameMap = new Map(activeAgents.map((a) => [a.id, a.name]));
+  const agentRoleMap = new Map(activeAgents.map((a) => [a.id, a.role]));
+
+  // Group claims by agent (filter out claims with null agentId)
+  const claimsByAgent = new Map<string, string[]>();
+  for (const claim of allActiveClaims) {
+    if (!claim.agentId) continue;
+    if (!claimsByAgent.has(claim.agentId)) {
+      claimsByAgent.set(claim.agentId, []);
+    }
+    claimsByAgent.get(claim.agentId)!.push(claim.claimPath);
+  }
+
+  const claimedPathsSummary: SwarmDigestClaimedPathsSummary = {
+    byAgent: Array.from(claimsByAgent.entries()).map(([agentId, paths]) => ({
+      agentId,
+      agentName: agentNameMap.get(agentId) ?? "Unknown",
+      role: agentRoleMap.get(agentId) ?? null,
+      paths: [...new Set(paths)].slice(0, 50), // dedupe and limit
+    })),
+  };
+
+  // 11. Build recommended avoid paths from recent handoffs
+  const avoidPathSet = new Set<string>();
+  const avoidPathReasons = new Map<string, string>();
+
+  for (const handoff of recentHandoffs) {
+    for (const avoidPath of handoff.avoidPaths) {
+      avoidPathSet.add(avoidPath);
+      const reason = `${handoff.agentName} is actively working on this area`;
+      if (!avoidPathReasons.has(avoidPath)) {
+        avoidPathReasons.set(avoidPath, reason);
+      }
+    }
+  }
+
+  const recommendedAvoidPaths: SwarmDigestRecommendedAvoidPaths = {
+    paths: Array.from(avoidPathSet).slice(0, 20),
+    reasons: Array.from(avoidPathReasons.values()).slice(0, 20),
+  };
 
   return {
     companyId,
@@ -583,6 +567,9 @@ export async function buildSwarmDigest(
     servicesDegraded,
     runsStuck,
     recentHandoffs,
+    latestHandoff: recentHandoffs[0] ?? null,
+    claimedPathsSummary,
+    recommendedAvoidPaths,
   };
 }
 
@@ -592,16 +579,40 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
   lines.push("## Coding Swarm Status");
   lines.push("");
 
-  // Active agents
+  // Active agents with roles
   if (digest.activeAgents.length > 0) {
     const otherAgents = digest.activeAgents.filter((a) => a.status === "running");
     if (otherAgents.length > 0) {
       lines.push("### Active Agents");
       for (const agent of otherAgents) {
-        lines.push(`- **${agent.name}** (${agent.status})`);
+        const roleTag = agent.role ? ` [${agent.role}]` : "";
+        lines.push(`- **${agent.name}**${roleTag} (${agent.status})`);
       }
       lines.push("");
     }
+  }
+
+  // Claimed paths summary
+  if (digest.claimedPathsSummary.byAgent.length > 0) {
+    lines.push("### Claimed Paths");
+    for (const agentEntry of digest.claimedPathsSummary.byAgent.slice(0, 5)) {
+      const roleTag = agentEntry.role ? ` [${agentEntry.role}]` : "";
+      lines.push(`- **${agentEntry.agentName}**${roleTag}:`);
+      for (const path of agentEntry.paths.slice(0, 5)) {
+        lines.push(`  - ${path}`);
+      }
+    }
+    lines.push("");
+  }
+
+  // Recommended avoid paths
+  if (digest.recommendedAvoidPaths.paths.length > 0) {
+    lines.push("### Recommended Avoid Paths");
+    lines.push("Do NOT modify these paths — another agent is actively working on them:");
+    for (const path of digest.recommendedAvoidPaths.paths.slice(0, 10)) {
+      lines.push(`- ${path}`);
+    }
+    lines.push("");
   }
 
   // Active runs with issues

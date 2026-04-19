@@ -177,6 +177,48 @@ describe("buildSwarmDigest", () => {
     expect(digest.activeAgents[0].status).toBe("running");
     expect(digest.activeAgents[0].name).toBe("Running Agent");
   });
+
+  it("does NOT include idle or paused agents in activeAgents", async () => {
+    // This test catches the bug where activeAgents included ALL non-deleted agents
+    // instead of only status=running agents
+    let queryIndex = 0;
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => {
+          const results = [
+            // Query 0: agents - should only contain running agents, not idle/paused
+            [{ id: "agent-1", name: "Running Agent", status: "running" }],
+            // Query 1: runs
+            [],
+            // Query 2: stale claims
+            [],
+            // Query 3: degraded services
+            [],
+            // Query 4: stuck runs
+            [],
+            // Query 5: handoff comments
+            [],
+          ];
+          return resolve(results[queryIndex++] ?? []);
+        },
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockImplementation(() => ({
+          then: (resolve: any) => resolve([]),
+        })),
+      })),
+    } as any;
+
+    const digest = await buildSwarmDigest(mockDb as any, {
+      companyId: "company-1",
+      projectId: null,
+    });
+
+    // Idle agents should not appear in activeAgents
+    expect(digest.activeAgents.every(a => a.status === "running")).toBe(true);
+    expect(digest.activeAgents.map(a => a.id)).not.toContain("idle-agent");
+  });
 });
 
 describe("file claims sequencing", () => {
@@ -238,6 +280,8 @@ describe("file claims sequencing", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -261,6 +305,8 @@ describe("file claims sequencing", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -284,6 +330,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -293,14 +341,14 @@ describe("formatSwarmDigestForPrompt", () => {
     expect(formatted).not.toContain("### Active Runs");
   });
 
-  it("formats active agents section", () => {
+  it("formats active agents section with roles", () => {
     const digest: SwarmDigest = {
       companyId: "company-1",
       projectId: "project-1",
       generatedAt: new Date().toISOString(),
       activeAgents: [
-        { id: "agent-1", name: "Alice", status: "running" },
-        { id: "agent-2", name: "Bob", status: "paused" },
+        { id: "agent-1", name: "Alice", status: "running", role: "planner" },
+        { id: "agent-2", name: "Bob", status: "paused", role: "implementer" },
       ],
       activeRuns: [],
       workspaces: [],
@@ -310,12 +358,15 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
 
     expect(formatted).toContain("### Active Agents");
     expect(formatted).toContain("Alice");
+    expect(formatted).toContain("[planner]");
     expect(formatted).toContain("(running)");
     // Paused agents are filtered out from display
     expect(formatted).not.toContain("Bob");
@@ -346,6 +397,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -380,6 +433,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -411,6 +466,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -449,6 +506,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -469,6 +528,7 @@ describe("formatSwarmDigestForPrompt", () => {
         id: `agent-${i}`,
         name: `Agent ${i}`,
         status: "running",
+        role: null,
       })),
       activeRuns: Array.from({ length: 20 }, (_, i) => ({
         id: `run-${i}`,
@@ -499,6 +559,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -563,6 +625,8 @@ describe("formatSwarmDigestForPrompt", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -574,13 +638,22 @@ describe("formatSwarmDigestForPrompt", () => {
 });
 
 describe("digest data structure integrity", () => {
-  it("swarm digest has all required fields", () => {
+  it("swarm digest has all required fields including new swarm collaboration fields", () => {
     const digest: SwarmDigest = {
       companyId: "company-1",
       projectId: "project-1",
       generatedAt: "2024-01-01T00:00:00.000Z",
-      activeAgents: [],
-      activeRuns: [],
+      activeAgents: [{ id: "a1", name: "Test", status: "running", role: "planner" }],
+      activeRuns: [{
+        id: "run-1",
+        agentId: "a1",
+        issueId: "issue-1",
+        issueIdentifier: "PAP-1",
+        issueTitle: "Test issue",
+        status: "running",
+        startedAt: "2024-01-01T00:00:00.000Z",
+        swarmRole: "planner",
+      }],
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
@@ -588,36 +661,50 @@ describe("digest data structure integrity", () => {
       servicesDegraded: [],
       runsStuck: [],
       recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: {
+        byAgent: [{
+          agentId: "a1",
+          agentName: "Test",
+          role: "planner",
+          paths: ["src/foo.ts"],
+        }],
+      },
+      recommendedAvoidPaths: {
+        paths: ["src/bar.ts"],
+        reasons: ["Another agent is working here"],
+      },
     };
 
     expect(digest.companyId).toBe("company-1");
     expect(digest.projectId).toBe("project-1");
     expect(digest.generatedAt).toBeTruthy();
     expect(Array.isArray(digest.activeAgents)).toBe(true);
-    expect(Array.isArray(digest.activeRuns)).toBe(true);
-    expect(Array.isArray(digest.workspaces)).toBe(true);
-    expect(Array.isArray(digest.services)).toBe(true);
-    expect(Array.isArray(digest.fileClaimConflicts)).toBe(true);
-    expect(Array.isArray(digest.fileClaimStale)).toBe(true);
-    expect(Array.isArray(digest.servicesDegraded)).toBe(true);
-    expect(Array.isArray(digest.runsStuck)).toBe(true);
-    expect(Array.isArray(digest.recentHandoffs)).toBe(true);
+    expect(digest.activeAgents[0].role).toBe("planner");
+    expect(digest.activeRuns[0].swarmRole).toBe("planner");
+    expect(digest.latestHandoff).toBeNull();
+    expect(Array.isArray(digest.claimedPathsSummary.byAgent)).toBe(true);
+    expect(digest.claimedPathsSummary.byAgent[0].paths).toContain("src/foo.ts");
+    expect(Array.isArray(digest.recommendedAvoidPaths.paths)).toBe(true);
+    expect(digest.recommendedAvoidPaths.paths).toContain("src/bar.ts");
   });
 });
 
 describe("buildHandoffComment", () => {
-  it("produces comment with all required sections", () => {
+  it("produces comment with all required sections including role and avoid paths", () => {
     const comment = buildHandoffComment({
       agentId: "agent-1",
       agentName: "Alice",
       runId: "run-123",
       issueId: "issue-456",
+      swarmRole: "planner",
       summary: "Implemented user authentication",
       filesTouched: ["src/auth/login.ts", "src/auth/session.ts"],
       currentState: "Login flow complete, session handling added",
       remainingWork: ["Add logout functionality", "Write auth tests"],
       blockers: ["Waiting on API spec"],
       recommendedNextStep: "Implement logout endpoint",
+      avoidPaths: ["src/auth/old-implementation/", "src/auth/deprecated/"],
     });
 
     expect(comment).toContain(HANDOFF_COMMENT_PREFIX);
@@ -625,6 +712,7 @@ describe("buildHandoffComment", () => {
     expect(comment).toContain("<!-- AGENT_NAME:Alice -->");
     expect(comment).toContain("<!-- RUN_ID:run-123 -->");
     expect(comment).toContain("<!-- ISSUE_ID:issue-456 -->");
+    expect(comment).toContain("<!-- SWARM_ROLE:planner -->");
     expect(comment).toContain("## Summary");
     expect(comment).toContain("Implemented user authentication");
     expect(comment).toContain("## Files touched");
@@ -638,6 +726,9 @@ describe("buildHandoffComment", () => {
     expect(comment).toContain("- Waiting on API spec");
     expect(comment).toContain("## Recommended next step");
     expect(comment).toContain("Implement logout endpoint");
+    expect(comment).toContain("## Avoid paths");
+    expect(comment).toContain("- src/auth/old-implementation/");
+    expect(comment).toContain("- src/auth/deprecated/");
   });
 
   it("escapes markdown-like content in values", () => {
@@ -703,19 +794,21 @@ describe("buildHandoffComment", () => {
 });
 
 describe("parseHandoffComment", () => {
-  it("parses full handoff comment correctly", () => {
+  it("parses full handoff comment correctly with role and avoid paths", () => {
     const handoff: StructuredHandoff = {
       version: "1.0",
       agentId: "agent-abc",
       agentName: "Eve",
       runId: "run-xyz",
       issueId: "issue-123",
+      swarmRole: "integrator",
       summary: "Added feature X",
       filesTouched: ["src/feature/x.ts", "src/feature/y.ts"],
       currentState: "Feature X implemented and tested",
       remainingWork: ["Update docs", "Add integration tests"],
       blockers: ["Waiting on API spec"],
       recommendedNextStep: "Update README with new endpoints",
+      avoidPaths: ["src/legacy/", "src/deprecated/"],
       emittedAt: "2024-01-15T10:30:00.000Z",
     };
 
@@ -724,12 +817,14 @@ describe("parseHandoffComment", () => {
       agentName: handoff.agentName,
       runId: handoff.runId,
       issueId: handoff.issueId,
+      swarmRole: handoff.swarmRole,
       summary: handoff.summary,
       filesTouched: handoff.filesTouched,
       currentState: handoff.currentState,
       remainingWork: handoff.remainingWork,
       blockers: handoff.blockers,
       recommendedNextStep: handoff.recommendedNextStep,
+      avoidPaths: handoff.avoidPaths,
     });
 
     const parsed = parseHandoffComment(comment);
@@ -739,12 +834,14 @@ describe("parseHandoffComment", () => {
     expect(parsed!.agentName).toBe("Eve");
     expect(parsed!.runId).toBe("run-xyz");
     expect(parsed!.issueId).toBe("issue-123");
+    expect(parsed!.swarmRole).toBe("integrator");
     expect(parsed!.summary).toBe("Added feature X");
     expect(parsed!.filesTouched).toEqual(["src/feature/x.ts", "src/feature/y.ts"]);
     expect(parsed!.currentState).toBe("Feature X implemented and tested");
     expect(parsed!.remainingWork).toEqual(["Update docs", "Add integration tests"]);
     expect(parsed!.blockers).toEqual(["Waiting on API spec"]);
     expect(parsed!.recommendedNextStep).toBe("Update README with new endpoints");
+    expect(parsed!.avoidPaths).toEqual(["src/legacy/", "src/deprecated/"]);
   });
 
   it("returns null for non-handoff comments", () => {

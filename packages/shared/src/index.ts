@@ -393,6 +393,20 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+  SwarmDigest,
+  SwarmDigestAgent,
+  SwarmDigestRun,
+  SwarmDigestWorkspace,
+  SwarmDigestService,
+  SwarmDigestFileClaimConflict,
+  SwarmDigestFileClaimStale,
+  SwarmDigestServiceDegraded,
+  SwarmDigestRunStuck,
+  SwarmDigestHandoff,
+  SwarmCockpitDigest,
+  SwarmDigestClaimedPathsSummary,
+  SwarmDigestRecommendedAvoidPaths,
+  SwarmDigestClaimedPath,
 } from "./types/index.js";
 
 export {

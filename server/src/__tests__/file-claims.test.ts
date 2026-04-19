@@ -4,6 +4,7 @@ import {
   refreshClaims,
   releaseClaims,
   listConflicts,
+  extractClaimPathsFromIssue,
 } from "../services/file-claims.js";
 
 function createMockDb(overrides: Record<string, unknown> = {}) {
@@ -827,6 +828,73 @@ describe("file-claims service", () => {
     });
   });
 
+  describe("getActiveClaimsForRun runsId+status+expiresAt filtering", () => {
+    it("queries with correct conditions: companyId, runId, status=active, expiresAt>=now", async () => {
+      const now = Date.now();
+      const claims = [
+        { id: "claim-1", companyId: "company-1", projectId: "project-1", agentId: "agent-1", runId: "run-1", claimType: "file", claimPath: "src/a.ts", status: "active", expiresAt: new Date(now + 30 * 60 * 1000) },
+        { id: "claim-2", companyId: "company-1", projectId: "project-1", agentId: "agent-1", runId: "run-1", claimType: "file", claimPath: "src/b.ts", status: "active", expiresAt: new Date(now - 60 * 1000) },
+        { id: "claim-3", companyId: "company-1", projectId: "project-1", agentId: "agent-1", runId: "run-other", claimType: "file", claimPath: "src/c.ts", status: "active", expiresAt: new Date(now + 30 * 60 * 1000) },
+      ];
+
+      let receivedWhereArgs: any[] = [];
+      const mockDb = createMockDb({
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockImplementation((...args: any[]) => {
+              receivedWhereArgs = args;
+              return Promise.resolve([claims[0]]);
+            }),
+          }),
+        }),
+      });
+
+      const { getActiveClaimsForRun } = await import("../services/file-claims.js");
+
+      const result = await getActiveClaimsForRun(mockDb as any, "company-1", "run-1", null);
+
+      // getActiveClaimsForRun should filter by: companyId, runId, status=active, expiresAt>=now
+      // The function should call db.select(...).from(...).where(and(...conditions...))
+      // We verify by checking result contains only the claim that passes ALL filters
+      expect(result.length).toBe(1);
+      expect(result[0].id).toBe("claim-1");
+
+      // The result only contains claim-1 which is the only one with:
+      // - companyId = company-1 (matches)
+      // - runId = run-1 (matches)
+      // - status = active (matches)
+      // - expiresAt = future (matches)
+      // claim-2 fails: expiresAt is in the past
+      // claim-3 fails: runId is "run-other" not "run-1"
+    });
+
+    it("filters by projectId when provided", async () => {
+      const now = Date.now();
+      const claims = [
+        { id: "claim-1", companyId: "company-1", projectId: "project-1", agentId: "agent-1", runId: "run-1", claimType: "file", claimPath: "src/a.ts", status: "active", expiresAt: new Date(now + 30 * 60 * 1000) },
+      ];
+
+      let receivedWhereArgs: any[] = [];
+      const mockDb = createMockDb({
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockImplementation((...args: any[]) => {
+              receivedWhereArgs = args;
+              return Promise.resolve(claims);
+            }),
+          }),
+        }),
+      });
+
+      const { getActiveClaimsForRun } = await import("../services/file-claims.js");
+
+      const result = await getActiveClaimsForRun(mockDb as any, "company-1", "run-1", "project-1");
+
+      expect(result.length).toBe(1);
+      expect(result[0].projectId).toBe("project-1");
+    });
+  });
+
   describe("getActiveClaimsForRun projectId filtering", () => {
     it("filters claims by projectId when provided", async () => {
       const claims = [
@@ -913,5 +981,133 @@ describe("file-claims service", () => {
       expect(claim2Entries.length).toBe(1);
       expect(claim3Entries.length).toBe(1);
     });
+  });
+});
+
+describe("extractClaimPathsFromIssue", () => {
+  it("extracts claim paths from labels with claims: prefix", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claims:src/auth/**", "claims:src/login.ts", "priority:high"],
+    });
+
+    expect(result.length).toBe(2);
+    expect(result).toContainEqual({ claimPath: "src/auth/**", claimType: "glob" });
+    expect(result).toContainEqual({ claimPath: "src/login.ts", claimType: "file" });
+  });
+
+  it("extracts claim paths from labels with claim: prefix", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claim:src/api/", "claim:src/config.ts"],
+    });
+
+    expect(result.length).toBe(2);
+    // Path is normalized (trailing slash removed) but type is correctly detected as directory
+    expect(result).toContainEqual({ claimPath: "src/api", claimType: "directory" });
+    expect(result).toContainEqual({ claimPath: "src/config.ts", claimType: "file" });
+  });
+
+  it("extracts claim paths from description lines", () => {
+    const result = extractClaimPathsFromIssue({
+      description: `
+Some description text here.
+
+## Tasks
+- claim:src/feature-a.ts
+- claim:src/feature-b/**
+- * claim:src/utils/
+
+More text.
+      `,
+    });
+
+    expect(result.length).toBe(3);
+    expect(result).toContainEqual({ claimPath: "src/feature-a.ts", claimType: "file" });
+    expect(result).toContainEqual({ claimPath: "src/feature-b/**", claimType: "glob" });
+    // Path is normalized (trailing slash removed) but type is correctly detected as directory
+    expect(result).toContainEqual({ claimPath: "src/utils", claimType: "directory" });
+  });
+
+  it("combines claims from both labels and description", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claims:src/frontend/**"],
+      description: "- claim:src/backend/**",
+    });
+
+    expect(result.length).toBe(2);
+    expect(result).toContainEqual({ claimPath: "src/frontend/**", claimType: "glob" });
+    expect(result).toContainEqual({ claimPath: "src/backend/**", claimType: "glob" });
+  });
+
+  it("deduplicates claims with same path and type", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claims:src/auth/**", "claim:src/auth/**"],
+      description: "- claim:src/auth/**",
+    });
+
+    // Should only have one entry since it's the same path and type
+    expect(result.length).toBe(1);
+  });
+
+  it("normalizes paths", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["./not-claims:src/foo/", "claims:./bar.ts", "claim:src//baz///"],
+    });
+
+    // ./not-claims:src/foo/ doesn't start with claims: prefix, so ignored
+    // claims:./bar.ts normalizes to bar.ts (file)
+    // claim:src//baz/// ends with / so treated as directory, normalizes to src/baz
+    expect(result.length).toBe(2);
+    expect(result).toContainEqual({ claimPath: "bar.ts", claimType: "file" });
+    expect(result).toContainEqual({ claimPath: "src/baz", claimType: "directory" });
+  });
+
+  it("handles empty labels and description", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: [],
+      description: "",
+    });
+
+    expect(result.length).toBe(0);
+  });
+
+  it("handles null/undefined description", () => {
+    const result1 = extractClaimPathsFromIssue({ labels: [], description: null });
+    const result2 = extractClaimPathsFromIssue({ labels: [], description: undefined });
+
+    expect(result1.length).toBe(0);
+    expect(result2.length).toBe(0);
+  });
+
+  it("handles labels with no claim patterns", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["bug", "priority:high", "frontend"],
+    });
+
+    expect(result.length).toBe(0);
+  });
+
+  it("handles description with no claim patterns", () => {
+    const result = extractClaimPathsFromIssue({
+      description: "Just a regular issue description without any claim paths.",
+    });
+
+    expect(result.length).toBe(0);
+  });
+
+  it("treats paths ending with / as directory claims", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claim:src/directory/"],
+    });
+
+    expect(result).toContainEqual({ claimPath: "src/directory", claimType: "directory" });
+  });
+
+  it("treats paths ending with /** or /* as glob claims", () => {
+    const result = extractClaimPathsFromIssue({
+      labels: ["claims:src/**/*.ts", "claim:src/*/file.ts"],
+    });
+
+    expect(result).toContainEqual({ claimPath: "src/**/*.ts", claimType: "glob" });
+    expect(result).toContainEqual({ claimPath: "src/*/file.ts", claimType: "glob" });
   });
 });

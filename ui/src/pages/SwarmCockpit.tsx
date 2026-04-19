@@ -6,6 +6,7 @@ import { queryKeys } from "@/lib/queryKeys";
 import { swarmDigestApi, type SwarmCockpitDigest } from "@/api/swarm-digest";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { cn } from "@/lib/utils";
+import { useSearchParams } from "@/lib/router";
 import {
   Bot,
   CircleDot,
@@ -18,6 +19,7 @@ import {
   ArrowRight,
   FileText,
   AlertCircle,
+  MapPin,
 } from "lucide-react";
 
 function SectionCard({
@@ -223,14 +225,19 @@ function HandoffRow({ handoff }: { handoff: { id: string; agentName: string; iss
 export function SwarmCockpit() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const [searchParams] = useSearchParams();
+  const projectId = searchParams.get("projectId") ?? undefined;
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Swarm Cockpit" }]);
-  }, [setBreadcrumbs]);
+    const crumbs = projectId
+      ? [{ label: "Projects", href: "/projects" }, { label: "Swarm Cockpit" }]
+      : [{ label: "Swarm Cockpit" }];
+    setBreadcrumbs(crumbs);
+  }, [setBreadcrumbs, projectId]);
 
   const { data, isLoading, error } = useQuery({
-    queryKey: queryKeys.swarmDigest(selectedCompanyId!),
-    queryFn: () => swarmDigestApi.getCockpitDigest(selectedCompanyId!),
+    queryKey: queryKeys.swarmDigest(selectedCompanyId!, projectId),
+    queryFn: () => swarmDigestApi.getCockpitDigest(selectedCompanyId!, projectId),
     enabled: !!selectedCompanyId,
     refetchInterval: 10_000,
   });
@@ -257,6 +264,12 @@ export function SwarmCockpit() {
 
   return (
     <div className="space-y-4">
+      {projectId && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <MapPin className="h-3 w-3" />
+          <span>Project-scoped view</span>
+        </div>
+      )}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         <SectionCard title="Active Agents" icon={Bot} className="md:col-span-2 lg:col-span-1">
           {data.activeAgents.length === 0 ? (

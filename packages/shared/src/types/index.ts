@@ -191,6 +191,22 @@ export type {
 } from "./access.js";
 export type { QuotaWindow, ProviderQuotaResult } from "./quota.js";
 export type {
+  SwarmDigest,
+  SwarmDigestAgent,
+  SwarmDigestRun,
+  SwarmDigestWorkspace,
+  SwarmDigestService,
+  SwarmDigestFileClaimConflict,
+  SwarmDigestFileClaimStale,
+  SwarmDigestServiceDegraded,
+  SwarmDigestRunStuck,
+  SwarmDigestHandoff,
+  SwarmCockpitDigest,
+  SwarmDigestClaimedPathsSummary,
+  SwarmDigestRecommendedAvoidPaths,
+  SwarmDigestClaimedPath,
+} from "./swarm-digest.js";
+export type {
   CompanyPortabilityInclude,
   CompanyPortabilityEnvInput,
   CompanyPortabilityFileEntry,
