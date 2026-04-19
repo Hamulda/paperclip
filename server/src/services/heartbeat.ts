@@ -30,6 +30,14 @@ import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } fr
 import { costService } from "./costs.js";
 import { buildSwarmDigest, formatSwarmDigestForPrompt, buildHandoffComment } from "./swarm-digest.js";
 import { acquireClaims, refreshClaims, releaseClaims, listConflicts } from "./file-claims.js";
+import { buildExecutionWorkspaceConfigSnapshot, deriveRepoNameFromRepoUrl } from "./workspace-repo-utils.js";
+import {
+  normalizeUsageTotals,
+  readRawUsageTotals,
+  deriveNormalizedUsageDelta,
+  formatCount,
+  type UsageTotals,
+} from "./run-usage.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -296,41 +304,6 @@ export function buildRealizedExecutionWorkspaceFromPersisted(input: {
   };
 }
 
-function buildExecutionWorkspaceConfigSnapshot(config: Record<string, unknown>): Partial<ExecutionWorkspaceConfig> | null {
-  const strategy = parseObject(config.workspaceStrategy);
-  const snapshot: Partial<ExecutionWorkspaceConfig> = {};
-
-  if ("workspaceStrategy" in config) {
-    snapshot.provisionCommand = typeof strategy.provisionCommand === "string" ? strategy.provisionCommand : null;
-    snapshot.teardownCommand = typeof strategy.teardownCommand === "string" ? strategy.teardownCommand : null;
-  }
-
-  if ("workspaceRuntime" in config) {
-    const workspaceRuntime = parseObject(config.workspaceRuntime);
-    snapshot.workspaceRuntime = Object.keys(workspaceRuntime).length > 0 ? workspaceRuntime : null;
-  }
-
-  const hasSnapshot = Object.values(snapshot).some((value) => {
-    if (value === null) return false;
-    if (typeof value === "object") return Object.keys(value).length > 0;
-    return true;
-  });
-  return hasSnapshot ? snapshot : null;
-}
-
-function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
-  const trimmed = repoUrl?.trim() ?? "";
-  if (!trimmed) return null;
-  try {
-    const parsed = new URL(trimmed);
-    const cleanedPath = parsed.pathname.replace(/\/+$/, "");
-    const repoName = cleanedPath.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? "";
-    return repoName || null;
-  } catch {
-    return null;
-  }
-}
-
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
@@ -572,12 +545,6 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
 }
 
-type UsageTotals = {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-};
-
 type SessionCompactionDecision = {
   rotate: boolean;
   reason: string | null;
@@ -809,69 +776,6 @@ export function buildExplicitResumeSessionOverride(input: {
     sessionDisplayId,
     sessionParams,
   };
-}
-
-function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTotals | null {
-  if (!usage) return null;
-  return {
-    inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
-    cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
-    outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
-  };
-}
-
-function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
-  const parsed = parseObject(usageJson);
-  if (Object.keys(parsed).length === 0) return null;
-
-  const inputTokens = Math.max(
-    0,
-    Math.floor(asNumber(parsed.rawInputTokens, asNumber(parsed.inputTokens, 0))),
-  );
-  const cachedInputTokens = Math.max(
-    0,
-    Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
-  );
-  const outputTokens = Math.max(
-    0,
-    Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
-  );
-
-  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
-    return null;
-  }
-
-  return {
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
-  };
-}
-
-function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: UsageTotals | null): UsageTotals | null {
-  if (!current) return null;
-  if (!previous) return { ...current };
-
-  const inputTokens = current.inputTokens >= previous.inputTokens
-    ? current.inputTokens - previous.inputTokens
-    : current.inputTokens;
-  const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
-    ? current.cachedInputTokens - previous.cachedInputTokens
-    : current.cachedInputTokens;
-  const outputTokens = current.outputTokens >= previous.outputTokens
-    ? current.outputTokens - previous.outputTokens
-    : current.outputTokens;
-
-  return {
-    inputTokens: Math.max(0, inputTokens),
-    cachedInputTokens: Math.max(0, cachedInputTokens),
-    outputTokens: Math.max(0, outputTokens),
-  };
-}
-
-function formatCount(value: number | null | undefined) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "0";
-  return value.toLocaleString("en-US");
 }
 
 export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {

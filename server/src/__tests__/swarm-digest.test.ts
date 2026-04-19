@@ -34,6 +34,7 @@ function createMockDbChain(results: any[]) {
   const chain = {
     select: vi.fn().mockReturnThis(),
     from: vi.fn().mockReturnThis(),
+    innerJoin: vi.fn().mockReturnThis(),
     where: vi.fn().mockReturnThis(),
     orderBy: vi.fn().mockReturnThis(),
     limit: vi.fn().mockImplementation(() => ({
@@ -42,6 +43,7 @@ function createMockDbChain(results: any[]) {
   };
   (chain.select as any).mockReturnValue(chain);
   (chain.from as any).mockReturnValue(chain);
+  (chain.innerJoin as any).mockReturnValue(chain);
   (chain.where as any).mockReturnValue(chain);
   (chain.orderBy as any).mockReturnValue(chain);
   return chain;
@@ -65,7 +67,13 @@ describe("buildSwarmDigest", () => {
     const mockDb = {
       select: vi.fn().mockReturnThis(),
       from: vi.fn().mockReturnThis(),
-      where: vi.fn().mockResolvedValue([]),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([]),
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockImplementation(() => ({
+          then: (resolve: any) => resolve([]),
+        })),
+      })),
     } as any;
 
     const digest = await buildSwarmDigest(mockDb, {
@@ -83,7 +91,13 @@ describe("buildSwarmDigest", () => {
     const mockDb = {
       select: vi.fn().mockReturnThis(),
       from: vi.fn().mockReturnThis(),
-      where: vi.fn().mockResolvedValue([]),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([]),
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockImplementation(() => ({
+          then: (resolve: any) => resolve([]),
+        })),
+      })),
     } as any;
 
     const digest = await buildSwarmDigest(mockDb, {
@@ -118,6 +132,50 @@ describe("buildSwarmDigest", () => {
 
     expect(digest.companyId).toBe("company-1");
     expect(digest.projectId).toBe("project-1");
+  });
+
+  it("filters agents to status=running only (not all non-deleted)", async () => {
+    // Mock the db to return agents - the real query filters to status=running
+    // so we only include running agents in the resolved value
+    // Note: mock returns different results for different queries via queryIndex
+    let queryIndex = 0;
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => {
+          const results = [
+            // Query 0: agents
+            [{ id: "agent-1", name: "Running Agent", status: "running" }],
+            // Query 1: runs (empty since no active agents in mock)
+            [],
+            // Query 2: stale claims (empty)
+            [],
+            // Query 3: degraded services (empty)
+            [],
+            // Query 4: stuck runs (empty)
+            [],
+            // Query 5: handoff comments (empty)
+            [],
+          ];
+          return resolve(results[queryIndex++] ?? []);
+        },
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockImplementation(() => ({
+          then: (resolve: any) => resolve([]),
+        })),
+      })),
+    } as any;
+
+    const digest = await buildSwarmDigest(mockDb as any, {
+      companyId: "company-1",
+      projectId: null,
+    });
+
+    // Should only return running agents, not idle or deleted
+    expect(digest.activeAgents.length).toBe(1);
+    expect(digest.activeAgents[0].status).toBe("running");
+    expect(digest.activeAgents[0].name).toBe("Running Agent");
   });
 });
 
@@ -176,6 +234,10 @@ describe("file claims sequencing", () => {
       fileClaimConflicts: [
         { claimPath: "src/contested.ts", claimType: "file", conflictingAgentId: "agent-2", conflictingRunId: "run-2" },
       ],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -195,6 +257,10 @@ describe("file claims sequencing", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -214,6 +280,10 @@ describe("formatSwarmDigestForPrompt", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -236,6 +306,10 @@ describe("formatSwarmDigestForPrompt", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -268,6 +342,10 @@ describe("formatSwarmDigestForPrompt", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -298,6 +376,10 @@ describe("formatSwarmDigestForPrompt", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -325,6 +407,10 @@ describe("formatSwarmDigestForPrompt", () => {
       ],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -359,6 +445,10 @@ describe("formatSwarmDigestForPrompt", () => {
         },
       ],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -405,6 +495,10 @@ describe("formatSwarmDigestForPrompt", () => {
         ownerAgentId: null,
       })),
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -465,6 +559,10 @@ describe("formatSwarmDigestForPrompt", () => {
         },
       ],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -486,6 +584,10 @@ describe("digest data structure integrity", () => {
       workspaces: [],
       services: [],
       fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
     };
 
     expect(digest.companyId).toBe("company-1");
@@ -496,6 +598,10 @@ describe("digest data structure integrity", () => {
     expect(Array.isArray(digest.workspaces)).toBe(true);
     expect(Array.isArray(digest.services)).toBe(true);
     expect(Array.isArray(digest.fileClaimConflicts)).toBe(true);
+    expect(Array.isArray(digest.fileClaimStale)).toBe(true);
+    expect(Array.isArray(digest.servicesDegraded)).toBe(true);
+    expect(Array.isArray(digest.runsStuck)).toBe(true);
+    expect(Array.isArray(digest.recentHandoffs)).toBe(true);
   });
 });
 

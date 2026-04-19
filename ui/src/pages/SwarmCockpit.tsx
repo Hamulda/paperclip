@@ -15,6 +15,9 @@ import {
   Clock,
   CheckCircle2,
   XCircle,
+  ArrowRight,
+  FileText,
+  AlertCircle,
 } from "lucide-react";
 
 function SectionCard({
@@ -150,6 +153,73 @@ function ConflictRow({ conflict }: { conflict: { claimPath: string; claimType: s
   );
 }
 
+function StaleClaimRow({ claim }: { claim: { id: string; claimPath: string; claimType: string; minutesUntilExpiry: number } }) {
+  const isExpiring = claim.minutesUntilExpiry <= 1;
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <Clock className={cn("h-4 w-4 shrink-0 mt-0.5", isExpiring ? "text-red-500" : "text-yellow-500")} />
+      <div className="min-w-0 flex-1">
+        <p className="font-mono text-xs truncate">{claim.claimPath}</p>
+        <p className="text-xs text-muted-foreground">
+          {claim.minutesUntilExpiry <= 0
+            ? "Expired"
+            : `${claim.minutesUntilExpiry}m until expiry`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function DegradedServiceRow({ svc }: { svc: { id: string; serviceName: string; status: string; healthStatus: string; url: string | null } }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <AlertCircle className="h-4 w-4 shrink-0 text-red-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <p className="font-medium truncate">{svc.serviceName}</p>
+        <p className="text-xs text-muted-foreground">
+          {svc.status} / {svc.healthStatus}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function StuckRunRow({ run }: { run: { id: string; issueIdentifier: string | null; issueTitle: string | null; status: string; minutesWaiting: number } }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <Clock className="h-4 w-4 shrink-0 text-yellow-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-medium">
+          {run.issueIdentifier ? `[${run.issueIdentifier}]` : "No issue"} {run.issueTitle ?? ""}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          Waiting {run.minutesWaiting}m
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function HandoffRow({ handoff }: { handoff: { id: string; agentName: string; issueIdentifier: string | null; summary: string; recommendedNextStep: string; emittedAt: string } }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <ArrowRight className="h-4 w-4 shrink-0 text-blue-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1">
+          <span className="font-medium text-xs">{handoff.agentName}</span>
+          {handoff.issueIdentifier && (
+            <span className="text-xs text-muted-foreground">[{handoff.issueIdentifier}]</span>
+          )}
+        </div>
+        <p className="text-xs truncate mt-0.5">{handoff.summary}</p>
+        <p className="text-xs text-blue-500 truncate mt-0.5">
+          Next: {handoff.recommendedNextStep}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export function SwarmCockpit() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -206,7 +276,7 @@ export function SwarmCockpit() {
         </SectionCard>
 
         <SectionCard title="Hot Slot Usage" icon={Zap} className="md:col-span-2 lg:col-span-1">
-          <HotSlotMeter current={data.hotSlotUsage.current} max={data.hotSlotUsage.maxPerAgent} />
+          <HotSlotMeter current={data.hotSlotUsage.current} max={data.hotSlotUsage.max} />
           {data.queuedHotRunsCount > 0 && (
             <p className="mt-2 text-xs text-yellow-500">
               {data.queuedHotRunsCount} queued hot runs waiting
@@ -257,6 +327,54 @@ export function SwarmCockpit() {
             <div className="divide-y divide-border max-h-48 overflow-y-auto">
               {data.fileClaimConflicts.slice(0, 10).map((conflict, i) => (
                 <ConflictRow key={i} conflict={conflict} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Stale Claims" icon={Clock} className="md:col-span-2 lg:col-span-1">
+          {data.fileClaimStale.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No expiring claims</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.fileClaimStale.slice(0, 10).map((claim) => (
+                <StaleClaimRow key={claim.id} claim={claim} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Failed/Degraded Services" icon={AlertCircle} className="md:col-span-2 lg:col-span-1">
+          {data.servicesDegraded.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No degraded services</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.servicesDegraded.slice(0, 10).map((svc) => (
+                <DegradedServiceRow key={svc.id} svc={svc} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Stuck Runs" icon={Clock} className="md:col-span-2 lg:col-span-1">
+          {data.runsStuck.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No stuck runs</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.runsStuck.slice(0, 10).map((run) => (
+                <StuckRunRow key={run.id} run={run} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Recent Handoffs" icon={ArrowRight} className="md:col-span-2 lg:col-span-2">
+          {data.recentHandoffs.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No recent handoffs</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.recentHandoffs.slice(0, 10).map((handoff) => (
+                <HandoffRow key={handoff.id} handoff={handoff} />
               ))}
             </div>
           )}

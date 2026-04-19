@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Plus, X, ChevronDown, ChevronRight, AlertCircle } from "lucide-react";
 import { cn } from "../lib/utils";
 
+const DEBOUNCE_MS = 300;
+
 export interface ServiceEntry {
   name: string;
   command: string;
@@ -178,6 +180,7 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
   const [jsonError, setJsonError] = useState<string | null>(null);
   const valueRef = useRef(value);
   const emittingRef = useRef(false);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (emittingRef.current) {
@@ -186,6 +189,10 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
       return;
     }
     if (value !== valueRef.current) {
+      if (debounceTimerRef.current !== null) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
       valueRef.current = value;
       setServices(parseServices(value));
       setJsonText(value ? JSON.stringify(value, null, 2) : "");
@@ -197,8 +204,20 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
 
   function emit(nextServices: ServiceEntry[]) {
     const serialized = serializeServices(nextServices);
+    const nextValue = serialized.services.length > 0 ? serialized : null;
+    if (nextValue === valueRef.current) return;
     emittingRef.current = true;
-    onChange(serialized.services.length > 0 ? serialized : null);
+    onChange(nextValue);
+  }
+
+  function scheduleEmit(nextServices: ServiceEntry[]) {
+    if (debounceTimerRef.current !== null) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = null;
+      emit(nextServices);
+    }, DEBOUNCE_MS);
   }
 
   function serializeServices(services: ServiceEntry[]): { services: unknown[] } {
@@ -218,19 +237,19 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
   function updateService(index: number, patch: Partial<ServiceEntry>) {
     const next = services.map((s, i) => (i === index ? { ...s, ...patch } : s));
     setServices(next);
-    emit(next);
+    scheduleEmit(next);
   }
 
   function addService() {
     const next = [...services, { name: "", command: "" }];
     setServices(next);
-    emit(next);
+    scheduleEmit(next);
   }
 
   function removeService(index: number) {
     const next = services.filter((_, i) => i !== index);
     setServices(next);
-    emit(next);
+    scheduleEmit(next);
   }
 
   function handleJsonChange(text: string) {
@@ -243,6 +262,8 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
     }
     try {
       const parsed = JSON.parse(text);
+      const nextValue = parsed;
+      if (nextValue === valueRef.current) return;
       setJsonError(null);
       emittingRef.current = true;
       onChange(parsed);
@@ -250,6 +271,14 @@ export function WorkspaceServicesEditor({ value, onChange }: WorkspaceServicesEd
       setJsonError(err instanceof Error ? err.message : "Invalid JSON");
     }
   }
+
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current !== null) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
 
   const isJsonMode = showJson || jsonError !== null;
   const hasErrors = errors.size > 0;

@@ -40,6 +40,52 @@ export interface SwarmDigestFileClaimConflict {
   conflictingRunId: string;
 }
 
+export interface SwarmDigestFileClaimStale {
+  id: string;
+  claimPath: string;
+  claimType: string;
+  agentId: string | null;
+  runId: string | null;
+  expiresAt: string;
+  minutesUntilExpiry: number;
+}
+
+export interface SwarmDigestServiceDegraded {
+  id: string;
+  serviceName: string;
+  status: string;
+  healthStatus: string;
+  url: string | null;
+  ownerAgentId: string | null;
+}
+
+export interface SwarmDigestRunStuck {
+  id: string;
+  agentId: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  issueTitle: string | null;
+  status: string;
+  startedAt: string | null;
+  minutesWaiting: number;
+}
+
+export interface SwarmDigestHandoff {
+  id: string;
+  agentId: string;
+  agentName: string;
+  runId: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  summary: string;
+  filesTouched: string[];
+  currentState: string;
+  remainingWork: string[];
+  blockers: string[];
+  recommendedNextStep: string;
+  emittedAt: string;
+}
+
 export interface SwarmDigest {
   companyId: string;
   projectId: string | null;
@@ -49,12 +95,16 @@ export interface SwarmDigest {
   workspaces: SwarmDigestWorkspace[];
   services: SwarmDigestService[];
   fileClaimConflicts: SwarmDigestFileClaimConflict[];
+  fileClaimStale: SwarmDigestFileClaimStale[];
+  servicesDegraded: SwarmDigestServiceDegraded[];
+  runsStuck: SwarmDigestRunStuck[];
+  recentHandoffs: SwarmDigestHandoff[];
 }
 
 export interface SwarmCockpitDigest extends SwarmDigest {
   hotSlotUsage: {
     current: number;
-    maxPerAgent: number;
+    max: number;
   };
   queuedHotRunsCount: number;
 }

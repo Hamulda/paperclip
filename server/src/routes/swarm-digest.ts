@@ -3,13 +3,13 @@ import type { Db } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import { buildSwarmDigest, type SwarmDigest } from "../services/swarm-digest.js";
-import { countRunningHotCodingRuns, SESSIONED_LOCAL_ADAPTERS } from "../services/hot-run-governor.js";
+import { countRunningHotCodingRuns, SESSIONED_LOCAL_ADAPTERS, HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT } from "../services/hot-run-governor.js";
 import { assertCompanyAccess } from "./authz.js";
 
 export interface SwarmCockpitDigest extends SwarmDigest {
   hotSlotUsage: {
     current: number;
-    maxPerAgent: number;
+    max: number;
   };
   queuedHotRunsCount: number;
 }
@@ -47,7 +47,7 @@ export function swarmDigestRoutes(db: Db) {
       ...digest,
       hotSlotUsage: {
         current: hotSlotCurrent,
-        maxPerAgent: 2,
+        max: HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT,
       },
       queuedHotRunsCount: Number(queuedCount ?? 0),
     });

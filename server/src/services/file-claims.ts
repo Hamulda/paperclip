@@ -9,6 +9,51 @@ export interface ClaimInput {
   claimPath: string;
 }
 
+/**
+ * Normalize claim path for consistent comparison.
+ * - trim whitespace
+ * - normalize separators (backslash -> forward slash)
+ * - remove redundant "./" prefixes
+ * - collapse multiple slashes
+ * - remove trailing slash (except for root)
+ */
+export function normalizePath(path: string): string {
+  if (!path) return "";
+  let normalized = path.trim().replace(/\\/g, "/");
+  // Remove leading ./
+  while (normalized.startsWith("./")) {
+    normalized = normalized.slice(2);
+  }
+  // Collapse multiple slashes
+  normalized = normalized.replace(/\/+/g, "/");
+  // Remove trailing slash unless it's root
+  if (normalized.length > 1 && normalized.endsWith("/")) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function pathsOverlap(claimPath: string, claimType: ClaimType, otherPath: string, otherType: ClaimType): boolean {
+  const normClaim = normalizePath(claimPath);
+  const normOther = normalizePath(otherPath);
+
+  if (normClaim === normOther) return true;
+
+  if (claimType === "glob" && matchesGlob(normClaim, normOther)) return true;
+  if (otherType === "glob" && matchesGlob(normOther, normClaim)) return true;
+
+  if (claimType === "directory" && otherType === "glob" && normOther.startsWith(normClaim + "/")) return true;
+  if (otherType === "directory" && claimType === "glob" && normClaim.startsWith(normOther + "/")) return true;
+
+  if (claimType === "directory" && normOther.startsWith(normClaim + "/")) return true;
+  if (claimType === "file" && otherType === "directory" && normClaim.startsWith(normOther + "/")) return true;
+
+  if (otherType === "directory" && normClaim.startsWith(normOther + "/")) return true;
+  if (otherType === "file" && claimType === "directory" && normOther.startsWith(normClaim + "/")) return true;
+
+  return false;
+}
+
 export interface ClaimWithConflict extends FileClaim {
   conflictingClaims: FileClaim[];
 }
@@ -47,22 +92,16 @@ export interface ListConflictsInput {
 }
 
 function matchesGlob(pattern: string, path: string): boolean {
-  const regex = new RegExp(
-    "^" + pattern.replace(/\./g, "\\.").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*") + "$"
-  );
+  // CRITICAL: protect ** output from * replacement.
+  // Replace in strict order: ** placeholder -> * -> dots -> restore **
+  const placeholder = "\x00DOUBLESTAR\x00";
+  const regexPattern = pattern
+    .replace(/\*\*/g, placeholder)
+    .replace(/\*/g, "[^/]*")
+    .replace(/\./g, "\\.")
+    .replace(new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g'), ".*");
+  const regex = new RegExp("^" + regexPattern + "$");
   return regex.test(path);
-}
-
-function pathsOverlap(claimPath: string, claimType: ClaimType, otherPath: string, otherType: ClaimType): boolean {
-  if (claimPath === otherPath) return true;
-
-  if (claimType === "glob" && matchesGlob(claimPath, otherPath)) return true;
-  if (otherType === "glob" && matchesGlob(otherPath, claimPath)) return true;
-
-  if (claimType === "directory" && otherPath.startsWith(claimPath + "/")) return true;
-  if (otherType === "directory" && claimPath.startsWith(otherPath + "/")) return true;
-
-  return false;
 }
 
 export async function acquireClaims(
@@ -307,10 +346,11 @@ export async function getActiveClaimsForRun(
   runId: string,
   projectId?: string | null,
 ): Promise<FileClaim[]> {
-  const conditions = [
+  const conditions: ReturnType<typeof eq>[] = [
     eq(fileClaims.companyId, companyId),
     eq(fileClaims.runId, runId),
     eq(fileClaims.status, "active"),
+    gte(fileClaims.expiresAt, new Date()),
   ];
 
   if (projectId) {

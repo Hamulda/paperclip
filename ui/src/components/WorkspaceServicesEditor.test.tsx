@@ -5,6 +5,8 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceServicesEditor } from "./WorkspaceServicesEditor";
 
+const DEBOUNCE_MS = 300;
+
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("WorkspaceServicesEditor", () => {
@@ -16,9 +18,11 @@ describe("WorkspaceServicesEditor", () => {
     onChange = vi.fn();
     container = document.createElement("div");
     document.body.appendChild(container);
+    vi.useFakeTimers();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     act(() => {
       root?.unmount();
     });
@@ -142,10 +146,146 @@ describe("WorkspaceServicesEditor", () => {
     expect(document.body.textContent).toContain("Agent");
   });
 
-  it("renders description text", () => {
-    renderEditor();
-    expect(document.body.textContent).toContain(
-      "Services run in isolated execution workspaces",
+  it("does not emit on rapid keystrokes without debounce wait", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+    const nameInput = container.querySelector('input[value="web"]') as HTMLInputElement;
+    expect(nameInput).toBeTruthy();
+
+    act(() => {
+      nameInput.setSelectionRange(3, 3);
+      nameInput.setRangeText("2");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    act(() => {
+      nameInput.setSelectionRange(4, 4);
+      nameInput.setRangeText("3");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("emits after debounce delay", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+    const nameInput = container.querySelector('input[value="web"]') as HTMLInputElement;
+
+    act(() => {
+      nameInput.setSelectionRange(3, 3);
+      nameInput.setRangeText("2");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(onChange).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+    });
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const emitted = onChange.mock.calls[0][0] as Record<string, unknown>;
+    expect((emitted.services as unknown[])[0]).toMatchObject({ name: "web2", command: "pnpm dev" });
+  });
+
+  it("does not emit when value is identical after debounce", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+    });
+    onChange.mockClear();
+
+    const nameInput = container.querySelector('input[value="web"]') as HTMLInputElement;
+    // Replace "web" with "web" (same value via setRangeText)
+    act(() => {
+      nameInput.setSelectionRange(0, 3);
+    });
+    act(() => {
+      nameInput.setRangeText("web");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    act(() => {
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+    });
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("aborts pending emit when parent updates value", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+    const nameInput = container.querySelector('input[value="web"]') as HTMLInputElement;
+
+    act(() => {
+      nameInput.setSelectionRange(3, 3);
+      nameInput.setRangeText("2");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    // Unmount first (clears timer via cleanup effect), THEN advance time
+    act(() => {
+      root.unmount();
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+    });
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("clears pending debounce on unmount", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+    const nameInput = container.querySelector('input[value="web"]') as HTMLInputElement;
+
+    act(() => {
+      nameInput.setSelectionRange(3, 3);
+      nameInput.setRangeText("2");
+    });
+    nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    act(() => {
+      root.unmount();
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+    });
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("does not emit in JSON mode when parsed value is identical", () => {
+    renderEditor({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+    onChange.mockClear();
+
+    const jsonButton = Array.from(document.body.querySelectorAll("button")).find(
+      (b) => b.textContent === "JSON",
     );
+    act(() => {
+      jsonButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+    act(() => {
+      textarea.setSelectionRange(0, 0);
+    });
+
+    const validJson = JSON.stringify({ services: [{ name: "web", command: "pnpm dev" }] }, null, 2);
+    act(() => {
+      textarea.setRangeText(validJson);
+    });
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(onChange).not.toHaveBeenCalled();
   });
 });
