@@ -2,17 +2,10 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { agents, heartbeatRuns } from "@paperclipai/db";
-import { buildSwarmDigest, type SwarmDigest } from "../services/swarm-digest.js";
-import { countRunningHotCodingRuns, SESSIONED_LOCAL_ADAPTERS, HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT } from "../services/hot-run-governor.js";
+import { buildSwarmDigest } from "../services/swarm-digest.js";
+import { countRunningHotCodingRuns, getEffectiveHotCodingCapacity, SESSIONED_LOCAL_ADAPTERS } from "../services/hot-run-governor.js";
 import { assertCompanyAccess } from "./authz.js";
-
-export interface SwarmCockpitDigest extends SwarmDigest {
-  hotSlotUsage: {
-    current: number;
-    max: number;
-  };
-  queuedHotRunsCount: number;
-}
+import type { SwarmCockpitDigest } from "@paperclipai/shared";
 
 export function swarmDigestRoutes(db: Db) {
   const router = Router();
@@ -28,26 +21,31 @@ export function swarmDigestRoutes(db: Db) {
       projectId,
     });
 
-    const hotSlotCurrent = await countRunningHotCodingRuns(db, companyId);
+    const [hotSlotCurrent, hotSlotMax] = await Promise.all([
+      countRunningHotCodingRuns(db, companyId, projectId ?? undefined),
+      getEffectiveHotCodingCapacity(db, companyId, projectId ?? undefined),
+    ]);
 
     const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
+    const queuedConditions = [
+      eq(heartbeatRuns.status, "queued"),
+      eq(agents.companyId, companyId),
+      hotCodingTypes.length > 0 ? inArray(agents.adapterType, hotCodingTypes) : eq(agents.id, agents.id),
+    ];
+    if (projectId) {
+      queuedConditions.push(sql`${heartbeatRuns.contextSnapshot}->>'projectId' = ${projectId}` as any);
+    }
     const [{ count: queuedCount }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(
-        and(
-          eq(heartbeatRuns.status, "queued"),
-          eq(agents.companyId, companyId),
-          hotCodingTypes.length > 0 ? inArray(agents.adapterType, hotCodingTypes) : eq(agents.id, agents.id),
-        ),
-      );
+      .where(and(...queuedConditions));
 
     res.json({
       ...digest,
       hotSlotUsage: {
         current: hotSlotCurrent,
-        max: HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT,
+        max: hotSlotMax,
       },
       queuedHotRunsCount: Number(queuedCount ?? 0),
     });

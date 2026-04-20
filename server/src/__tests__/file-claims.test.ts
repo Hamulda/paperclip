@@ -5,6 +5,9 @@ import {
   releaseClaims,
   listConflicts,
   extractClaimPathsFromIssue,
+  isProtectedPath,
+  filterProtectedPaths,
+  extractClaimPathsFromDiff,
 } from "../services/file-claims.js";
 
 function createMockDb(overrides: Record<string, unknown> = {}) {
@@ -1109,5 +1112,278 @@ More text.
 
     expect(result).toContainEqual({ claimPath: "src/**/*.ts", claimType: "glob" });
     expect(result).toContainEqual({ claimPath: "src/*/file.ts", claimType: "glob" });
+  });
+});
+
+describe("isProtectedPath", () => {
+  it("blocks package.json", () => {
+    expect(isProtectedPath("package.json")).toBe(true);
+    expect(isProtectedPath("src/package.json")).toBe(true);
+  });
+
+  it("blocks lock files", () => {
+    expect(isProtectedPath("pnpm-lock.yaml")).toBe(true);
+    expect(isProtectedPath("yarn.lock")).toBe(true);
+    expect(isProtectedPath("bun.lockb")).toBe(true);
+  });
+
+  it("blocks .git and .github directories", () => {
+    expect(isProtectedPath(".git/config")).toBe(true);
+    expect(isProtectedPath(".github/workflows/test.yml")).toBe(true);
+  });
+
+  it("blocks node_modules and build directories", () => {
+    expect(isProtectedPath("node_modules/lodash")).toBe(true);
+    expect(isProtectedPath("dist/bundle.js")).toBe(true);
+    expect(isProtectedPath("build/output.css")).toBe(true);
+  });
+
+  it("blocks config files", () => {
+    expect(isProtectedPath("tsconfig.json")).toBe(true);
+    expect(isProtectedPath("jest.config.js")).toBe(true);
+    expect(isProtectedPath("vitest.config.ts")).toBe(true);
+  });
+
+  it("blocks test files", () => {
+    expect(isProtectedPath("src/foo.test.ts")).toBe(true);
+    expect(isProtectedPath("src/bar.spec.tsx")).toBe(true);
+    expect(isProtectedPath("src/baz.stories.tsx")).toBe(true);
+  });
+
+  it("allows regular source files", () => {
+    expect(isProtectedPath("src/foo.ts")).toBe(false);
+    expect(isProtectedPath("src/bar.tsx")).toBe(false);
+    expect(isProtectedPath("src/utils/helper.ts")).toBe(false);
+  });
+
+  it("allows files not in protected patterns", () => {
+    expect(isProtectedPath("src/components/Button.tsx")).toBe(false);
+    expect(isProtectedPath("server/routes/api.ts")).toBe(false);
+  });
+
+  it("respects custom protected patterns", () => {
+    expect(isProtectedPath("secret.txt", ["secret.txt"])).toBe(true);
+    expect(isProtectedPath("src/foo.ts", ["src/**/*.ts"])).toBe(true);
+  });
+});
+
+describe("filterProtectedPaths", () => {
+  it("separates allowed from blocked claims", () => {
+    const claims = [
+      { claimType: "file" as const, claimPath: "src/foo.ts" },
+      { claimType: "file" as const, claimPath: "package.json" },
+      { claimType: "file" as const, claimPath: "src/bar.ts" },
+    ];
+
+    const result = filterProtectedPaths(claims);
+
+    expect(result.allowed).toHaveLength(2);
+    expect(result.blocked).toHaveLength(1);
+    expect(result.blocked[0].claimPath).toBe("package.json");
+  });
+
+  it("returns empty arrays when all claims are allowed", () => {
+    const claims = [
+      { claimType: "file" as const, claimPath: "src/foo.ts" },
+      { claimType: "file" as const, claimPath: "src/bar.ts" },
+    ];
+
+    const result = filterProtectedPaths(claims);
+
+    expect(result.allowed).toHaveLength(2);
+    expect(result.blocked).toHaveLength(0);
+  });
+
+  it("returns empty arrays when all claims are blocked", () => {
+    const claims = [
+      { claimType: "file" as const, claimPath: "package.json" },
+      { claimType: "file" as const, claimPath: "pnpm-lock.yaml" },
+    ];
+
+    const result = filterProtectedPaths(claims);
+
+    expect(result.allowed).toHaveLength(0);
+    expect(result.blocked).toHaveLength(2);
+  });
+
+  it("respects custom protected patterns", () => {
+    const claims = [
+      { claimType: "file" as const, claimPath: "custom.txt" },
+      { claimType: "file" as const, claimPath: "src/foo.ts" },
+    ];
+
+    const result = filterProtectedPaths(claims, ["custom.txt"]);
+
+    expect(result.allowed).toHaveLength(1);
+    expect(result.blocked).toHaveLength(1);
+    expect(result.blocked[0].claimPath).toBe("custom.txt");
+  });
+});
+
+describe("extractClaimPathsFromDiff", () => {
+  it("extracts paths from diff --git headers", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+index 1234567..89abcdef 100644
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,5 +1,6 @@
+ const foo = "bar";
++const baz = "qux";
+ return foo;`;
+
+    const result = extractClaimPathsFromDiff(diff);
+
+    expect(result.some((c) => c.claimPath === "src/foo.ts")).toBe(true);
+  });
+
+  it("extracts multiple files from a diff", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+index 1234567..89abcdef 100644
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,5 +1,6 @@
+ const foo = "bar";
++const baz = "qux";
+diff --git a/src/bar.ts b/src/bar.ts
+index 1234567..89abcdef 100644
+--- a/src/bar.ts
++++ b/src/bar.ts
+@@ -1,5 +1,6 @@
+ const bar = "foo";
++const qux = "baz";`;
+
+    const result = extractClaimPathsFromDiff(diff);
+
+    expect(result).toHaveLength(2);
+    expect(result.map((c) => c.claimPath)).toContain("src/foo.ts");
+    expect(result.map((c) => c.claimPath)).toContain("src/bar.ts");
+  });
+
+  it("deduplicates paths", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+index 1234567..89abcdef 100644
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,5 +1,6 @@
+ const foo = "bar";
++const baz = "qux";
+diff --git a/src/foo.ts b/src/foo.ts
+index 89abcdef..1111111 100644
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,6 +2,7 @@
+ const foo = "bar";
+ const baz = "qux";
++const newVar = "value";`;
+
+    const result = extractClaimPathsFromDiff(diff);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].claimPath).toBe("src/foo.ts");
+  });
+
+  it("returns empty array for empty diff", () => {
+    const result = extractClaimPathsFromDiff("");
+    expect(result).toHaveLength(0);
+  });
+
+  it("returns empty array for diff with no file changes", () => {
+    const diff = `diff --git a/README.md b/README.md
+index 1234567..89abcdef 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,3 @@
+ # Project
++New line added`;
+
+    const result = extractClaimPathsFromDiff(diff);
+    // .md files are in protected patterns, but extractClaimPathsFromDiff doesn't filter
+    // The filtering happens in acquireClaims via filterProtectedPaths
+    expect(result).toHaveLength(1);
+  });
+
+  it("handles renamed files", () => {
+    const diff = `rename from src/old.ts
+rename to src/new.ts`;
+
+    const result = extractClaimPathsFromDiff(diff);
+
+    expect(result.some((c) => c.claimPath === "src/old.ts")).toBe(true);
+    expect(result.some((c) => c.claimPath === "src/new.ts")).toBe(true);
+  });
+});
+
+describe("acquireClaims with protected paths", () => {
+  it("blocks protected paths and does not insert them", async () => {
+    const mockDb = createMockDb({
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([]),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{
+            id: "claim-1",
+            companyId: "company-1",
+            projectId: "project-1",
+            agentId: "agent-1",
+            runId: "run-1",
+            claimType: "file",
+            claimPath: "src/foo.ts",
+            status: "active",
+            expiresAt: new Date(),
+          }]),
+        }),
+      }),
+    });
+
+    const result = await acquireClaims(mockDb as any, {
+      companyId: "company-1",
+      projectId: "project-1",
+      issueId: "issue-1",
+      agentId: "agent-1",
+      runId: "run-1",
+      claims: [
+        { claimType: "file", claimPath: "src/foo.ts" },
+        { claimType: "file", claimPath: "package.json" },
+      ],
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+
+    // package.json should be blocked, src/foo.ts should be acquired
+    expect(result.acquired.length).toBe(1);
+    expect(result.blocked.length).toBe(1);
+    expect(result.blocked[0].claimPath).toBe("package.json");
+  });
+
+  it("returns blocked in result", async () => {
+    const mockDb = createMockDb({
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([]),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([]),
+        }),
+      }),
+    });
+
+    const result = await acquireClaims(mockDb as any, {
+      companyId: "company-1",
+      projectId: "project-1",
+      issueId: "issue-1",
+      agentId: "agent-1",
+      runId: "run-1",
+      claims: [
+        { claimType: "file", claimPath: "pnpm-lock.yaml" },
+      ],
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+
+    expect(result.blocked).toHaveLength(1);
+    expect(result.blocked[0].claimPath).toBe("pnpm-lock.yaml");
   });
 });

@@ -66,6 +66,13 @@ export interface AcquireClaimsInput {
   runId: string;
   claims: ClaimInput[];
   expiresAt: Date;
+  protectedPaths?: string[]; // optional override of protected path patterns
+}
+
+export interface AcquireClaimsResult {
+  acquired: FileClaim[];
+  conflicts: ClaimWithConflict[];
+  blocked: ClaimInput[]; // claims blocked due to protected path rules
 }
 
 export interface RefreshClaimsInput {
@@ -91,6 +98,172 @@ export interface ListConflictsInput {
   excludeRunId?: string | null;
 }
 
+/**
+ * Protected paths registry — hard-block rules for critical directories/files
+ * that should never be claimed. These are project-agnostic defaults.
+ */
+export interface ProtectedPathsConfig {
+  patterns: string[]; // glob patterns that are protected
+}
+
+export const DEFAULT_PROTECTED_PATTERNS = [
+  "package.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+  ".git/**",
+  ".github/**",
+  "node_modules/**",
+  "dist/**",
+  "build/**",
+  ".next/**",
+  ".nuxt/**",
+  ".output/**",
+  ".cache/**",
+  ".parcel-cache/**",
+  "__pycache__/**",
+  "*.pyc",
+  ".venv/**",
+  "venv/**",
+  "*.egg-info/**",
+  ".turbo/**",
+  ".vercel/**",
+  ".netlify/**",
+  ".env",
+  ".env.*",
+  "!.env.example",
+  "tsconfig*.json",
+  "jsconfig*.json",
+  "jest.config.*",
+  "vitest.config.*",
+  "*.test.ts",
+  "*.test.tsx",
+  "*.spec.ts",
+  "*.spec.tsx",
+  "*.stories.tsx",
+  "*.md",
+];
+
+/**
+ * Check if a path matches any protected pattern.
+ * Handles both exact glob matches and file-name-based matches (e.g., "package.json" matches "src/package.json").
+ */
+export function isProtectedPath(path: string, protectedPatterns: string[] = DEFAULT_PROTECTED_PATTERNS): boolean {
+  const normalized = normalizePath(path);
+  for (const pattern of protectedPatterns) {
+    // Direct glob match
+    if (matchesGlob(pattern, normalized)) {
+      return true;
+    }
+    // Directory pattern with /**
+    if (matchesGlob(pattern + "/**", normalized)) {
+      return true;
+    }
+    // For non-glob patterns like "package.json", check if path ends with /pattern
+    if (!pattern.includes("*")) {
+      if (normalized === pattern || normalized.endsWith("/" + pattern)) {
+        return true;
+      }
+    }
+    // For patterns like "*.test.ts" that should match any directory, check if path ends with the pattern
+    // This handles cases like "src/foo.test.ts" matching pattern "*.test.ts"
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(1); // "*.test.ts" -> ".test.ts"
+      if (normalized.endsWith(suffix)) {
+        return true;
+      }
+    }
+    // For patterns with ** like "src/**/*.ts", check if path matches
+    // Split by ** and check prefix/suffix match, allowing ** to match zero or more path segments
+    if (pattern.includes("**")) {
+      const parts = pattern.split("**");
+      if (parts.length === 2) {
+        let [prefix, suffix] = parts;
+        // Strip leading / from suffix since we want to match the end of the path
+        if (suffix.startsWith("/")) {
+          suffix = suffix.slice(1);
+        }
+        // Path must start with prefix and end with suffix (glob match for suffix)
+        if (normalized.startsWith(prefix) && matchesGlob(suffix, normalized.slice(prefix.length))) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Filter out protected paths from a list of claim inputs.
+ * Returns { allowed: ClaimInput[], blocked: ClaimInput[] }
+ */
+export function filterProtectedPaths(
+  claims: ClaimInput[],
+  protectedPatterns: string[] = DEFAULT_PROTECTED_PATTERNS,
+): { allowed: ClaimInput[]; blocked: ClaimInput[] } {
+  const allowed: ClaimInput[] = [];
+  const blocked: ClaimInput[] = [];
+
+  for (const claim of claims) {
+    if (isProtectedPath(claim.claimPath, protectedPatterns)) {
+      blocked.push(claim);
+    } else {
+      allowed.push(claim);
+    }
+  }
+
+  return { allowed, blocked };
+}
+
+/**
+ * Extract claim path suggestions from a git diff.
+ * Supports:
+ * - Added/modified file paths (lines starting with + but not +++)
+ * - Renamed file paths
+ */
+export function extractClaimPathsFromDiff(diff: string): ClaimInput[] {
+  const claims: ClaimInput[] = [];
+  const seen = new Set<string>();
+
+  function addClaim(path: string) {
+    const normalized = normalizePath(path);
+    const key = `file:${normalized}`;
+    if (!seen.has(key) && normalized) {
+      seen.add(key);
+      claims.push({ claimPath: normalized, claimType: "file" });
+    }
+  }
+
+  const lines = diff.split("\n");
+  for (const line of lines) {
+    // Match: +new_file.ts (added file, not diff header)
+    // or: rename from old.ts / rename to new.ts
+    // or: diff --git a/path/to/file.ts b/path/to/file.ts (extract both paths)
+    const diffHeaderMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (diffHeaderMatch) {
+      addClaim(diffHeaderMatch[2]);
+      continue;
+    }
+
+    // Added file: +++ b/newfile.ts
+    const addedMatch = line.match(/^\+{3}\s+b\/(.+)$/);
+    if (addedMatch && !line.startsWith("+++ b/")) {
+      // skip binary files and mode changes
+      addClaim(addedMatch[1]);
+      continue;
+    }
+
+    // Renamed files
+    const renameMatch = line.match(/^rename (?:from|to)\s+(.+)$/);
+    if (renameMatch) {
+      addClaim(renameMatch[1]);
+      continue;
+    }
+  }
+
+  return claims;
+}
+
 function matchesGlob(pattern: string, path: string): boolean {
   // CRITICAL: protect ** output from * replacement.
   // Replace in strict order: ** placeholder -> * -> dots -> restore **
@@ -107,11 +280,19 @@ function matchesGlob(pattern: string, path: string): boolean {
 export async function acquireClaims(
   db: Db,
   input: AcquireClaimsInput,
-): Promise<{ acquired: FileClaim[]; conflicts: ClaimWithConflict[] }> {
-  const { companyId, projectId, issueId, agentId, runId, claims, expiresAt } = input;
+): Promise<AcquireClaimsResult> {
+  const { companyId, projectId, issueId, agentId, runId, claims, expiresAt, protectedPaths } = input;
 
   const now = new Date();
   const conflicts: ClaimWithConflict[] = [];
+  const blocked: ClaimInput[] = [];
+
+  // Filter out protected paths first
+  const { allowed: unprotectedClaims, blocked: protectedBlocked } = filterProtectedPaths(
+    claims,
+    protectedPaths,
+  );
+  blocked.push(...protectedBlocked);
 
   // Single query: fetch all active, non-expired claims for this company
   const existingClaims = await db
@@ -129,7 +310,7 @@ export async function acquireClaims(
   const conflictClaimInputs: ClaimInput[] = [];
   const nonConflictClaimInputs: ClaimInput[] = [];
 
-  for (const claim of claims) {
+  for (const claim of unprotectedClaims) {
     const overlapping = existingClaims.filter(
       (c) =>
         c.agentId !== agentId &&
@@ -192,7 +373,7 @@ export async function acquireClaims(
     }
   }
 
-  return { acquired, conflicts };
+  return { acquired, conflicts, blocked };
 }
 
 export async function refreshClaims(

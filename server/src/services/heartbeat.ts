@@ -30,7 +30,22 @@ import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } fr
 import { costService } from "./costs.js";
 import { buildSwarmDigest, formatSwarmDigestForPrompt, buildHandoffComment } from "./swarm-digest.js";
 import { acquireClaims, refreshClaims, releaseClaims, listConflicts } from "./file-claims.js";
-import { buildExecutionWorkspaceConfigSnapshot, deriveRepoNameFromRepoUrl } from "./workspace-repo-utils.js";
+import {
+  resolveExecutionRunAdapterConfig,
+  extractMentionedSkillIdsFromSources,
+  applyRunScopedMentionedSkillKeys,
+  resolveRunScopedMentionedSkillKeys,
+  applyPersistedExecutionWorkspaceConfig,
+  stripWorkspaceRuntimeFromExecutionRunConfig,
+  buildRealizedExecutionWorkspaceFromPersisted,
+  ensureManagedProjectWorkspace,
+  prioritizeProjectWorkspaceCandidatesForRun,
+  resolveRuntimeSessionParamsForWorkspace,
+  type RuntimeConfigSecretResolver,
+  type ResolvedWorkspaceForRun,
+  type ProjectWorkspaceCandidate,
+} from "./runtime-config-builder.js";
+import { buildExecutionWorkspaceConfigSnapshot } from "./workspace-repo-utils.js";
 import {
   normalizeUsageTotals,
   readRawUsageTotals,
@@ -43,7 +58,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
-import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
@@ -51,6 +66,14 @@ import {
   HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
+import {
+  buildExplicitResumeSessionOverride,
+  getAdapterSessionCodec,
+  normalizeSessionParams,
+  resolveNextSessionState,
+  defaultSessionCodec,
+  type ResumeSessionRow,
+} from "./session-state-manager.js";
 import {
   deriveTaskKey,
   deriveTaskKeyWithHeartbeatFallback,
@@ -100,11 +123,6 @@ import {
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
-import {
-  readPaperclipSkillSyncPreference,
-  writePaperclipSkillSyncPreference,
-} from "@paperclipai/adapter-utils/server-utils";
-import { extractSkillMentionIds } from "@paperclipai/shared";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -130,230 +148,6 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "pi_local",
 ]);
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
-
-type RuntimeConfigSecretResolver = Pick<
-  ReturnType<typeof secretService>,
-  "resolveAdapterConfigForRuntime" | "resolveEnvBindings"
->;
-
-export async function resolveExecutionRunAdapterConfig(input: {
-  companyId: string;
-  executionRunConfig: Record<string, unknown>;
-  projectEnv: unknown;
-  secretsSvc: RuntimeConfigSecretResolver;
-}) {
-  const { config: resolvedConfig, secretKeys } = await input.secretsSvc.resolveAdapterConfigForRuntime(
-    input.companyId,
-    input.executionRunConfig,
-  );
-  const projectEnvResolution = input.projectEnv
-    ? await input.secretsSvc.resolveEnvBindings(input.companyId, input.projectEnv)
-    : { env: {}, secretKeys: new Set<string>() };
-  if (Object.keys(projectEnvResolution.env).length > 0) {
-    resolvedConfig.env = {
-      ...parseObject(resolvedConfig.env),
-      ...projectEnvResolution.env,
-    };
-    for (const key of projectEnvResolution.secretKeys) {
-      secretKeys.add(key);
-    }
-  }
-  return { resolvedConfig, secretKeys };
-}
-
-export function extractMentionedSkillIdsFromSources(
-  sources: Array<string | null | undefined>,
-): string[] {
-  const mentionedIds = new Set<string>();
-  for (const source of sources) {
-    if (typeof source !== "string" || source.length === 0) continue;
-    for (const skillId of extractSkillMentionIds(source)) {
-      mentionedIds.add(skillId);
-    }
-  }
-  return [...mentionedIds];
-}
-
-export function applyRunScopedMentionedSkillKeys(
-  config: Record<string, unknown>,
-  skillKeys: string[],
-): Record<string, unknown> {
-  const normalizedSkillKeys = Array.from(
-    new Set(
-      skillKeys
-        .map((value) => value.trim())
-        .filter(Boolean),
-    ),
-  );
-  if (normalizedSkillKeys.length === 0) return config;
-
-  const existingPreference = readPaperclipSkillSyncPreference(config);
-  return writePaperclipSkillSyncPreference(config, [
-    ...existingPreference.desiredSkills,
-    ...normalizedSkillKeys,
-  ]);
-}
-
-async function resolveRunScopedMentionedSkillKeys(input: {
-  db: Db;
-  companyId: string;
-  issueId: string | null;
-}): Promise<string[]> {
-  if (!input.issueId) return [];
-
-  const issue = await input.db
-    .select({
-      title: issues.title,
-      description: issues.description,
-    })
-    .from(issues)
-    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
-    .then((rows) => rows[0] ?? null);
-  if (!issue) return [];
-
-  const comments = await input.db
-    .select({ body: issueComments.body })
-    .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.issueId, input.issueId),
-        eq(issueComments.companyId, input.companyId),
-      ),
-    );
-  const mentionedSkillIds = extractMentionedSkillIdsFromSources([
-    issue.title,
-    issue.description ?? "",
-    ...comments.map((comment) => comment.body),
-  ]);
-  if (mentionedSkillIds.length === 0) return [];
-
-  const skillRows = await input.db
-    .select({
-      id: companySkillsTable.id,
-      key: companySkillsTable.key,
-    })
-    .from(companySkillsTable)
-    .where(
-      and(
-        eq(companySkillsTable.companyId, input.companyId),
-        inArray(companySkillsTable.id, mentionedSkillIds),
-      ),
-    );
-  const skillKeyById = new Map(skillRows.map((row) => [row.id, row.key]));
-  return mentionedSkillIds
-    .map((skillId) => skillKeyById.get(skillId) ?? null)
-    .filter((skillKey): skillKey is string => Boolean(skillKey));
-}
-
-export function applyPersistedExecutionWorkspaceConfig(input: {
-  config: Record<string, unknown>;
-  workspaceConfig: ExecutionWorkspaceConfig | null;
-  mode: ReturnType<typeof resolveExecutionWorkspaceMode>;
-}) {
-  const nextConfig = { ...input.config };
-
-  if (input.mode !== "agent_default") {
-    if (input.workspaceConfig?.workspaceRuntime === null) {
-      delete nextConfig.workspaceRuntime;
-    } else if (input.workspaceConfig?.workspaceRuntime) {
-      nextConfig.workspaceRuntime = { ...input.workspaceConfig.workspaceRuntime };
-    }
-  }
-
-  if (input.workspaceConfig && input.mode === "isolated_workspace") {
-    const nextStrategy = parseObject(nextConfig.workspaceStrategy);
-    if (input.workspaceConfig.provisionCommand === null) delete nextStrategy.provisionCommand;
-    else nextStrategy.provisionCommand = input.workspaceConfig.provisionCommand;
-    if (input.workspaceConfig.teardownCommand === null) delete nextStrategy.teardownCommand;
-    else nextStrategy.teardownCommand = input.workspaceConfig.teardownCommand;
-    nextConfig.workspaceStrategy = nextStrategy;
-  }
-
-  return nextConfig;
-}
-
-export function stripWorkspaceRuntimeFromExecutionRunConfig(config: Record<string, unknown>) {
-  const nextConfig = { ...config };
-  delete nextConfig.workspaceRuntime;
-  return nextConfig;
-}
-
-export function buildRealizedExecutionWorkspaceFromPersisted(input: {
-  base: ExecutionWorkspaceInput;
-  workspace: ExecutionWorkspace;
-}): RealizedExecutionWorkspace | null {
-  const cwd = readNonEmptyString(input.workspace.cwd) ?? readNonEmptyString(input.workspace.providerRef);
-  if (!cwd) {
-    return null;
-  }
-
-  const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
-  return {
-    baseCwd: input.base.baseCwd,
-    source: input.workspace.mode === "shared_workspace" ? "project_primary" : "task_session",
-    projectId: input.workspace.projectId ?? input.base.projectId,
-    workspaceId: input.workspace.projectWorkspaceId ?? input.base.workspaceId,
-    repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
-    repoRef: input.workspace.baseRef ?? input.base.repoRef,
-    strategy,
-    cwd,
-    branchName: input.workspace.branchName ?? null,
-    worktreePath: strategy === "git_worktree" ? (readNonEmptyString(input.workspace.providerRef) ?? cwd) : null,
-    warnings: [],
-    created: false,
-  };
-}
-
-async function ensureManagedProjectWorkspace(input: {
-  companyId: string;
-  projectId: string;
-  repoUrl: string | null;
-}): Promise<{ cwd: string; warning: string | null }> {
-  const cwd = resolveManagedProjectWorkspaceDir({
-    companyId: input.companyId,
-    projectId: input.projectId,
-    repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
-  });
-  await fs.mkdir(path.dirname(cwd), { recursive: true });
-  const stats = await fs.stat(cwd).catch(() => null);
-
-  if (!input.repoUrl) {
-    if (!stats) {
-      await fs.mkdir(cwd, { recursive: true });
-    }
-    return { cwd, warning: null };
-  }
-
-  const gitDirExists = await fs
-    .stat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory())
-    .catch(() => false);
-  if (gitDirExists) {
-    return { cwd, warning: null };
-  }
-
-  if (stats) {
-    const entries = await fs.readdir(cwd).catch(() => []);
-    if (entries.length > 0) {
-      return {
-        cwd,
-        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
-      };
-    }
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
-
-  try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
-      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
-    });
-    return { cwd, warning: null };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
-  }
-}
 
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
@@ -557,36 +351,6 @@ interface ParsedIssueAssigneeAdapterOverrides {
   useProjectWorkspace: boolean | null;
 }
 
-export type ResolvedWorkspaceForRun = {
-  cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
-  projectId: string | null;
-  workspaceId: string | null;
-  repoUrl: string | null;
-  repoRef: string | null;
-  workspaceHints: Array<{
-    workspaceId: string;
-    cwd: string | null;
-    repoUrl: string | null;
-    repoRef: string | null;
-  }>;
-  warnings: string[];
-};
-
-type ProjectWorkspaceCandidate = {
-  id: string;
-};
-
-export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
-  rows: T[],
-  preferredWorkspaceId: string | null | undefined,
-): T[] {
-  if (!preferredWorkspaceId) return rows;
-  const preferredIndex = rows.findIndex((row) => row.id === preferredWorkspaceId);
-  if (preferredIndex <= 0) return rows;
-  return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
-}
-
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -733,121 +497,8 @@ async function resolveLedgerScopeForRun(
   };
 }
 
-type ResumeSessionRow = {
-  sessionParamsJson: Record<string, unknown> | null;
-  sessionDisplayId: string | null;
-  lastRunId: string | null;
-};
-
-export function buildExplicitResumeSessionOverride(input: {
-  resumeFromRunId: string;
-  resumeRunSessionIdBefore: string | null;
-  resumeRunSessionIdAfter: string | null;
-  taskSession: ResumeSessionRow | null;
-  sessionCodec: AdapterSessionCodec;
-}) {
-  const desiredDisplayId = truncateDisplayId(
-    input.resumeRunSessionIdAfter ?? input.resumeRunSessionIdBefore,
-  );
-  const taskSessionParams = normalizeSessionParams(
-    input.sessionCodec.deserialize(input.taskSession?.sessionParamsJson ?? null),
-  );
-  const taskSessionDisplayId = truncateDisplayId(
-    input.taskSession?.sessionDisplayId ??
-      (input.sessionCodec.getDisplayId ? input.sessionCodec.getDisplayId(taskSessionParams) : null) ??
-      readNonEmptyString(taskSessionParams?.sessionId),
-  );
-  const canReuseTaskSessionParams =
-    input.taskSession != null &&
-    (
-      input.taskSession.lastRunId === input.resumeFromRunId ||
-      (!!desiredDisplayId && taskSessionDisplayId === desiredDisplayId)
-    );
-  const sessionParams =
-    canReuseTaskSessionParams
-      ? taskSessionParams
-      : desiredDisplayId
-        ? { sessionId: desiredDisplayId }
-        : null;
-  const sessionDisplayId = desiredDisplayId ?? (canReuseTaskSessionParams ? taskSessionDisplayId : null);
-
-  if (!sessionDisplayId && !sessionParams) return null;
-  return {
-    sessionDisplayId,
-    sessionParams,
-  };
-}
-
 export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
   return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
-}
-
-export function resolveRuntimeSessionParamsForWorkspace(input: {
-  agentId: string;
-  previousSessionParams: Record<string, unknown> | null;
-  resolvedWorkspace: ResolvedWorkspaceForRun;
-}) {
-  const { agentId, previousSessionParams, resolvedWorkspace } = input;
-  const previousSessionId = readNonEmptyString(previousSessionParams?.sessionId);
-  const previousCwd = readNonEmptyString(previousSessionParams?.cwd);
-  if (!previousSessionId || !previousCwd) {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-  if (resolvedWorkspace.source !== "project_primary") {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-  const projectCwd = readNonEmptyString(resolvedWorkspace.cwd);
-  if (!projectCwd) {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-  const fallbackAgentHomeCwd = resolveDefaultAgentWorkspaceDir(agentId);
-  if (path.resolve(previousCwd) !== path.resolve(fallbackAgentHomeCwd)) {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-  if (path.resolve(projectCwd) === path.resolve(previousCwd)) {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-  const previousWorkspaceId = readNonEmptyString(previousSessionParams?.workspaceId);
-  if (
-    previousWorkspaceId &&
-    resolvedWorkspace.workspaceId &&
-    previousWorkspaceId !== resolvedWorkspace.workspaceId
-  ) {
-    return {
-      sessionParams: previousSessionParams,
-      warning: null as string | null,
-    };
-  }
-
-  const migratedSessionParams: Record<string, unknown> = {
-    ...(previousSessionParams ?? {}),
-    cwd: projectCwd,
-  };
-  if (resolvedWorkspace.workspaceId) migratedSessionParams.workspaceId = resolvedWorkspace.workspaceId;
-  if (resolvedWorkspace.repoUrl) migratedSessionParams.repoUrl = resolvedWorkspace.repoUrl;
-  if (resolvedWorkspace.repoRef) migratedSessionParams.repoRef = resolvedWorkspace.repoRef;
-
-  return {
-    sessionParams: migratedSessionParams,
-    warning:
-      `Project workspace "${projectCwd}" is now available. ` +
-      `Attempting to resume session "${previousSessionId}" that was previously saved in fallback workspace "${previousCwd}".`,
-  };
 }
 
 function parseIssueAssigneeAdapterOverrides(
@@ -957,90 +608,6 @@ function normalizeAgentNameKey(value: string | null | undefined) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
   return normalized.length > 0 ? normalized : null;
-}
-
-const defaultSessionCodec: AdapterSessionCodec = {
-  deserialize(raw: unknown) {
-    const asObj = parseObject(raw);
-    if (Object.keys(asObj).length > 0) return asObj;
-    const sessionId = readNonEmptyString((raw as Record<string, unknown> | null)?.sessionId);
-    if (sessionId) return { sessionId };
-    return null;
-  },
-  serialize(params: Record<string, unknown> | null) {
-    if (!params || Object.keys(params).length === 0) return null;
-    return params;
-  },
-  getDisplayId(params: Record<string, unknown> | null) {
-    return readNonEmptyString(params?.sessionId);
-  },
-};
-
-function getAdapterSessionCodec(adapterType: string) {
-  const adapter = getServerAdapter(adapterType);
-  return adapter.sessionCodec ?? defaultSessionCodec;
-}
-
-function normalizeSessionParams(params: Record<string, unknown> | null | undefined) {
-  if (!params) return null;
-  return Object.keys(params).length > 0 ? params : null;
-}
-
-function resolveNextSessionState(input: {
-  codec: AdapterSessionCodec;
-  adapterResult: AdapterExecutionResult;
-  previousParams: Record<string, unknown> | null;
-  previousDisplayId: string | null;
-  previousLegacySessionId: string | null;
-}) {
-  const { codec, adapterResult, previousParams, previousDisplayId, previousLegacySessionId } = input;
-
-  if (adapterResult.clearSession) {
-    return {
-      params: null as Record<string, unknown> | null,
-      displayId: null as string | null,
-      legacySessionId: null as string | null,
-    };
-  }
-
-  const explicitParams = adapterResult.sessionParams;
-  const hasExplicitParams = adapterResult.sessionParams !== undefined;
-  const hasExplicitSessionId = adapterResult.sessionId !== undefined;
-  const explicitSessionId = readNonEmptyString(adapterResult.sessionId);
-  const hasExplicitDisplay = adapterResult.sessionDisplayId !== undefined;
-  const explicitDisplayId = readNonEmptyString(adapterResult.sessionDisplayId);
-  const shouldUsePrevious = !hasExplicitParams && !hasExplicitSessionId && !hasExplicitDisplay;
-
-  const candidateParams =
-    hasExplicitParams
-      ? explicitParams
-      : hasExplicitSessionId
-        ? (explicitSessionId ? { sessionId: explicitSessionId } : null)
-        : previousParams;
-
-  const serialized = normalizeSessionParams(codec.serialize(normalizeSessionParams(candidateParams) ?? null));
-  const deserialized = normalizeSessionParams(codec.deserialize(serialized));
-
-  const displayId = truncateDisplayId(
-    explicitDisplayId ??
-      (codec.getDisplayId ? codec.getDisplayId(deserialized) : null) ??
-      readNonEmptyString(deserialized?.sessionId) ??
-      (shouldUsePrevious ? previousDisplayId : null) ??
-      explicitSessionId ??
-      (shouldUsePrevious ? previousLegacySessionId : null),
-  );
-
-  const legacySessionId =
-    explicitSessionId ??
-    readNonEmptyString(deserialized?.sessionId) ??
-    displayId ??
-    (shouldUsePrevious ? previousLegacySessionId : null);
-
-  return {
-    params: serialized,
-    displayId,
-    legacySessionId,
-  };
 }
 
 export function heartbeatService(db: Db) {

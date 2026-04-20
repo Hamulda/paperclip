@@ -23,8 +23,8 @@ const mockBuildSwarmDigest = vi.hoisted(() =>
   >(),
 );
 
-const mockCountRunningHotCodingRuns = vi.hoisted(() => vi.fn<[Db, string], Promise<number>>());
-const mockGetEffectiveHotCodingCapacity = vi.hoisted(() => vi.fn<[Db, string], Promise<number>>());
+const mockCountRunningHotCodingRuns = vi.hoisted(() => vi.fn<[Db, string, (string | undefined)?], Promise<number>>());
+const mockGetEffectiveHotCodingCapacity = vi.hoisted(() => vi.fn<[Db, string, (string | undefined)?], Promise<number>>());
 
 vi.mock("../services/swarm-digest.js", () => ({
   buildSwarmDigest: mockBuildSwarmDigest,
@@ -219,6 +219,64 @@ describe("GET /companies/:companyId/swarm-digest", () => {
     expect(mockBuildSwarmDigest).toHaveBeenCalledWith(
       mockDb,
       expect.objectContaining({ companyId: "company-1", projectId: "project-42" }),
+    );
+  });
+
+  it("passes projectId to hot slot functions when scoped to a project", async () => {
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(1);
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(2);
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    const app = createApp(mockDb);
+    await request(app).get("/companies/company-1/swarm-digest?projectId=project-42");
+
+    expect(mockCountRunningHotCodingRuns).toHaveBeenCalledWith(
+      mockDb,
+      "company-1",
+      "project-42",
+    );
+    expect(mockGetEffectiveHotCodingCapacity).toHaveBeenCalledWith(
+      mockDb,
+      "company-1",
+      "project-42",
+    );
+  });
+
+  it("does not pass projectId to hot slot functions when viewing company-wide", async () => {
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(0);
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(3);
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    const app = createApp(mockDb);
+    await request(app).get("/companies/company-1/swarm-digest");
+
+    expect(mockCountRunningHotCodingRuns).toHaveBeenCalledWith(
+      mockDb,
+      "company-1",
+      undefined,
+    );
+    expect(mockGetEffectiveHotCodingCapacity).toHaveBeenCalledWith(
+      mockDb,
+      "company-1",
+      undefined,
     );
   });
 

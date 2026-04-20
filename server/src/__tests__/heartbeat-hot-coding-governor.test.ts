@@ -586,6 +586,174 @@ describeEmbeddedPostgres("heartbeat hot coding concurrency governor", () => {
     expect(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT).toBe(2);
   });
 
+  it("getEffectiveHotCodingCapacity returns sum of per-agent maxHotCodingRuns", async () => {
+    // Company with 3 agents: maxHotCodingRuns=2, 3, and 1
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 2 },
+      }),
+      permissions: {},
+    });
+
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId,
+      name: "AgentB-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 3 },
+      }),
+      permissions: {},
+    });
+
+    const agentC = randomUUID();
+    await db.insert(agents).values({
+      id: agentC,
+      companyId,
+      name: "AgentC-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 1 },
+      }),
+      permissions: {},
+    });
+
+    const { getEffectiveHotCodingCapacity } = await import("../../services/hot-run-governor.js");
+    const capacity = await getEffectiveHotCodingCapacity(db, companyId);
+    // Sum: 2 + 3 + 1 = 6
+    expect(capacity).toBe(6);
+  });
+
+  it("getEffectiveHotCodingCapacity is company-scoped: different companies get different capacities", async () => {
+    const [companyA, companyB] = [randomUUID(), randomUUID()];
+    await createCompany(companyA);
+    await createCompany(companyB);
+
+    // Company A: one agent with maxHotCodingRuns=2
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId: companyA,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 2 },
+      }),
+      permissions: {},
+    });
+
+    // Company B: one agent with maxHotCodingRuns=4
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId: companyB,
+      name: "AgentB-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 4 },
+      }),
+      permissions: {},
+    });
+
+    const { getEffectiveHotCodingCapacity } = await import("../../services/hot-run-governor.js");
+    const [capacityA, capacityB] = await Promise.all([
+      getEffectiveHotCodingCapacity(db, companyA),
+      getEffectiveHotCodingCapacity(db, companyB),
+    ]);
+    expect(capacityA).toBe(2);
+    expect(capacityB).toBe(4);
+  });
+
+  it("getEffectiveHotCodingCapacity falls back to default when company has no hot coding agents", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    // Create only non-hot-coding agents
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Agent-http_remote",
+      role: "engineer",
+      status: "running",
+      adapterType: "http_remote",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60 },
+      }),
+      permissions: {},
+    });
+
+    const { getEffectiveHotCodingCapacity } = await import("../../services/hot-run-governor.js");
+    const capacity = await getEffectiveHotCodingCapacity(db, companyId);
+    // Falls back to HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT = 2
+    expect(capacity).toBe(2);
+  });
+
+  it("getEffectiveHotCodingCapacity uses normalized values (clamps to [1, 8])", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: 99 }, // above max of 8
+      }),
+      permissions: {},
+    });
+
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId,
+      name: "AgentB-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxHotCodingRuns: -5 }, // below min of 1
+      }),
+      permissions: {},
+    });
+
+    const { getEffectiveHotCodingCapacity } = await import("../../services/hot-run-governor.js");
+    const capacity = await getEffectiveHotCodingCapacity(db, companyId);
+    // 99 -> 8 (clamped to max), -5 -> 1 (clamped to min) = 9
+    expect(capacity).toBe(9);
+  });
+
   it("tickTimers refreshes expiring file claims", async () => {
     const companyId = randomUUID();
     await createCompany(companyId);
@@ -762,5 +930,32 @@ describe("heartbeat file claims sequencing", () => {
     );
     expect(heartbeatContent).toContain("async function refreshExpiringClaims");
     expect(heartbeatContent).toContain("await refreshExpiringClaims(now)");
+  });
+});
+
+describe("hot-run-governor import path consistency", () => {
+  // Structural tests ensuring @paperclipai/db casing is consistent across the codebase
+
+  it("hot-run-governor.ts imports @paperclipai/db with correct lowercase casing", async () => {
+    const content = await import("fs").then(fs =>
+      fs.readFileSync("/Users/vojtechhamada/paperclip/server/src/services/hot-run-governor.ts", "utf8")
+    );
+    // The correct package name is @paperclipai/db (all lowercase ai)
+    // Incorrect: @paperclipAI/db (uppercase AI breaks on case-sensitive filesystems)
+    expect(content).toContain('from "@paperclipai/db"');
+    expect(content).not.toContain('from "@paperclipAI/db"');
+  });
+
+  it("swarm-digest route imports from hot-run-governor using correct casing", async () => {
+    const content = await import("fs").then(fs =>
+      fs.readFileSync("/Users/vojtechhamada/paperclip/server/src/routes/swarm-digest.ts", "utf8")
+    );
+    expect(content).toContain('from "@paperclipai/db"');
+    expect(content).not.toContain('from "@paperclipAI/db"');
+  });
+
+  it("getEffectiveHotCodingCapacity is exported from hot-run-governor", async () => {
+    const gov = await import("../services/hot-run-governor.js");
+    expect(typeof gov.getEffectiveHotCodingCapacity).toBe("function");
   });
 });

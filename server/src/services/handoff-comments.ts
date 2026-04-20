@@ -11,12 +11,14 @@ export interface StructuredHandoff {
   agentName: string;
   runId: string;
   issueId: string | null;
+  swarmRole: string | null;
   summary: string;
   filesTouched: string[];
   currentState: string;
   remainingWork: string[];
   blockers: string[];
   recommendedNextStep: string;
+  avoidPaths: string[];
   emittedAt: string;
 }
 
@@ -41,12 +43,14 @@ export function buildHandoffComment(input: {
   agentName: string;
   runId: string;
   issueId: string | null;
+  swarmRole?: string | null;
   summary: string;
   filesTouched: string[];
   currentState: string;
   remainingWork: string[];
   blockers: string[];
   recommendedNextStep: string;
+  avoidPaths?: string[];
 }): string {
   const escaped = {
     summary: escapeHandoffValue(input.summary),
@@ -60,6 +64,7 @@ export function buildHandoffComment(input: {
     `<!-- AGENT_NAME:${input.agentName} -->`,
     `<!-- RUN_ID:${input.runId} -->`,
     `<!-- ISSUE_ID:${input.issueId ?? ""} -->`,
+    `<!-- SWARM_ROLE:${input.swarmRole ?? ""} -->`,
     ``,
     `## Summary`,
     `${escaped.summary}`,
@@ -79,6 +84,9 @@ export function buildHandoffComment(input: {
     `## Recommended next step`,
     `${escaped.recommendedNextStep}`,
     ``,
+    ...(input.avoidPaths && input.avoidPaths.length > 0
+      ? [`## Avoid paths`, ...input.avoidPaths.map((p) => `- ${p}`), ``]
+      : []),
     `<!-- EMITTED_AT:${new Date().toISOString()} -->`,
   ];
 
@@ -150,12 +158,14 @@ export function parseHandoffComment(body: string): StructuredHandoff | null {
     agentName: metadata["AGENT_NAME"] ?? "",
     runId: metadata["RUN_ID"] ?? "",
     issueId: metadata["ISSUE_ID"] || null,
+    swarmRole: metadata["SWARM_ROLE"] || null,
     summary: getRawSection("Summary"),
     filesTouched: getListSection("Files touched"),
     currentState: getRawSection("Current state"),
     remainingWork: getListSection("Remaining work"),
     blockers: getListSection("Blockers"),
     recommendedNextStep: getRawSection("Recommended next step"),
+    avoidPaths: getListSection("Avoid paths"),
     emittedAt: metadata["EMITTED_AT"] ?? "",
   };
 }

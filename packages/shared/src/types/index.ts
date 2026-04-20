@@ -205,6 +205,7 @@ export type {
   SwarmDigestClaimedPathsSummary,
   SwarmDigestRecommendedAvoidPaths,
   SwarmDigestClaimedPath,
+  SwarmDigestProtectedPaths,
 } from "./swarm-digest.js";
 export type {
   CompanyPortabilityInclude,

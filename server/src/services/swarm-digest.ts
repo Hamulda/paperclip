@@ -27,6 +27,7 @@ import type {
   SwarmDigestHandoff,
   SwarmDigestClaimedPathsSummary,
   SwarmDigestRecommendedAvoidPaths,
+  SwarmDigestProtectedPaths,
 } from "@paperclipai/shared";
 
 function readNonEmptyString(value: unknown): string {
@@ -35,6 +36,24 @@ function readNonEmptyString(value: unknown): string {
 }
 
 function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDigest {
+  const commonlyProtectedPatterns = [
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    ".git/**",
+    ".github/**",
+    "node_modules/**",
+    "dist/**",
+    "build/**",
+    ".next/**",
+    "tsconfig*.json",
+    "jest.config.*",
+    "vitest.config.*",
+    "*.test.ts",
+    "*.spec.ts",
+    "*.stories.tsx",
+    "*.md",
+  ];
   return {
     companyId,
     projectId,
@@ -51,6 +70,7 @@ function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDig
     latestHandoff: null,
     claimedPathsSummary: { byAgent: [] },
     recommendedAvoidPaths: { paths: [], reasons: [] },
+    protectedPaths: { paths: commonlyProtectedPatterns },
   };
 }
 
@@ -374,6 +394,9 @@ export async function buildSwarmDigest(
   }));
 
   // 8. Stuck runs (queued for more than 5 minutes)
+  // For queued runs, we use createdAt (when the run was queued) rather than startedAt
+  // (which is only set when a run transitions from queued to running via claimQueuedRun).
+  // A truly stuck queued run will have createdAt set but startedAt = NULL.
   const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
 
   const stuckRunRows = await db
@@ -382,6 +405,7 @@ export async function buildSwarmDigest(
       agentId: heartbeatRuns.agentId,
       contextSnapshot: heartbeatRuns.contextSnapshot,
       status: heartbeatRuns.status,
+      createdAt: heartbeatRuns.createdAt,
       startedAt: heartbeatRuns.startedAt,
     })
     .from(heartbeatRuns)
@@ -389,11 +413,10 @@ export async function buildSwarmDigest(
       and(
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.status, "queued"),
-        isNotNull(heartbeatRuns.startedAt),
-        lt(heartbeatRuns.startedAt, fiveMinutesAgo),
+        lt(heartbeatRuns.createdAt, fiveMinutesAgo),
       ),
     )
-    .orderBy(asc(heartbeatRuns.startedAt))
+    .orderBy(asc(heartbeatRuns.createdAt))
     .limit(20);
 
   // Extract issue IDs from stuck runs
@@ -416,8 +439,9 @@ export async function buildSwarmDigest(
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) || null;
     const issueInfo = issueId ? stuckIssueMap.get(issueId) : null;
-    const minutesWaiting = run.startedAt
-      ? Math.round((now.getTime() - run.startedAt.getTime()) / 60000)
+    // Use createdAt for minutesWaiting since it represents when the run was queued
+    const minutesWaiting = run.createdAt
+      ? Math.round((now.getTime() - run.createdAt.getTime()) / 60000)
       : 0;
     return {
       id: run.id,
@@ -426,6 +450,7 @@ export async function buildSwarmDigest(
       issueIdentifier: issueInfo?.identifier ?? null,
       issueTitle: issueInfo?.title ?? null,
       status: run.status,
+      createdAt: run.createdAt?.toISOString() ?? null,
       startedAt: run.startedAt?.toISOString() ?? null,
       minutesWaiting,
     };
@@ -517,22 +542,49 @@ export async function buildSwarmDigest(
   const agentRoleMap = new Map(activeAgents.map((a) => [a.id, a.role]));
 
   // Group claims by agent (filter out claims with null agentId)
-  const claimsByAgent = new Map<string, string[]>();
+  // Also track the most common issueId per agent for richer context
+  const claimsByAgent = new Map<string, { paths: Set<string>; issueIds: Set<string> }>();
   for (const claim of allActiveClaims) {
     if (!claim.agentId) continue;
     if (!claimsByAgent.has(claim.agentId)) {
-      claimsByAgent.set(claim.agentId, []);
+      claimsByAgent.set(claim.agentId, { paths: new Set(), issueIds: new Set() });
     }
-    claimsByAgent.get(claim.agentId)!.push(claim.claimPath);
+    claimsByAgent.get(claim.agentId)!.paths.add(claim.claimPath);
+    if (claim.issueId) {
+      claimsByAgent.get(claim.agentId)!.issueIds.add(claim.issueId);
+    }
   }
 
+  // Get issue identifiers for agents' common issues
+  const allIssueIds = new Set<string>();
+  for (const agentData of claimsByAgent.values()) {
+    for (const issueId of agentData.issueIds) {
+      allIssueIds.add(issueId);
+    }
+  }
+  const issueRows = allIssueIds.size > 0
+    ? await db
+        .select({ id: issues.id, identifier: issues.identifier })
+        .from(issues)
+        .where(inArray(issues.id, Array.from(allIssueIds)))
+    : [];
+  const issueIdToIdentifier = new Map(issueRows.map((i) => [i.id, i.identifier]));
+
   const claimedPathsSummary: SwarmDigestClaimedPathsSummary = {
-    byAgent: Array.from(claimsByAgent.entries()).map(([agentId, paths]) => ({
-      agentId,
-      agentName: agentNameMap.get(agentId) ?? "Unknown",
-      role: agentRoleMap.get(agentId) ?? null,
-      paths: [...new Set(paths)].slice(0, 50), // dedupe and limit
-    })),
+    byAgent: Array.from(claimsByAgent.entries()).map(([agentId, data]) => {
+      // Find the most common issue identifier for this agent
+      const issueIdentifiers = Array.from(data.issueIds)
+        .map((id) => issueIdToIdentifier.get(id))
+        .filter((id): id is string => id !== undefined);
+      const commonIssue: string | null = issueIdentifiers.length > 0 ? issueIdentifiers[0] : null;
+      return {
+        agentId,
+        agentName: agentNameMap.get(agentId) ?? "Unknown",
+        role: agentRoleMap.get(agentId) ?? null,
+        paths: [...data.paths].slice(0, 50), // dedupe and limit
+        issueIdentifier: commonIssue,
+      };
+    }),
   };
 
   // 11. Build recommended avoid paths from recent handoffs
@@ -554,6 +606,29 @@ export async function buildSwarmDigest(
     reasons: Array.from(avoidPathReasons.values()).slice(0, 20),
   };
 
+  // 12. Protected paths (hard-block rules) - commonly protected patterns for display
+  const commonlyProtectedPatterns = [
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    ".git/**",
+    ".github/**",
+    "node_modules/**",
+    "dist/**",
+    "build/**",
+    ".next/**",
+    "tsconfig*.json",
+    "jest.config.*",
+    "vitest.config.*",
+    "*.test.ts",
+    "*.spec.ts",
+    "*.stories.tsx",
+    "*.md",
+  ];
+  const protectedPaths: SwarmDigestProtectedPaths = {
+    paths: commonlyProtectedPatterns,
+  };
+
   return {
     companyId,
     projectId,
@@ -570,6 +645,7 @@ export async function buildSwarmDigest(
     latestHandoff: recentHandoffs[0] ?? null,
     claimedPathsSummary,
     recommendedAvoidPaths,
+    protectedPaths,
   };
 }
 
@@ -597,7 +673,8 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("### Claimed Paths");
     for (const agentEntry of digest.claimedPathsSummary.byAgent.slice(0, 5)) {
       const roleTag = agentEntry.role ? ` [${agentEntry.role}]` : "";
-      lines.push(`- **${agentEntry.agentName}**${roleTag}:`);
+      const issueTag = agentEntry.issueIdentifier ? ` [${agentEntry.issueIdentifier}]` : "";
+      lines.push(`- **${agentEntry.agentName}**${roleTag}${issueTag}:`);
       for (const path of agentEntry.paths.slice(0, 5)) {
         lines.push(`  - ${path}`);
       }
@@ -652,6 +729,16 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("### File Claim Conflicts");
     for (const conflict of digest.fileClaimConflicts.slice(0, 10)) {
       lines.push(`- ⚠️ ${conflict.claimPath} (${conflict.claimType}) claimed by another agent`);
+    }
+    lines.push("");
+  }
+
+  // Protected paths (hard-block rules)
+  if (digest.protectedPaths?.paths?.length > 0) {
+    lines.push("### Protected Paths (Hard Blocks)");
+    lines.push("These paths CANNOT be claimed — do not modify them:");
+    for (const path of digest.protectedPaths.paths.slice(0, 15)) {
+      lines.push(`- ${path}`);
     }
     lines.push("");
   }

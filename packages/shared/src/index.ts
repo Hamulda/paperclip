@@ -407,6 +407,7 @@ export type {
   SwarmDigestClaimedPathsSummary,
   SwarmDigestRecommendedAvoidPaths,
   SwarmDigestClaimedPath,
+  SwarmDigestProtectedPaths,
 } from "./types/index.js";
 
 export {

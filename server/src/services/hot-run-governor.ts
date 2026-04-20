@@ -4,8 +4,8 @@
 
 import { and, eq, inArray, ne, asc, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns } from "@paperclipAI/db";
-import { asNumber } from "../adapters/utils.js";
+import { agents, heartbeatRuns } from "@paperclipai/db";
+import { asNumber, parseObject } from "../adapters/utils.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -46,7 +46,11 @@ export function isHotCodingAdapter(adapterType: string): boolean {
 // Running hot run counter
 // ---------------------------------------------------------------------------
 
-export async function countRunningHotCodingRuns(db: Db, companyId?: string): Promise<number> {
+export async function countRunningHotCodingRuns(
+  db: Db,
+  companyId?: string,
+  projectId?: string,
+): Promise<number> {
   const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
   if (hotCodingTypes.length === 0) return 0;
   const conditions = [
@@ -55,6 +59,9 @@ export async function countRunningHotCodingRuns(db: Db, companyId?: string): Pro
   ];
   if (companyId) {
     conditions.push(eq(agents.companyId, companyId));
+  }
+  if (projectId) {
+    conditions.push(sql`${heartbeatRuns.contextSnapshot}->>'projectId' = ${projectId}`);
   }
   const [{ count }] = await db
     .select({ count: sql<number>`count(*)` })
@@ -67,6 +74,73 @@ export async function countRunningHotCodingRuns(db: Db, companyId?: string): Pro
 // ---------------------------------------------------------------------------
 // Fairness promotion — find and promote next queued hot run from another agent
 // ---------------------------------------------------------------------------
+
+export async function getEffectiveHotCodingCapacity(
+  db: Db,
+  companyId: string,
+  projectId?: string,
+): Promise<number> {
+  const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
+  if (hotCodingTypes.length === 0) return 0;
+
+  if (projectId) {
+    // Project-scoped: sum maxHotCodingRuns from agents that have runs for this project
+    const rows = await db
+      .select({ runtimeConfig: agents.runtimeConfig, agentId: agents.id })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(agents.companyId, companyId),
+        inArray(agents.adapterType, hotCodingTypes),
+        sql`${heartbeatRuns.contextSnapshot}->>'projectId' = ${projectId}`,
+      ));
+
+    if (rows.length === 0) return HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT;
+
+    // Deduplicate by agent (one agent may have multiple runs for same project)
+    const agentConfigs = new Map<string, string>();
+    for (const row of rows) {
+      if (!agentConfigs.has(row.agentId)) {
+        const raw = row.runtimeConfig;
+        agentConfigs.set(row.agentId, typeof raw === "string" ? raw : JSON.stringify(raw));
+      }
+    }
+
+    let total = 0;
+    for (const [, runtimeConfig] of agentConfigs) {
+      try {
+        const config = parseObject(runtimeConfig) as { heartbeat?: { maxHotCodingRuns?: unknown } };
+        total += normalizeMaxConcurrentHotCodingRuns(config?.heartbeat?.maxHotCodingRuns);
+      } catch {
+        total += HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT;
+      }
+    }
+    return total;
+  }
+
+  // Company-level: sum across all hot coding agents in the company
+  const rows = await db
+    .select({ runtimeConfig: agents.runtimeConfig })
+    .from(agents)
+    .where(and(
+      eq(agents.companyId, companyId),
+      inArray(agents.adapterType, hotCodingTypes),
+    ));
+
+  if (rows.length === 0) return HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT;
+
+  let total = 0;
+  for (const row of rows) {
+    try {
+      const config = parseObject(row.runtimeConfig) as { heartbeat?: { maxHotCodingRuns?: unknown } };
+      const maxRuns = normalizeMaxConcurrentHotCodingRuns(config?.heartbeat?.maxHotCodingRuns);
+      total += maxRuns;
+    } catch {
+      total += HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT;
+    }
+  }
+  return total;
+}
 
 export async function tryPromoteNextHotCodingRun(
   db: Db,

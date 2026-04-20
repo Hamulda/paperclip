@@ -22,12 +22,17 @@ export interface SwarmDigestClaimedPathsSummary {
     agentName: string;
     role: string | null;
     paths: string[];
+    issueIdentifier: string | null; // common issue being worked on
   }[];
 }
 
 export interface SwarmDigestRecommendedAvoidPaths {
   paths: string[];
   reasons: string[];
+}
+
+export interface SwarmDigestProtectedPaths {
+  paths: string[]; // hard-blocked paths that should never be claimed
 }
 
 export interface SwarmDigestRun {
@@ -91,6 +96,7 @@ export interface SwarmDigestRunStuck {
   issueIdentifier: string | null;
   issueTitle: string | null;
   status: string;
+  createdAt: string | null;
   startedAt: string | null;
   minutesWaiting: number;
 }
@@ -129,6 +135,7 @@ export interface SwarmDigest {
   latestHandoff: SwarmDigestHandoff | null;
   claimedPathsSummary: SwarmDigestClaimedPathsSummary;
   recommendedAvoidPaths: SwarmDigestRecommendedAvoidPaths;
+  protectedPaths: SwarmDigestProtectedPaths;
 }
 
 export interface SwarmCockpitDigest extends SwarmDigest {

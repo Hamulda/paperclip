@@ -5,18 +5,21 @@ import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
-  buildExplicitResumeSessionOverride,
-  deriveTaskKeyWithHeartbeatFallback,
-  extractWakeCommentIds,
-  formatRuntimeWorkspaceWarningLog,
-  mergeCoalescedContextSnapshot,
   prioritizeProjectWorkspaceCandidatesForRun,
-  parseSessionCompactionPolicy,
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
-  shouldResetTaskSessionForWake,
   type ResolvedWorkspaceForRun,
-} from "../services/heartbeat.ts";
+} from "../services/runtime-config-builder.ts";
+import {
+  buildExplicitResumeSessionOverride,
+} from "../services/session-state-manager.ts";
+import {
+  deriveTaskKeyWithHeartbeatFallback,
+  extractWakeCommentIds,
+  mergeCoalescedContextSnapshot,
+  shouldResetTaskSessionForWake,
+} from "../services/run-context-builder.ts";
+import { formatRuntimeWorkspaceWarningLog, parseSessionCompactionPolicy } from "../services/heartbeat.ts";
 
 function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
   return {
