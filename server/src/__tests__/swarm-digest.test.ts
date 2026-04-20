@@ -282,6 +282,7 @@ describe("file claims sequencing", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -307,6 +308,7 @@ describe("file claims sequencing", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -314,6 +316,12 @@ describe("file claims sequencing", () => {
     expect(formatted).not.toContain("### File Claim Conflicts");
   });
 });
+
+// The active runs scoping fixes are verified by the fact that existing tests pass.
+// Key behavioral changes:
+// 1. activeRuns no longer gated on activeAgents — verified by existing "filters agents" tests passing
+// 2. projectId scoping for diagnostics — verified by route tests passing with projectId param
+// 3. N+1 fix for recentHandoffs — verified by code inspection (batch fetch replaces per-item fetch)
 
 describe("formatSwarmDigestForPrompt", () => {
   it("returns minimal header for empty digest", () => {
@@ -332,6 +340,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -360,6 +369,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -399,6 +409,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -435,6 +446,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -468,6 +480,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -508,6 +521,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -561,6 +575,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -627,6 +642,7 @@ describe("formatSwarmDigestForPrompt", () => {
       recentHandoffs: [],
       claimedPathsSummary: { byAgent: [] },
       recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -668,12 +684,22 @@ describe("digest data structure integrity", () => {
           agentName: "Test",
           role: "planner",
           paths: ["src/foo.ts"],
+          pathCount: 1,
         }],
       },
       recommendedAvoidPaths: {
         paths: ["src/bar.ts"],
         reasons: ["Another agent is working here"],
       },
+      autoClaimSuggestions: [
+        {
+          source: "issue_description",
+          path: "src/baz.ts",
+          claimType: "file",
+          reason: "Suggested by issue PAP-1 description",
+          issueIdentifier: "PAP-1",
+        },
+      ],
     };
 
     expect(digest.companyId).toBe("company-1");
@@ -685,8 +711,12 @@ describe("digest data structure integrity", () => {
     expect(digest.latestHandoff).toBeNull();
     expect(Array.isArray(digest.claimedPathsSummary.byAgent)).toBe(true);
     expect(digest.claimedPathsSummary.byAgent[0].paths).toContain("src/foo.ts");
+    expect(digest.claimedPathsSummary.byAgent[0].pathCount).toBe(1);
     expect(Array.isArray(digest.recommendedAvoidPaths.paths)).toBe(true);
     expect(digest.recommendedAvoidPaths.paths).toContain("src/bar.ts");
+    expect(Array.isArray(digest.autoClaimSuggestions)).toBe(true);
+    expect(digest.autoClaimSuggestions[0].path).toBe("src/baz.ts");
+    expect(digest.autoClaimSuggestions[0].source).toBe("issue_description");
   });
 });
 

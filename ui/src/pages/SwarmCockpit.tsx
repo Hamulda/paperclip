@@ -20,6 +20,9 @@ import {
   FileText,
   AlertCircle,
   MapPin,
+  Shield,
+  Scale,
+  Ban,
 } from "lucide-react";
 
 function SectionCard({
@@ -86,25 +89,37 @@ function HotSlotMeter({ current, max }: { current: number; max: number }) {
   );
 }
 
-function AgentRow({ agent }: { agent: { id: string; name: string; status: string } }) {
+function AgentRow({ agent }: { agent: { id: string; name: string; status: string; role: string | null } }) {
   return (
     <div className="flex items-center justify-between py-2 text-sm">
       <div className="flex items-center gap-2">
         <Bot className="h-4 w-4 text-muted-foreground" />
         <span className="font-medium">{agent.name}</span>
+        {agent.role && (
+          <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+            {agent.role}
+          </span>
+        )}
       </div>
       <StatusBadge status={agent.status} />
     </div>
   );
 }
 
-function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: string | null; issueTitle: string | null; status: string; startedAt: string | null } }) {
+function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: string | null; issueTitle: string | null; status: string; startedAt: string | null; swarmRole: string | null } }) {
   return (
     <div className="flex items-center justify-between py-2 text-sm">
       <div className="min-w-0 flex-1">
-        <p className="truncate font-medium">
-          {run.issueIdentifier ? `[${run.issueIdentifier}]` : "No issue"} {run.issueTitle ?? ""}
-        </p>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <p className="truncate font-medium">
+            {run.issueIdentifier ? `[${run.issueIdentifier}]` : "No issue"} {run.issueTitle ?? ""}
+          </p>
+          {run.swarmRole && (
+            <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded shrink-0">
+              {run.swarmRole}
+            </span>
+          )}
+        </div>
         <p className="text-xs text-muted-foreground truncate">
           {run.startedAt ? new Date(run.startedAt).toLocaleTimeString() : "Unknown start"}
         </p>
@@ -202,22 +217,111 @@ function StuckRunRow({ run }: { run: { id: string; issueIdentifier: string | nul
   );
 }
 
-function HandoffRow({ handoff }: { handoff: { id: string; agentName: string; issueIdentifier: string | null; summary: string; recommendedNextStep: string; emittedAt: string } }) {
+function HandoffRow({ handoff }: { handoff: { id: string; agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; recommendedNextStep: string; avoidPaths: string[]; emittedAt: string } }) {
   return (
     <div className="flex items-start gap-2 py-2 text-sm">
       <ArrowRight className="h-4 w-4 shrink-0 text-blue-500 mt-0.5" />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 flex-wrap">
           <span className="font-medium text-xs">{handoff.agentName}</span>
+          {handoff.swarmRole && (
+            <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded">
+              {handoff.swarmRole}
+            </span>
+          )}
           {handoff.issueIdentifier && (
             <span className="text-xs text-muted-foreground">[{handoff.issueIdentifier}]</span>
           )}
         </div>
         <p className="text-xs truncate mt-0.5">{handoff.summary}</p>
+        {handoff.avoidPaths.length > 0 && (
+          <p className="text-xs text-amber-600 truncate mt-0.5">
+            Avoid: {handoff.avoidPaths.slice(0, 2).join(", ")}{handoff.avoidPaths.length > 2 ? ` +${handoff.avoidPaths.length - 2}` : ""}
+          </p>
+        )}
         <p className="text-xs text-blue-500 truncate mt-0.5">
           Next: {handoff.recommendedNextStep}
         </p>
       </div>
+    </div>
+  );
+}
+
+function ClaimedPathsRow({ agent }: { agent: { agentId: string; agentName: string; role: string | null; pathCount: number; paths: string[]; issueIdentifier: string | null } }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <MapPin className="h-4 w-4 shrink-0 text-green-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className="font-medium text-xs">{agent.agentName}</span>
+          {agent.role && (
+            <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded">
+              {agent.role}
+            </span>
+          )}
+          {agent.issueIdentifier && (
+            <span className="text-xs text-muted-foreground">[{agent.issueIdentifier}]</span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground mt-0.5">
+          {agent.pathCount} path{agent.pathCount !== 1 ? "s" : ""} claimed
+        </p>
+        <p className="text-xs font-mono text-muted-foreground truncate mt-0.5">
+          {agent.paths.slice(0, 3).join(", ")}{agent.paths.length > 3 ? ` +${agent.paths.length - 3}` : ""}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AvoidPathsRow({ path, reason }: { path: string; reason: string }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <Ban className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <p className="font-mono text-xs truncate">{path}</p>
+        <p className="text-xs text-muted-foreground truncate">{reason}</p>
+      </div>
+    </div>
+  );
+}
+
+function ProtectedPathsRow({ path }: { path: string }) {
+  return (
+    <div className="flex items-start gap-2 py-1.5 text-sm">
+      <Shield className="h-4 w-4 shrink-0 text-red-400 mt-0.5" />
+      <div className="min-w-0">
+        <p className="font-mono text-xs truncate">{path}</p>
+      </div>
+    </div>
+  );
+}
+
+function FairnessSignal({ stuckRuns, activeRuns }: { stuckRuns: number; activeRuns: number }) {
+  const isHealthy = stuckRuns === 0 || activeRuns === 0;
+  const starvationRatio = activeRuns > 0 ? stuckRuns / activeRuns : 0;
+  const isStarving = starvationRatio >= 0.3 && stuckRuns > 0;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Scale className={cn("h-4 w-4", isStarving ? "text-red-500" : "text-green-500")} />
+          <span className="text-xs font-medium">Queue Health</span>
+        </div>
+        <span className={cn(
+          "text-xs font-mono",
+          isStarving ? "text-red-500" : "text-green-500"
+        )}>
+          {isHealthy ? "Healthy" : `${stuckRuns}/${activeRuns + stuckRuns} queued`}
+        </span>
+      </div>
+      {isStarving && (
+        <p className="text-xs text-red-500/80">
+          High queue pressure: {stuckRuns} run{stuckRuns !== 1 ? "s" : ""} waiting {" "}
+          {Math.round(starvationRatio * 100)}% of active capacity
+        </p>
+      )}
     </div>
   );
 }
@@ -379,6 +483,45 @@ export function SwarmCockpit() {
               ))}
             </div>
           )}
+        </SectionCard>
+
+        <SectionCard title="Claimed Paths" icon={MapPin} className="md:col-span-2 lg:col-span-1">
+          {data.claimedPathsSummary.byAgent.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No active claims</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.claimedPathsSummary.byAgent.slice(0, 8).map((agent) => (
+                <ClaimedPathsRow key={agent.agentId} agent={agent} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Avoid Paths" icon={Ban} className="md:col-span-2 lg:col-span-1">
+          {data.recommendedAvoidPaths.paths.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No avoid paths</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.recommendedAvoidPaths.paths.slice(0, 10).map((path, i) => (
+                <AvoidPathsRow key={path} path={path} reason={data.recommendedAvoidPaths.reasons[i] ?? ""} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Protected Paths" icon={Shield} className="md:col-span-2 lg:col-span-1">
+          <p className="text-xs text-muted-foreground mb-2">
+            Hard-blocked patterns ({data.protectedPaths.enforcedBy})
+          </p>
+          <div className="max-h-32 overflow-y-auto space-y-1">
+            {data.protectedPaths.paths.slice(0, 15).map((path) => (
+              <ProtectedPathsRow key={path} path={path} />
+            ))}
+          </div>
+        </SectionCard>
+
+        <SectionCard title="Queue Fairness" icon={Scale} className="md:col-span-2 lg:col-span-1">
+          <FairnessSignal stuckRuns={data.runsStuck.length} activeRuns={data.activeRuns.length} />
         </SectionCard>
 
         <SectionCard title="Recent Handoffs" icon={ArrowRight} className="md:col-span-2 lg:col-span-2">

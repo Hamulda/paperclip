@@ -94,6 +94,17 @@ import {
 } from "./run-context-builder.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import {
+  readNonEmptyString,
+  truncateDisplayId,
+  normalizeAgentNameKey,
+} from "./agent-name-utils.js";
+import {
+  isProcessAlive,
+  terminateHeartbeatRunProcess,
+  buildProcessLossMessage,
+  DETACHED_PROCESS_ERROR_CODE,
+} from "./process-lifecycle.js";
+import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
   ensureRuntimeServicesForRun,
@@ -107,7 +118,7 @@ import {
 import { issueService } from "./issues.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { isProcessGroupAlive } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -132,7 +143,6 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT = 2;
 const HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX = 8;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -351,10 +361,6 @@ interface ParsedIssueAssigneeAdapterOverrides {
   useProjectWorkspace: boolean | null;
 }
 
-function readNonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
-}
-
 export function summarizeHeartbeatRunContextSnapshot(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> | null {
@@ -541,73 +547,6 @@ function isSameTaskScope(left: string | null, right: string | null) {
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
-}
-
-// A positive liveness check means some process currently owns the PID.
-// On Linux, PIDs can be recycled, so this is a best-effort signal rather
-// than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    return false;
-  }
-}
-
-async function terminateHeartbeatRunProcess(input: {
-  pid: number | null | undefined;
-  processGroupId: number | null | undefined;
-  graceMs?: number;
-}) {
-  const pid = input.pid ?? null;
-  const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
-
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
-  );
-}
-
-function buildProcessLossMessage(run: {
-  processPid: number | null;
-  processGroupId: number | null;
-}, options?: { descendantOnly?: boolean }) {
-  if (options?.descendantOnly && run.processGroupId) {
-    return `Process lost -- parent pid ${run.processPid ?? "unknown"} exited, but descendant process group ${run.processGroupId} was still alive and was terminated`;
-  }
-  if (run.processPid) {
-    return `Process lost -- child pid ${run.processPid} is no longer running`;
-  }
-  if (run.processGroupId) {
-    return `Process lost -- process group ${run.processGroupId} is no longer running`;
-  }
-  return "Process lost -- server may have restarted";
-}
-
-function truncateDisplayId(value: string | null | undefined, max = 128) {
-  if (!value) return null;
-  return value.length > max ? value.slice(0, max) : value;
-}
-
-function normalizeAgentNameKey(value: string | null | undefined) {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim().toLowerCase();
-  return normalized.length > 0 ? normalized : null;
 }
 
 export function heartbeatService(db: Db) {

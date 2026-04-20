@@ -22,6 +22,7 @@ export interface SwarmDigestClaimedPathsSummary {
     agentName: string;
     role: string | null;
     paths: string[];
+    pathCount: number; // total unique paths claimed ( richer summary )
     issueIdentifier: string | null; // common issue being worked on
   }[];
 }
@@ -31,8 +32,17 @@ export interface SwarmDigestRecommendedAvoidPaths {
   reasons: string[];
 }
 
+export interface SwarmDigestAutoClaimSuggestion {
+  source: "issue_labels" | "issue_description" | "diff"; // where suggestion came from
+  path: string;
+  claimType: string;
+  reason: string; // human-readable reason for suggestion
+  issueIdentifier?: string; // linked issue if source is issue_labels or issue_description
+}
+
 export interface SwarmDigestProtectedPaths {
   paths: string[]; // hard-blocked paths that should never be claimed
+  enforcedBy: "server" | "config"; // who enforces these rules
 }
 
 export interface SwarmDigestRun {
@@ -135,6 +145,7 @@ export interface SwarmDigest {
   latestHandoff: SwarmDigestHandoff | null;
   claimedPathsSummary: SwarmDigestClaimedPathsSummary;
   recommendedAvoidPaths: SwarmDigestRecommendedAvoidPaths;
+  autoClaimSuggestions: SwarmDigestAutoClaimSuggestion[];
   protectedPaths: SwarmDigestProtectedPaths;
 }
 

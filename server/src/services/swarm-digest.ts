@@ -12,7 +12,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, executionWorkspaces, workspaceRuntimeServices, issues, fileClaims, issueComments } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, ne, sql, lt, isNotNull, or } from "drizzle-orm";
 import { asString, parseObject } from "../adapters/utils.js";
-import { getActiveClaimsForRun, listConflicts } from "./file-claims.js";
+import { getActiveClaimsForRun, listConflicts, extractClaimPathsFromIssue, extractClaimPathsFromDiff } from "./file-claims.js";
 import { parseHandoffComment, isHandoffComment, HANDOFF_COMMENT_PREFIX } from "./handoff-comments.js";
 import type {
   SwarmDigest,
@@ -27,6 +27,7 @@ import type {
   SwarmDigestHandoff,
   SwarmDigestClaimedPathsSummary,
   SwarmDigestRecommendedAvoidPaths,
+  SwarmDigestAutoClaimSuggestion,
   SwarmDigestProtectedPaths,
 } from "@paperclipai/shared";
 
@@ -70,7 +71,8 @@ function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDig
     latestHandoff: null,
     claimedPathsSummary: { byAgent: [] },
     recommendedAvoidPaths: { paths: [], reasons: [] },
-    protectedPaths: { paths: commonlyProtectedPatterns },
+    autoClaimSuggestions: [],
+    protectedPaths: { paths: commonlyProtectedPatterns, enforcedBy: "server" },
   };
 }
 
@@ -127,25 +129,24 @@ export async function buildSwarmDigest(
     activeRunConditions.push(ne(heartbeatRuns.id, currentRunId));
   }
 
-  // Get runs scoped to project via contextSnapshot projectId
+  // Get all runs (running or queued) for the company/project
+  // Not gated on activeAgents so queued runs from idle agents are included
   let activeRuns: SwarmDigestRun[] = [];
-  if (activeAgents.length > 0) {
-    const agentIds = activeAgents.map((a) => a.id);
-    activeRunConditions.push(inArray(heartbeatRuns.agentId, agentIds));
+  const runRows = await db
+    .select({
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      status: heartbeatRuns.status,
+      startedAt: heartbeatRuns.startedAt,
+    })
+    .from(heartbeatRuns)
+    .where(and(...activeRunConditions))
+    .orderBy(desc(heartbeatRuns.startedAt))
+    .limit(50);
 
-    const runRows = await db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        status: heartbeatRuns.status,
-        startedAt: heartbeatRuns.startedAt,
-      })
-      .from(heartbeatRuns)
-      .where(and(...activeRunConditions))
-      .orderBy(desc(heartbeatRuns.startedAt))
-      .limit(50);
-
+  // (activeRuns initialized as empty array above, mapped below after issue fetching)
+  if (runRows.length > 0) {
     // Extract issue info from contextSnapshot
     const issueIds = new Set<string>();
     for (const run of runRows) {
@@ -154,33 +155,35 @@ export async function buildSwarmDigest(
       if (issueId) issueIds.add(issueId);
     }
 
-    // Batch fetch issue identifiers and titles
-    const issueRows = issueIds.size > 0
-      ? await db
-          .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
-          .from(issues)
-          .where(inArray(issues.id, Array.from(issueIds)))
-      : [];
-    const issueMap = new Map(issueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title }]));
+  // Batch fetch issue identifiers and titles
+  const activeRunsIssueRows = issueIds.size > 0
+    ? await db
+        .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+        .from(issues)
+        .where(inArray(issues.id, Array.from(issueIds)))
+    : [];
+  const issueMap = new Map(activeRunsIssueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title }]));
 
-    activeRuns = runRows
-      .map((run): SwarmDigestRun => {
-        const context = parseObject(run.contextSnapshot);
-        const issueId = readNonEmptyString(context.issueId) || null;
-        const issueInfo = issueId ? issueMap.get(issueId) : null;
-        const swarmRole = activeAgents.find((a) => a.id === run.agentId)?.role ?? null;
-        return {
-          id: run.id,
-          agentId: run.agentId,
-          issueId,
-          issueIdentifier: issueInfo?.identifier ?? null,
-          issueTitle: issueInfo?.title ?? null,
-          status: run.status,
-          startedAt: run.startedAt?.toISOString() ?? null,
-          swarmRole,
-        };
-      })
-      .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
+  const activeRunsAgentRoleMap = new Map(activeAgents.map((a) => [a.id, a.role]));
+
+  activeRuns = runRows
+    .map((run): SwarmDigestRun => {
+      const context = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(context.issueId) || null;
+      const issueInfo = issueId ? issueMap.get(issueId) : null;
+      const swarmRole = activeRunsAgentRoleMap.get(run.agentId) ?? null;
+      return {
+        id: run.id,
+        agentId: run.agentId,
+        issueId,
+        issueIdentifier: issueInfo?.identifier ?? null,
+        issueTitle: issueInfo?.title ?? null,
+        status: run.status,
+        startedAt: run.startedAt?.toISOString() ?? null,
+        swarmRole,
+      };
+    })
+    .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
   }
 
   // 3. Execution workspaces for the project/company
@@ -327,6 +330,15 @@ export async function buildSwarmDigest(
   const now = new Date();
   const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
 
+  const staleClaimConditions = [
+    eq(fileClaims.companyId, companyId),
+    eq(fileClaims.status, "active"),
+    lt(fileClaims.expiresAt, fiveMinutesFromNow),
+  ];
+  if (projectId) {
+    staleClaimConditions.push(eq(fileClaims.projectId, projectId));
+  }
+
   const staleClaimRows = await db
     .select({
       id: fileClaims.id,
@@ -337,13 +349,7 @@ export async function buildSwarmDigest(
       expiresAt: fileClaims.expiresAt,
     })
     .from(fileClaims)
-    .where(
-      and(
-        eq(fileClaims.companyId, companyId),
-        eq(fileClaims.status, "active"),
-        lt(fileClaims.expiresAt, fiveMinutesFromNow),
-      ),
-    )
+    .where(and(...staleClaimConditions))
     .limit(20);
 
   const fileClaimStale: SwarmDigestFileClaimStale[] = staleClaimRows.map((c) => {
@@ -361,6 +367,23 @@ export async function buildSwarmDigest(
   });
 
   // 7. Failed or degraded runtime services
+  // Scope to project's workspaces when projectId is provided (via executionWorkspaceId join)
+  const degradedServiceConditions = [
+    eq(workspaceRuntimeServices.companyId, companyId),
+    or(
+      eq(workspaceRuntimeServices.healthStatus, "degraded"),
+      eq(workspaceRuntimeServices.healthStatus, "unhealthy"),
+      eq(workspaceRuntimeServices.status, "stopped"),
+      eq(workspaceRuntimeServices.status, "failed"),
+    ),
+  ];
+  if (projectId && activeWorkspaceIds.length > 0) {
+    degradedServiceConditions.push(inArray(workspaceRuntimeServices.executionWorkspaceId, activeWorkspaceIds));
+  } else if (projectId && activeWorkspaceIds.length === 0) {
+    // No active workspaces in this project — degraded services list will be empty
+    degradedServiceConditions.push(sql`1 = 0`);
+  }
+
   const degradedServiceRows = await db
     .select({
       id: workspaceRuntimeServices.id,
@@ -371,17 +394,7 @@ export async function buildSwarmDigest(
       ownerAgentId: workspaceRuntimeServices.ownerAgentId,
     })
     .from(workspaceRuntimeServices)
-    .where(
-      and(
-        eq(workspaceRuntimeServices.companyId, companyId),
-        or(
-          eq(workspaceRuntimeServices.healthStatus, "degraded"),
-          eq(workspaceRuntimeServices.healthStatus, "unhealthy"),
-          eq(workspaceRuntimeServices.status, "stopped"),
-          eq(workspaceRuntimeServices.status, "failed"),
-        ),
-      ),
-    )
+    .where(and(...degradedServiceConditions))
     .limit(20);
 
   const servicesDegraded: SwarmDigestServiceDegraded[] = degradedServiceRows.map((s) => ({
@@ -399,6 +412,16 @@ export async function buildSwarmDigest(
   // A truly stuck queued run will have createdAt set but startedAt = NULL.
   const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
 
+  // Get all stuck runs scoped to projectId when provided
+  const stuckRunConditions = [
+    eq(heartbeatRuns.companyId, companyId),
+    eq(heartbeatRuns.status, "queued"),
+    lt(heartbeatRuns.createdAt, fiveMinutesAgo),
+  ];
+  if (projectId) {
+    stuckRunConditions.push(sql`${heartbeatRuns.contextSnapshot} ->> 'projectId' = ${projectId}`);
+  }
+
   const stuckRunRows = await db
     .select({
       id: heartbeatRuns.id,
@@ -409,13 +432,7 @@ export async function buildSwarmDigest(
       startedAt: heartbeatRuns.startedAt,
     })
     .from(heartbeatRuns)
-    .where(
-      and(
-        eq(heartbeatRuns.companyId, companyId),
-        eq(heartbeatRuns.status, "queued"),
-        lt(heartbeatRuns.createdAt, fiveMinutesAgo),
-      ),
-    )
+    .where(and(...stuckRunConditions))
     .orderBy(asc(heartbeatRuns.createdAt))
     .limit(20);
 
@@ -459,6 +476,12 @@ export async function buildSwarmDigest(
   // 9. Recent handoff comments (last 30 minutes)
   const thirtyMinutesAgo = new Date(now.getTime() - 30 * 60 * 1000);
 
+  const handoffConditions = [
+    eq(issueComments.companyId, companyId),
+    gte(issueComments.createdAt, thirtyMinutesAgo),
+    isNotNull(issueComments.authorAgentId),
+  ];
+
   const handoffCommentRows = await db
     .select({
       id: issueComments.id,
@@ -469,34 +492,36 @@ export async function buildSwarmDigest(
       createdAt: issueComments.createdAt,
     })
     .from(issueComments)
-    .where(
-      and(
-        eq(issueComments.companyId, companyId),
-        gte(issueComments.createdAt, thirtyMinutesAgo),
-        isNotNull(issueComments.authorAgentId),
-      ),
-    )
+    .where(and(...handoffConditions))
     .orderBy(desc(issueComments.createdAt))
     .limit(20);
 
   // Filter to only handoff comments and parse them
   const recentHandoffs: SwarmDigestHandoff[] = [];
+
+  // Batch-fetch all issue identifiers upfront to avoid N+1 queries
+  const allHandoffIssueIds = new Set<string>();
+  for (const row of handoffCommentRows) {
+    if (!isHandoffComment(row.body)) continue;
+    const parsed = parseHandoffComment(row.body);
+    if (parsed?.issueId) allHandoffIssueIds.add(parsed.issueId);
+  }
+
+  const handoffIssueRows = allHandoffIssueIds.size > 0
+    ? await db
+        .select({ id: issues.id, identifier: issues.identifier })
+        .from(issues)
+        .where(inArray(issues.id, Array.from(allHandoffIssueIds)))
+    : [];
+  const handoffIssueMap = new Map(handoffIssueRows.map((i) => [i.id, i.identifier]));
+
   for (const row of handoffCommentRows) {
     if (!isHandoffComment(row.body)) continue;
 
     const parsed = parseHandoffComment(row.body);
     if (!parsed) continue;
 
-    // Get issue identifier if we have issueId
-    let issueIdentifier: string | null = null;
-    if (parsed.issueId) {
-      const issueRows = await db
-        .select({ identifier: issues.identifier })
-        .from(issues)
-        .where(eq(issues.id, parsed.issueId))
-        .limit(1);
-      issueIdentifier = issueRows[0]?.identifier ?? null;
-    }
+    const issueIdentifier = parsed.issueId ? handoffIssueMap.get(parsed.issueId) ?? null : null;
 
     recentHandoffs.push({
       id: row.id,
@@ -539,7 +564,7 @@ export async function buildSwarmDigest(
 
   // Build agent name map from activeAgents
   const agentNameMap = new Map(activeAgents.map((a) => [a.id, a.name]));
-  const agentRoleMap = new Map(activeAgents.map((a) => [a.id, a.role]));
+  const claimedPathsAgentRoleMap = new Map(activeAgents.map((a) => [a.id, a.role]));
 
   // Group claims by agent (filter out claims with null agentId)
   // Also track the most common issueId per agent for richer context
@@ -562,13 +587,13 @@ export async function buildSwarmDigest(
       allIssueIds.add(issueId);
     }
   }
-  const issueRows = allIssueIds.size > 0
+  const claimedPathsIssueRows = allIssueIds.size > 0
     ? await db
         .select({ id: issues.id, identifier: issues.identifier })
         .from(issues)
         .where(inArray(issues.id, Array.from(allIssueIds)))
     : [];
-  const issueIdToIdentifier = new Map(issueRows.map((i) => [i.id, i.identifier]));
+  const issueIdToIdentifier = new Map(claimedPathsIssueRows.map((i) => [i.id, i.identifier]));
 
   const claimedPathsSummary: SwarmDigestClaimedPathsSummary = {
     byAgent: Array.from(claimsByAgent.entries()).map(([agentId, data]) => {
@@ -580,8 +605,9 @@ export async function buildSwarmDigest(
       return {
         agentId,
         agentName: agentNameMap.get(agentId) ?? "Unknown",
-        role: agentRoleMap.get(agentId) ?? null,
+        role: claimedPathsAgentRoleMap.get(agentId) ?? null,
         paths: [...data.paths].slice(0, 50), // dedupe and limit
+        pathCount: data.paths.size,
         issueIdentifier: commonIssue,
       };
     }),
@@ -627,7 +653,45 @@ export async function buildSwarmDigest(
   ];
   const protectedPaths: SwarmDigestProtectedPaths = {
     paths: commonlyProtectedPatterns,
+    enforcedBy: "server",
   };
+
+  // 13. Auto-claim suggestions from issue metadata (labels + description)
+  const autoClaimSuggestions: SwarmDigestAutoClaimSuggestion[] = [];
+  const suggestionSeen = new Set<string>();
+
+  // Get active runs for this project to extract their issue context
+  for (const run of activeRuns) {
+    if (!run.issueId) continue;
+
+    // Fetch issue labels and description for auto-claim extraction
+    const [issueRows] = await db
+      .select({ id: issues.id, identifier: issues.identifier, title: issues.title, description: issues.description })
+      .from(issues)
+      .where(eq(issues.id, run.issueId))
+      .limit(1);
+
+    if (!issueRows) continue;
+    // @ts-ignore - drizzle row type
+    const issue = issueRows as { id: string; identifier: string | null; title: string | null; description: string | null } | undefined;
+    if (!issue) continue;
+
+    // Extract from labels (labels are stored as text[] in PostgreSQL)
+    const labelClaims = extractClaimPathsFromIssue({ description: issue.description });
+    for (const claim of labelClaims) {
+      const key = `${claim.claimType}:${claim.claimPath}`;
+      if (!suggestionSeen.has(key)) {
+        suggestionSeen.add(key);
+        autoClaimSuggestions.push({
+          source: "issue_description",
+          path: claim.claimPath,
+          claimType: claim.claimType,
+          reason: `Suggested by issue ${issue.identifier ?? issue.id} description`,
+          issueIdentifier: issue.identifier ?? undefined,
+        });
+      }
+    }
+  }
 
   return {
     companyId,
@@ -645,6 +709,7 @@ export async function buildSwarmDigest(
     latestHandoff: recentHandoffs[0] ?? null,
     claimedPathsSummary,
     recommendedAvoidPaths,
+    autoClaimSuggestions,
     protectedPaths,
   };
 }
@@ -674,10 +739,22 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     for (const agentEntry of digest.claimedPathsSummary.byAgent.slice(0, 5)) {
       const roleTag = agentEntry.role ? ` [${agentEntry.role}]` : "";
       const issueTag = agentEntry.issueIdentifier ? ` [${agentEntry.issueIdentifier}]` : "";
-      lines.push(`- **${agentEntry.agentName}**${roleTag}${issueTag}:`);
+      const countTag = agentEntry.pathCount > 5 ? ` (${agentEntry.pathCount} paths)` : "";
+      lines.push(`- **${agentEntry.agentName}**${roleTag}${issueTag}${countTag}:`);
       for (const path of agentEntry.paths.slice(0, 5)) {
         lines.push(`  - ${path}`);
       }
+    }
+    lines.push("");
+  }
+
+  // Auto-claim suggestions from issue metadata
+  if (digest.autoClaimSuggestions.length > 0) {
+    lines.push("### Auto-Claim Suggestions");
+    lines.push("Based on issue metadata, these paths may be relevant:");
+    for (const suggestion of digest.autoClaimSuggestions.slice(0, 10)) {
+      const issueNote = suggestion.issueIdentifier ? ` [${suggestion.issueIdentifier}]` : "";
+      lines.push(`- ${suggestion.path} (${suggestion.claimType})${issueNote}: ${suggestion.reason}`);
     }
     lines.push("");
   }

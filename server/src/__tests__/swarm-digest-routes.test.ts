@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import type { Db } from "@paperclipai/db";
 import { swarmDigestRoutes } from "../routes/swarm-digest.js";
+import { HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT } from "../services/hot-run-governor.js";
 import type {
   SwarmDigest,
   SwarmDigestAgent,
@@ -34,7 +35,7 @@ vi.mock("../services/hot-run-governor.js", () => ({
   countRunningHotCodingRuns: mockCountRunningHotCodingRuns,
   getEffectiveHotCodingCapacity: mockGetEffectiveHotCodingCapacity,
   SESSIONED_LOCAL_ADAPTERS: new Set(["claude", "codex", "cursor"]),
-  HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT: 3,
+  HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT: 2,
 }));
 
 function createMockDigest(overrides: Partial<{
@@ -433,5 +434,88 @@ describe("GET /companies/:companyId/swarm-digest", () => {
       summary: "Handed off work on auth",
       recommendedNextStep: "Write tests",
     });
+  });
+
+  it("hotSlotUsage.max reflects real computed capacity (displayed capacity matches reality)", async () => {
+    // Verify the route uses getEffectiveHotCodingCapacity result directly as hotSlotUsage.max.
+    // This ensures the cockpit shows the true effective capacity, not a hardcoded default.
+    const computedCapacity = 7;
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(2);
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(computedCapacity);
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    const app = createApp(mockDb);
+    const res = await request(app).get("/companies/company-1/swarm-digest");
+
+    expect(res.status).toBe(200);
+    expect(res.body.hotSlotUsage.max).toBe(computedCapacity);
+    expect(res.body.hotSlotUsage.max).not.toBe(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT);
+  });
+
+  it("company-scoped: Company A and Company B get different hotSlotUsage.max values", async () => {
+    // Company-scoped counting: capacity is per-company, so different companies
+    // must see different max values based on their own agent configurations.
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    // Company A: capacity = 5
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(5);
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(1);
+
+    const appA = express();
+    appA.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "board",
+        userId: "user-1",
+        source: "session",
+        companyIds: ["company-A"],
+        memberships: [{ companyId: "company-A", membershipRole: "admin", status: "active" }],
+      };
+      next();
+    });
+    appA.use(swarmDigestRoutes(mockDb));
+    const resA = await request(appA).get("/companies/company-A/swarm-digest");
+    expect(resA.status).toBe(200);
+    expect(resA.body.hotSlotUsage.max).toBe(5);
+
+    // Company B: capacity = 2 (different agent config)
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(2);
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(0);
+
+    const appB = express();
+    appB.use((req, _res, next) => {
+      (req as any).actor = {
+        type: "board",
+        userId: "user-2",
+        source: "session",
+        companyIds: ["company-B"],
+        memberships: [{ companyId: "company-B", membershipRole: "admin", status: "active" }],
+      };
+      next();
+    });
+    appB.use(swarmDigestRoutes(mockDb));
+    const resB = await request(appB).get("/companies/company-B/swarm-digest");
+    expect(resB.status).toBe(200);
+    expect(resB.body.hotSlotUsage.max).toBe(2);
+
+    expect(mockGetEffectiveHotCodingCapacity).toHaveBeenNthCalledWith(1, mockDb, "company-A", undefined);
+    expect(mockGetEffectiveHotCodingCapacity).toHaveBeenNthCalledWith(2, mockDb, "company-B", undefined);
   });
 });

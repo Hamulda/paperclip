@@ -42,7 +42,7 @@ vi.mock("@/lib/router", () => ({
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 function createMockDigest(overrides: Partial<SwarmCockpitDigest> = {}): SwarmCockpitDigest {
-  return {
+  const defaultDigest: SwarmCockpitDigest = {
     companyId: "company-1",
     projectId: "project-1",
     generatedAt: "2026-04-19T10:00:00.000Z",
@@ -55,12 +55,15 @@ function createMockDigest(overrides: Partial<SwarmCockpitDigest> = {}): SwarmCoc
     servicesDegraded: [],
     runsStuck: [],
     recentHandoffs: [],
+    latestHandoff: null,
     claimedPathsSummary: { byAgent: [] },
     recommendedAvoidPaths: { paths: [], reasons: [] },
+    protectedPaths: { paths: [], enforcedBy: "server" },
+    autoClaimSuggestions: [],
     hotSlotUsage: { current: 0, max: 3 },
     queuedHotRunsCount: 0,
-    ...overrides,
   };
+  return { ...defaultDigest, ...overrides };
 }
 
 function renderWithProviders(ui: ReactNode, container: HTMLDivElement) {
@@ -152,6 +155,7 @@ describe("SwarmCockpit", () => {
             issueIdentifier: "PAP-99",
             issueTitle: "Long task",
             status: "queued",
+            createdAt: "2026-04-19T08:00:00.000Z",
             startedAt: "2026-04-19T08:00:00.000Z",
             minutesWaiting: 110,
           },
@@ -223,6 +227,7 @@ describe("SwarmCockpit", () => {
             issueIdentifier: "PAP-5",
             issueTitle: "Stuck issue",
             status: "queued",
+            createdAt: "2026-04-19T08:00:00.000Z",
             startedAt: "2026-04-19T08:00:00.000Z",
             minutesWaiting: 55,
           },
@@ -389,5 +394,187 @@ describe("SwarmCockpit", () => {
     expect(container.textContent).toContain("Min");
     expect(container.textContent).toContain("Minimal handoff");
     expect(container.textContent).toContain("Ship it");
+  });
+
+  it("renders agent role badge in Active Agents section", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeAgents: [
+          { id: "agent-1", name: "Alice", status: "running", role: "planner" },
+          { id: "agent-2", name: "Bob", status: "running", role: "implementer" },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Alice");
+    expect(container.textContent).toContain("planner");
+    expect(container.textContent).toContain("Bob");
+    expect(container.textContent).toContain("implementer");
+  });
+
+  it("renders run swarmRole badge in Active Runs section", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          {
+            id: "run-1",
+            agentId: "agent-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-42",
+            issueTitle: "Fix bug",
+            status: "running",
+            startedAt: "2026-04-19T09:00:00.000Z",
+            swarmRole: "planner",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-42");
+    expect(container.textContent).toContain("planner");
+  });
+
+  it("renders handoff swarmRole badge and avoidPaths", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        recentHandoffs: [
+          {
+            id: "hc-1",
+            agentId: "agent-1",
+            agentName: "Charlie",
+            swarmRole: "integrator",
+            runId: "run-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-10",
+            summary: "Completed feature",
+            filesTouched: [],
+            currentState: "Done",
+            remainingWork: [],
+            blockers: [],
+            recommendedNextStep: "Review PR",
+            avoidPaths: ["src/legacy/", "src/deprecated/", "src/old/"],
+            emittedAt: "2026-04-19T09:00:00.000Z",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Charlie");
+    expect(container.textContent).toContain("integrator");
+    expect(container.textContent).toContain("Avoid: src/legacy/");
+    expect(container.textContent).toContain("+1");
+  });
+
+  it("renders Claimed Paths section with agent and path count", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        claimedPathsSummary: {
+          byAgent: [
+            {
+              agentId: "agent-1",
+              agentName: "Alice",
+              role: "planner",
+              paths: ["src/a.ts", "src/b.ts", "src/c.ts"],
+              pathCount: 3,
+              issueIdentifier: "PAP-1",
+            },
+          ],
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Alice");
+    expect(container.textContent).toContain("planner");
+    expect(container.textContent).toContain("PAP-1");
+    expect(container.textContent).toContain("3 paths claimed");
+  });
+
+  it("renders Avoid Paths section", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        recommendedAvoidPaths: {
+          paths: ["src/legacy/", "src/deprecated/"],
+          reasons: ["Agent is working here", "Another agent is working here"],
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("src/legacy/");
+    expect(container.textContent).toContain("src/deprecated/");
+    expect(container.textContent).toContain("Agent is working here");
+  });
+
+  it("renders Protected Paths section with enforcedBy label", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        protectedPaths: {
+          paths: ["package.json", "pnpm-lock.yaml", "node_modules/**"],
+          enforcedBy: "server",
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Protected Paths");
+    expect(container.textContent).toContain("Hard-blocked patterns");
+    expect(container.textContent).toContain("server");
+    expect(container.textContent).toContain("package.json");
+    expect(container.textContent).toContain("pnpm-lock.yaml");
+  });
+
+  it("renders Queue Fairness section in healthy state", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        runsStuck: [],
+        activeRuns: [{ id: "run-1", agentId: "a1", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null }],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Queue Health");
+    expect(container.textContent).toContain("Healthy");
+  });
+
+  it("renders Queue Fairness section with starvation warning", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        runsStuck: [
+          { id: "run-stuck", agentId: "a1", issueId: "issue-1", issueIdentifier: "PAP-5", issueTitle: "Stuck", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
+          { id: "run-stuck-2", agentId: "a2", issueId: "issue-2", issueIdentifier: "PAP-6", issueTitle: "Stuck2", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
+          { id: "run-stuck-3", agentId: "a3", issueId: "issue-3", issueIdentifier: "PAP-7", issueTitle: "Stuck3", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
+        ],
+        activeRuns: [
+          { id: "run-1", agentId: "a4", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null },
+          { id: "run-2", agentId: "a5", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null },
+          { id: "run-3", agentId: "a6", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Queue Health");
+    expect(container.textContent).toContain("High queue pressure");
+    expect(container.textContent).toContain("3/6 queued");
   });
 });
