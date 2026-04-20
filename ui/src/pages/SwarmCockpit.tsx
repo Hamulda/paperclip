@@ -23,6 +23,8 @@ import {
   Shield,
   Scale,
   Ban,
+  Lightbulb,
+  Star,
 } from "lucide-react";
 
 function SectionCard({
@@ -297,6 +299,64 @@ function ProtectedPathsRow({ path }: { path: string }) {
   );
 }
 
+function AutoClaimSuggestionRow({ suggestion }: { suggestion: { source: "issue_labels" | "issue_description" | "diff"; path: string; claimType: string; reason: string; issueIdentifier?: string } }) {
+  const sourceColors: Record<string, string> = {
+    issue_labels: "text-purple-500 bg-purple-500/10",
+    issue_description: "text-blue-500 bg-blue-500/10",
+    diff: "text-green-500 bg-green-500/10",
+  };
+  const colorClass = sourceColors[suggestion.source] ?? "text-muted bg-muted/50";
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <Lightbulb className="h-4 w-4 shrink-0 text-yellow-400 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1 flex-wrap">
+          <p className="font-mono text-xs truncate">{suggestion.path}</p>
+          <span className={cn("inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-xs font-medium", colorClass)}>
+            {suggestion.source}
+          </span>
+          {suggestion.issueIdentifier && (
+            <span className="text-xs text-muted-foreground">[{suggestion.issueIdentifier}]</span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground truncate mt-0.5">{suggestion.reason}</p>
+      </div>
+    </div>
+  );
+}
+
+function LatestHandoffSummaryRow({ handoff }: { handoff: { agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; remainingWork: string[]; blockers: string[]; emittedAt: string } }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="font-medium text-sm">{handoff.agentName}</span>
+        {handoff.swarmRole && (
+          <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded">{handoff.swarmRole}</span>
+        )}
+        {handoff.issueIdentifier && (
+          <span className="text-xs text-muted-foreground">[{handoff.issueIdentifier}]</span>
+        )}
+        <span className="text-xs text-muted-foreground ml-auto">
+          {new Date(handoff.emittedAt).toLocaleTimeString()}
+        </span>
+      </div>
+      <p className="text-xs text-muted-foreground">{handoff.summary}</p>
+      {handoff.remainingWork.length > 0 && (
+        <p className="text-xs text-amber-600">
+          Remaining: {handoff.remainingWork.slice(0, 2).join(", ")}
+          {handoff.remainingWork.length > 2 ? ` +${handoff.remainingWork.length - 2}` : ""}
+        </p>
+      )}
+      {handoff.blockers.length > 0 && (
+        <p className="text-xs text-red-500">
+          Blockers: {handoff.blockers.slice(0, 2).join(", ")}
+          {handoff.blockers.length > 2 ? ` +${handoff.blockers.length - 2}` : ""}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function FairnessSignal({ stuckRuns, activeRuns }: { stuckRuns: number; activeRuns: number }) {
   const isHealthy = stuckRuns === 0 || activeRuns === 0;
   const starvationRatio = activeRuns > 0 ? stuckRuns / activeRuns : 0;
@@ -485,6 +545,14 @@ export function SwarmCockpit() {
           )}
         </SectionCard>
 
+        <SectionCard title="Latest Handoff" icon={Star} className="md:col-span-2 lg:col-span-2">
+          {!data.latestHandoff ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No handoff yet</p>
+          ) : (
+            <LatestHandoffSummaryRow handoff={data.latestHandoff} />
+          )}
+        </SectionCard>
+
         <SectionCard title="Claimed Paths" icon={MapPin} className="md:col-span-2 lg:col-span-1">
           {data.claimedPathsSummary.byAgent.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 text-center">No active claims</p>
@@ -518,6 +586,18 @@ export function SwarmCockpit() {
               <ProtectedPathsRow key={path} path={path} />
             ))}
           </div>
+        </SectionCard>
+
+        <SectionCard title="Auto-Claim Suggestions" icon={Lightbulb} className="md:col-span-2 lg:col-span-1">
+          {data.autoClaimSuggestions.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No suggestions</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.autoClaimSuggestions.slice(0, 8).map((suggestion, i) => (
+                <AutoClaimSuggestionRow key={i} suggestion={suggestion} />
+              ))}
+            </div>
+          )}
         </SectionCard>
 
         <SectionCard title="Queue Fairness" icon={Scale} className="md:col-span-2 lg:col-span-1">

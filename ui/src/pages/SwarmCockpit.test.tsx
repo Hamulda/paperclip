@@ -577,4 +577,87 @@ describe("SwarmCockpit", () => {
     expect(container.textContent).toContain("High queue pressure");
     expect(container.textContent).toContain("3/6 queued");
   });
+
+  it("renders Latest Handoff section with role, blockers, and remaining work", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        latestHandoff: {
+          id: "hc-latest",
+          agentId: "agent-latest",
+          agentName: "Diana",
+          swarmRole: "reviewer",
+          runId: "run-latest",
+          issueId: "issue-x",
+          issueIdentifier: "PAP-77",
+          summary: "Review changes and merge",
+          filesTouched: ["src/merge.ts"],
+          currentState: "Ready for review",
+          remainingWork: ["Update changelog", "Bump version"],
+          blockers: ["CI must pass"],
+          recommendedNextStep: "Merge after CI",
+          avoidPaths: [],
+          emittedAt: "2026-04-19T11:00:00.000Z",
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Latest Handoff");
+    expect(container.textContent).toContain("Diana");
+    expect(container.textContent).toContain("reviewer");
+    expect(container.textContent).toContain("PAP-77");
+    expect(container.textContent).toContain("Review changes and merge");
+    expect(container.textContent).toContain("Remaining:");
+    expect(container.textContent).toContain("Blockers:");
+  });
+
+  it("renders Latest Handoff empty state", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({ latestHandoff: null }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Latest Handoff");
+    expect(container.textContent).toContain("No handoff yet");
+  });
+
+  it("renders Auto-Claim Suggestions section with source badges", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        autoClaimSuggestions: [
+          { source: "issue_labels", path: "src/feature/", claimType: "directory", reason: "Priority label detected", issueIdentifier: "PAP-1" },
+          { source: "issue_description", path: "src/auth.ts", claimType: "file", reason: "Mentioned in issue body" },
+          { source: "diff", path: "src/bugfix.ts", claimType: "file", reason: "Changed in recent diff", issueIdentifier: "PAP-2" },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Auto-Claim Suggestions");
+    expect(container.textContent).toContain("src/feature/");
+    expect(container.textContent).toContain("issue_labels");
+    expect(container.textContent).toContain("src/auth.ts");
+    expect(container.textContent).toContain("issue_description");
+    expect(container.textContent).toContain("src/bugfix.ts");
+    expect(container.textContent).toContain("diff");
+    expect(container.textContent).toContain("Priority label detected");
+  });
+
+  it("renders Auto-Claim Suggestions empty state", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({ autoClaimSuggestions: [] }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Auto-Claim Suggestions");
+    expect(container.textContent).toContain("No suggestions");
+  });
 });

@@ -36,6 +36,12 @@ server/src/**/*.d.ts.map
 tmp/
 feedback-export-*
 
+# Python
+__pycache__/
+*.pyc
+*.bak
+.venv/
+
 # Editor / tool temp files
 *.tmp
 .vscode/

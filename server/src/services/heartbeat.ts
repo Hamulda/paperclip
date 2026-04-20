@@ -30,6 +30,8 @@ import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } fr
 import { costService } from "./costs.js";
 import { buildSwarmDigest, formatSwarmDigestForPrompt, buildHandoffComment } from "./swarm-digest.js";
 import { acquireClaims, refreshClaims, releaseClaims, listConflicts } from "./file-claims.js";
+import { finalizeIssueCommentPolicy, enqueueMissingIssueCommentRetry, patchRunIssueCommentStatus, findRunIssueComment } from "./issue-comment-policy.js";
+import { evaluateSessionCompaction, resolveNormalizedUsageForSession, summarizeHeartbeatRunListResultJson, type SessionCompactionDecision } from "./session-compaction.js";
 import {
   resolveExecutionRunAdapterConfig,
   extractMentionedSkillIdsFromSources,
@@ -349,13 +351,6 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
 }
 
-type SessionCompactionDecision = {
-  rotate: boolean;
-  reason: string | null;
-  handoffMarkdown: string | null;
-  previousRunId: string | null;
-};
-
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
@@ -384,39 +379,7 @@ export function summarizeHeartbeatRunContextSnapshot(
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-export function summarizeHeartbeatRunListResultJson(input: {
-  summary?: string | null;
-  result?: string | null;
-  message?: string | null;
-  error?: string | null;
-  totalCostUsd?: string | null;
-  costUsd?: string | null;
-  costUsdCamel?: string | null;
-}): Record<string, unknown> | null {
-  const summary: Record<string, unknown> = {};
-  for (const [key, value] of [
-    ["summary", input.summary],
-    ["result", input.result],
-    ["message", input.message],
-    ["error", input.error],
-  ] as const) {
-    const normalized = readNonEmptyString(value);
-    if (normalized) summary[key] = normalized;
-  }
-
-  for (const [key, value] of [
-    ["total_cost_usd", input.totalCostUsd],
-    ["cost_usd", input.costUsd],
-    ["costUsd", input.costUsdCamel],
-  ] as const) {
-    const normalized = readNonEmptyString(value);
-    if (!normalized) continue;
-    const parsed = Number(normalized);
-    if (Number.isFinite(parsed)) summary[key] = parsed;
-  }
-
-  return Object.keys(summary).length > 0 ? summary : null;
-}
+export { summarizeHeartbeatRunListResultJson } from "./session-compaction.js";
 
 function summarizeRunFailureForIssueComment(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined,
@@ -675,150 +638,6 @@ export function heartbeatService(db: Db) {
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function resolveNormalizedUsageForSession(input: {
-    agentId: string;
-    runId: string;
-    sessionId: string | null;
-    rawUsage: UsageTotals | null;
-  }) {
-    const { agentId, runId, sessionId, rawUsage } = input;
-    if (!sessionId || !rawUsage) {
-      return {
-        normalizedUsage: rawUsage,
-        previousRawUsage: null as UsageTotals | null,
-        derivedFromSessionTotals: false,
-      };
-    }
-
-    const previousRun = await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId });
-    const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
-    return {
-      normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
-      previousRawUsage,
-      derivedFromSessionTotals: previousRawUsage !== null,
-    };
-  }
-
-  async function evaluateSessionCompaction(input: {
-    agent: typeof agents.$inferSelect;
-    sessionId: string | null;
-    issueId: string | null;
-  }): Promise<SessionCompactionDecision> {
-    const { agent, sessionId, issueId } = input;
-    if (!sessionId) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
-
-    const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
-
-    const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
-    const runs = await db
-      .select({
-        id: heartbeatRuns.id,
-        createdAt: heartbeatRuns.createdAt,
-        usageJson: heartbeatRuns.usageJson,
-        error: heartbeatRuns.error,
-        ...heartbeatRunListResultColumns,
-      })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionIdAfter, sessionId)))
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(fetchLimit);
-
-    if (runs.length === 0) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
-
-    const latestRun = runs[0] ?? null;
-    const oldestRun =
-      policy.maxSessionAgeHours > 0
-        ? await getOldestRunForSession(agent.id, sessionId)
-        : runs[runs.length - 1] ?? latestRun;
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
-    const sessionAgeHours =
-      latestRun && oldestRun
-        ? Math.max(
-            0,
-            (new Date(latestRun.createdAt).getTime() - new Date(oldestRun.createdAt).getTime()) / (1000 * 60 * 60),
-          )
-        : 0;
-
-    let reason: string | null = null;
-    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
-      reason = `session exceeded ${policy.maxSessionRuns} runs`;
-    } else if (
-      policy.maxRawInputTokens > 0 &&
-      latestRawUsage &&
-      latestRawUsage.inputTokens >= policy.maxRawInputTokens
-    ) {
-      reason =
-        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
-        `(threshold ${formatCount(policy.maxRawInputTokens)})`;
-    } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
-      reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
-    }
-
-    if (!reason || !latestRun) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: latestRun?.id ?? null,
-      };
-    }
-
-    const latestSummary = summarizeHeartbeatRunListResultJson({
-      summary: latestRun?.resultSummary,
-      result: latestRun?.resultResult,
-      message: latestRun?.resultMessage,
-      error: latestRun?.resultError,
-      totalCostUsd: latestRun?.resultTotalCostUsd,
-      costUsd: latestRun?.resultCostUsd,
-      costUsdCamel: latestRun?.resultCostUsdCamel,
-    });
-    const latestTextSummary =
-      readNonEmptyString(latestSummary?.summary) ??
-      readNonEmptyString(latestSummary?.result) ??
-      readNonEmptyString(latestSummary?.message) ??
-      readNonEmptyString(latestRun.error);
-
-    const handoffMarkdown = [
-      "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
-      issueId ? `- Issue: ${issueId}` : "",
-      `- Rotation reason: ${reason}`,
-      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
-      "Continue from the current task state. Rebuild only the minimum context you need.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    return {
-      rotate: true,
-      reason,
-      handoffMarkdown,
-      previousRunId: latestRun.id,
-    };
   }
 
   async function resolveSessionBeforeForWakeup(
@@ -1334,30 +1153,11 @@ export function heartbeatService(db: Db) {
     runId: string,
     patch: Partial<Pick<typeof heartbeatRuns.$inferInsert, "issueCommentStatus" | "issueCommentSatisfiedByCommentId" | "issueCommentRetryQueuedAt">>,
   ) {
-    return db
-      .update(heartbeatRuns)
-      .set({ ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    return patchRunIssueCommentStatus(db, runId, patch);
   }
 
   async function findRunIssueComment(runId: string, companyId: string, issueId: string) {
-    return db
-      .select({
-        id: issueComments.id,
-      })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, companyId),
-          eq(issueComments.issueId, issueId),
-          eq(issueComments.createdByRunId, runId),
-        ),
-      )
-      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+    return findRunIssueComment(db, runId, companyId, issueId);
   }
 
   async function enqueueMissingIssueCommentRetry(
@@ -1365,184 +1165,21 @@ export function heartbeatService(db: Db) {
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(parseObject(run.contextSnapshot), null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
-    const retryContextSnapshot = {
-      ...contextSnapshot,
-      retryOfRunId: run.id,
-      wakeReason: "missing_issue_comment",
-      retryReason: "missing_issue_comment",
-      missingIssueCommentForRunId: run.id,
-    };
-    const now = new Date();
-
-    const retryRun = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
-      );
-
-      const issue = await tx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
-        .then((rows) => rows[0] ?? null);
-      if (!issue) return null;
-
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
-          source: "automation",
-          triggerDetail: "system",
-          reason: "missing_issue_comment",
-          payload: {
-            issueId,
-            retryOfRunId: run.id,
-            retryReason: "missing_issue_comment",
-          },
-          status: "queued",
-          requestedByActorType: "system",
-          requestedByActorId: null,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      const queuedRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
-          invocationSource: "automation",
-          triggerDetail: "system",
-          status: "queued",
-          wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
-          sessionIdBefore: sessionBefore,
-          retryOfRunId: run.id,
-          issueCommentStatus: "not_applicable",
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      await tx
-        .update(agentWakeupRequests)
-        .set({
-          runId: queuedRun.id,
-          updatedAt: now,
-        })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(agent.name),
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(issues.id, issue.id));
-
-      await tx
-        .update(heartbeatRuns)
-        .set({
-          issueCommentStatus: "retry_queued",
-          issueCommentRetryQueuedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(heartbeatRuns.id, run.id));
-
-      return queuedRun;
-    });
-
-    if (!retryRun) return null;
-
-    publishLiveEvent({
-      companyId: retryRun.companyId,
-      type: "heartbeat.run.queued",
-      payload: {
-        runId: retryRun.id,
-        agentId: retryRun.agentId,
-        invocationSource: retryRun.invocationSource,
-        triggerDetail: retryRun.triggerDetail,
-        wakeupRequestId: retryRun.wakeupRequestId,
-      },
-    });
-
-    return retryRun;
+    return enqueueMissingIssueCommentRetry(db, run, agent, issueId, sessionBefore);
   }
 
   async function finalizeIssueCommentPolicy(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
   ) {
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) {
-      if (run.issueCommentStatus !== "not_applicable") {
-        await patchRunIssueCommentStatus(run.id, {
-          issueCommentStatus: "not_applicable",
-          issueCommentSatisfiedByCommentId: null,
-          issueCommentRetryQueuedAt: null,
-        });
-      }
-      return { outcome: "not_applicable" as const, queuedRun: null };
-    }
-
-    const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
-    if (postedComment) {
-      await patchRunIssueCommentStatus(run.id, {
-        issueCommentStatus: "satisfied",
-        issueCommentSatisfiedByCommentId: postedComment.id,
-        issueCommentRetryQueuedAt: null,
-      });
-      return { outcome: "satisfied" as const, queuedRun: null };
-    }
-
-    if (readNonEmptyString(contextSnapshot.retryReason) === "missing_issue_comment") {
-      await patchRunIssueCommentStatus(run.id, {
-        issueCommentStatus: "retry_exhausted",
-        issueCommentSatisfiedByCommentId: null,
-      });
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: "Run ended without an issue comment after one retry; no further comment wake will be queued",
-      });
-      return { outcome: "retry_exhausted" as const, queuedRun: null };
-    }
-
-    if (!shouldRequireIssueCommentForWake(contextSnapshot)) {
-      if (run.issueCommentStatus !== "not_applicable") {
-        await patchRunIssueCommentStatus(run.id, {
-          issueCommentStatus: "not_applicable",
-          issueCommentSatisfiedByCommentId: null,
-          issueCommentRetryQueuedAt: null,
-        });
-      }
-      return { outcome: "not_applicable" as const, queuedRun: null };
-    }
-
-    const queuedRun = await enqueueMissingIssueCommentRetry(run, agent, issueId);
-    if (queuedRun) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: "Run ended without an issue comment; queued one follow-up wake to require a comment",
-      });
-      return { outcome: "retry_queued" as const, queuedRun };
-    }
-
-    await patchRunIssueCommentStatus(run.id, {
-      issueCommentStatus: "retry_exhausted",
-      issueCommentSatisfiedByCommentId: null,
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(parseObject(run.contextSnapshot), null);
+    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    return finalizeIssueCommentPolicy(db, run, agent, sessionBefore, {
+      appendRunEvent: async (input) => appendRunEvent(input.run, input.seq, input.event),
+      nextRunEventSeq,
     });
-    return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
   async function enqueueProcessLossRetry(
@@ -2840,11 +2477,13 @@ export function heartbeatService(db: Db) {
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
     let runtimeSessionParamsForAdapter = runtimeSessionParams;
 
-    const sessionCompaction = await evaluateSessionCompaction({
+    const sessionCompaction = await evaluateSessionCompaction(
+      db,
       agent,
-      sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
+      previousSessionDisplayId ?? runtimeSessionIdForAdapter,
       issueId,
-    });
+      { getOldestRunForSession },
+    );
     if (sessionCompaction.rotate) {
       context.paperclipSessionHandoffMarkdown = sessionCompaction.handoffMarkdown;
       context.paperclipSessionRotationReason = sessionCompaction.reason;
@@ -3184,12 +2823,16 @@ export function heartbeatService(db: Db) {
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
-      const sessionUsageResolution = await resolveNormalizedUsageForSession({
+      const sessionUsageResolution = await resolveNormalizedUsageForSession(
+      db,
+      getLatestRunForSession,
+      {
         agentId: agent.id,
         runId: run.id,
         sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         rawUsage,
-      });
+      },
+    );
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";

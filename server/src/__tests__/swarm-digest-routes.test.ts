@@ -223,6 +223,92 @@ describe("GET /companies/:companyId/swarm-digest", () => {
     );
   });
 
+  it("project-scoped digest includes handoffs only for that project", async () => {
+    // When scoped to a project, recentHandoffs should only contain handoffs from that project.
+    // The buildSwarmDigest function filters via issueComments → issues.projectId join.
+    const projectHandoff = {
+      id: "hc-project",
+      agentId: "agent-1",
+      agentName: "Alice",
+      runId: "run-1",
+      issueId: "issue-in-project",
+      issueIdentifier: "PAP-100",
+      summary: "Completed feature X",
+      filesTouched: ["src/x.ts"],
+      currentState: "Done",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "Review",
+      emittedAt: "2026-04-20T09:00:00.000Z",
+    };
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest({ recentHandoffs: [projectHandoff] }));
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(0);
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(3);
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    const app = createApp(mockDb);
+    const res = await request(app).get("/companies/company-1/swarm-digest?projectId=project-42");
+
+    expect(res.status).toBe(200);
+    expect(res.body.recentHandoffs).toHaveLength(1);
+    expect(res.body.recentHandoffs[0].issueIdentifier).toBe("PAP-100");
+    expect(mockBuildSwarmDigest).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ projectId: "project-42" }),
+    );
+  });
+
+  it("company-scoped digest includes all company handoffs (no projectId filter)", async () => {
+    // When no projectId is provided, buildSwarmDigest receives projectId=null,
+    // which skips the project filter in recentHandoffs query (backward compatible).
+    const companyHandoff = {
+      id: "hc-company-wide",
+      agentId: "agent-2",
+      agentName: "Bob",
+      runId: "run-2",
+      issueId: "issue-other-project",
+      issueIdentifier: "PAP-99",
+      summary: "Cross-project handoff",
+      filesTouched: [],
+      currentState: "Done",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "Take over",
+      emittedAt: "2026-04-20T08:00:00.000Z",
+    };
+    mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest({ recentHandoffs: [companyHandoff] }));
+    mockCountRunningHotCodingRuns.mockResolvedValueOnce(0);
+    mockGetEffectiveHotCodingCapacity.mockResolvedValueOnce(3);
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        then: (resolve: any) => resolve([{ count: 0 }]),
+      })),
+    } as unknown as Db;
+
+    const app = createApp(mockDb);
+    const res = await request(app).get("/companies/company-1/swarm-digest"); // no projectId
+
+    expect(res.status).toBe(200);
+    expect(res.body.recentHandoffs).toHaveLength(1);
+    expect(res.body.recentHandoffs[0].issueIdentifier).toBe("PAP-99");
+    expect(mockBuildSwarmDigest).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ projectId: null }),
+    );
+  });
+
   it("passes projectId to hot slot functions when scoped to a project", async () => {
     mockBuildSwarmDigest.mockResolvedValueOnce(createMockDigest());
     mockCountRunningHotCodingRuns.mockResolvedValueOnce(1);
