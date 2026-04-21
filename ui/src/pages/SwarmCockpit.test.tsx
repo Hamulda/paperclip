@@ -65,6 +65,7 @@ function createMockDigest(overrides: Partial<SwarmCockpitDigest> = {}): SwarmCoc
     queuedHotRunsCount: 0,
     reviewQueue: { readyForReview: [], needsVerification: [], blocked: [] },
     collaborationHints: [],
+    recentArtifacts: [],
   };
   return { ...defaultDigest, ...overrides };
 }
@@ -182,6 +183,7 @@ describe("SwarmCockpit", () => {
             recommendedNextStep: "Review PR",
             avoidPaths: [],
             emittedAt: "2026-04-19T09:00:00.000Z",
+            verificationStatus: null,
           },
         ],
       }),
@@ -310,6 +312,7 @@ describe("SwarmCockpit", () => {
             recommendedNextStep: "Merge and deploy",
             avoidPaths: ["src/legacy/"],
             emittedAt: "2026-04-19T09:30:00.000Z",
+            verificationStatus: null,
           },
         ],
       }),
@@ -392,6 +395,7 @@ describe("SwarmCockpit", () => {
             recommendedNextStep: "Ship it",
             avoidPaths: [],
             emittedAt: "2026-04-19T09:00:00.000Z",
+            verificationStatus: null,
           },
         ],
       }),
@@ -469,6 +473,7 @@ describe("SwarmCockpit", () => {
             recommendedNextStep: "Review PR",
             avoidPaths: ["src/legacy/", "src/deprecated/", "src/old/"],
             emittedAt: "2026-04-19T09:00:00.000Z",
+            verificationStatus: null,
           },
         ],
       }),
@@ -607,6 +612,7 @@ describe("SwarmCockpit", () => {
           recommendedNextStep: "Merge after CI",
           avoidPaths: [],
           emittedAt: "2026-04-19T11:00:00.000Z",
+          verificationStatus: null,
         },
       }),
     );
@@ -1076,5 +1082,263 @@ describe("SwarmCockpit", () => {
 
     const redBadges = container.querySelectorAll(".bg-red-500\\/10");
     expect(redBadges.length).toBeGreaterThan(0);
+  });
+
+  it("renders RunRow with phase badge and review signals", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          {
+            id: "run-1",
+            agentId: "agent-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-42",
+            issueTitle: "Test run",
+            status: "running",
+            startedAt: "2026-04-19T09:00:00.000Z",
+            swarmRole: "planner",
+            phase: "executing",
+            verificationStatus: "verified",
+            mergeReadiness: "ready",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-42");
+    expect(container.textContent).toContain("Executing");
+    expect(container.textContent).toContain("✓ merge ready");
+  });
+
+  it("renders RunRow with blocked signal", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          {
+            id: "run-blocked",
+            agentId: "agent-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-99",
+            issueTitle: "Blocked run",
+            status: "running",
+            startedAt: "2026-04-19T09:00:00.000Z",
+            swarmRole: "executor",
+            phase: "code_review",
+            verificationStatus: "blocked",
+            mergeReadiness: "blocked",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-99");
+    expect(container.textContent).toContain("Code Review");
+    expect(container.textContent).toContain("✗ blocked");
+  });
+
+  it("renders RunRow with rework signal", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          {
+            id: "run-rework",
+            agentId: "agent-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-7",
+            issueTitle: "Rework run",
+            status: "running",
+            startedAt: "2026-04-19T09:00:00.000Z",
+            swarmRole: "reviewer",
+            phase: "code_review",
+            verificationStatus: "needs_verification",
+            mergeReadiness: "conditional",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-7");
+    expect(container.textContent).toContain("~ rework");
+  });
+
+  it("renders Recent Artifacts section with verdict and merge readiness", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        recentArtifacts: [
+          {
+            id: "artifact-1",
+            artifactType: "reviewer",
+            status: "published",
+            summary: "Code review complete",
+            actorAgentId: "agent-1",
+            actorAgentName: "Alice",
+            createdAt: "2026-04-19T10:00:00.000Z",
+            verificationStatus: "verified",
+            mergeReadiness: "ready",
+            verdict: "approved",
+            filesChanged: ["src/a.ts"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Recent Artifacts");
+    expect(container.textContent).toContain("Reviewer");
+    expect(container.textContent).toContain("Alice");
+    expect(container.textContent).toContain("approved");
+    expect(container.textContent).toContain("✓ merge: ready");
+  });
+
+  it("renders Recent Artifacts section with blocked merge readiness", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        recentArtifacts: [
+          {
+            id: "artifact-blocked",
+            artifactType: "executor",
+            status: "published",
+            summary: "Implementation done",
+            actorAgentId: "agent-2",
+            actorAgentName: "Bob",
+            createdAt: "2026-04-19T10:00:00.000Z",
+            mergeReadiness: "blocked",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Executor");
+    expect(container.textContent).toContain("Bob");
+    expect(container.textContent).toContain("✗ merge: blocked");
+  });
+
+  it("renders Recent Artifacts empty state", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({ recentArtifacts: [] }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Recent Artifacts");
+    expect(container.textContent).toContain("No recent artifacts");
+  });
+
+  it("renders ReviewQueueItem with review signals and blocked badge", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        reviewQueue: {
+          readyForReview: [],
+          needsVerification: [],
+          blocked: [
+            {
+              id: "hc-blocked-signal",
+              agentId: "agent-1",
+              agentName: "Charlie",
+              swarmRole: "reviewer",
+              runId: "run-1",
+              issueId: "issue-1",
+              issueIdentifier: "PAP-50",
+              summary: "Needs rework due to test failures",
+              filesTouched: [],
+              currentState: "Failed",
+              remainingWork: ["Fix tests"],
+              blockers: ["CI failing", "Tests timeout"],
+              recommendedNextStep: "Fix and resubmit",
+              avoidPaths: [],
+              emittedAt: "2026-04-19T09:00:00.000Z",
+              verificationStatus: "blocked",
+            },
+          ],
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Charlie");
+    expect(container.textContent).toContain("PAP-50");
+    expect(container.textContent).toContain("⚠ blocked");
+  });
+
+  it("renders ReviewQueueItem with rework signal", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        reviewQueue: {
+          readyForReview: [
+            {
+              id: "hc-rework-signal",
+              agentId: "agent-1",
+              agentName: "Diana",
+              swarmRole: "reviewer",
+              runId: "run-1",
+              issueId: "issue-1",
+              issueIdentifier: "PAP-200",
+              summary: "Changes requested",
+              filesTouched: [],
+              currentState: "Changes needed",
+              remainingWork: ["Address feedback"],
+              blockers: [],
+              recommendedNextStep: "Revise and resubmit",
+              avoidPaths: [],
+              emittedAt: "2026-04-19T09:00:00.000Z",
+              verificationStatus: "needs_verification",
+              mergeReadiness: "conditional",
+            },
+          ],
+          needsVerification: [],
+          blocked: [],
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Diana");
+    expect(container.textContent).toContain("PAP-200");
+    expect(container.textContent).toContain("~ rework");
+  });
+
+  it("renders run with owner agent name", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          {
+            id: "run-owner",
+            agentId: "agent-1",
+            issueId: "issue-1",
+            issueIdentifier: "PAP-100",
+            issueTitle: "Owner test",
+            status: "running",
+            startedAt: "2026-04-19T09:00:00.000Z",
+            swarmRole: "executor",
+            phase: "executing",
+            ownerAgentName: "Alice",
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Alice");
   });
 });

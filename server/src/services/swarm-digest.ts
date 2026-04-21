@@ -391,6 +391,7 @@ export async function buildSwarmDigest(
             title: issues.title,
             description: issues.description,
             labels: issues.labels,
+            phase: issues.phase,
           })
           .from(issues)
           .where(inArray(issues.id, Array.from(activeIssueIds)))
@@ -414,7 +415,7 @@ export async function buildSwarmDigest(
   const issueMap = new Map(
     activeRunsIssueRows.map((i) => [
       i.id,
-      { identifier: i.identifier, title: i.title, description: i.description ?? null, labels: i.labels ?? [] },
+      { identifier: i.identifier, title: i.title, description: i.description ?? null, labels: i.labels ?? [], phase: i.phase ?? null },
     ]),
   );
   const stuckIssueMap = new Map(stuckIssueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title }]));
@@ -609,6 +610,7 @@ export async function buildSwarmDigest(
         status: run.status,
         startedAt: run.startedAt?.toISOString() ?? null,
         swarmRole: agentRoleForLookup.get(run.agentId) ?? null,
+        phase: issueInfo?.phase ?? null,
       };
     })
     .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);

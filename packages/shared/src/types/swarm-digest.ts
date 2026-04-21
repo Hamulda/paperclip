@@ -57,6 +57,11 @@ export interface SwarmDigestRun {
   status: string;
   startedAt: string | null;
   swarmRole: string | null;
+  phase?: string | null;
+  verificationStatus?: string | null;
+  mergeReadiness?: string | null;
+  ownerAgentName?: string | null;
+  blockers?: string[];
 }
 
 export interface SwarmDigestWorkspace {
@@ -133,6 +138,7 @@ export interface SwarmDigestHandoff {
   avoidPaths: string[];
   emittedAt: string;
   verificationStatus: VerificationStatus | null;
+  mergeReadiness?: string | null;
 }
 
 export interface SwarmDigest {
@@ -176,4 +182,24 @@ export interface SwarmCockpitDigest extends SwarmDigest {
   queuedHotRunsCount: number;
   reviewQueue: SwarmDigestReviewQueue;
   collaborationHints: SwarmDigestCollaborationHint[];
+  recentArtifacts: SwarmDigestArtifact[];
+}
+
+// ---------------------------------------------------------------------------
+// Artifact summary for digest
+// ---------------------------------------------------------------------------
+
+export interface SwarmDigestArtifact {
+  id: string;
+  artifactType: string;
+  status: string;
+  summary: string | null;
+  actorAgentId: string | null;
+  actorAgentName: string | null;
+  createdAt: string;
+  goal?: string | null;
+  verdict?: string | null;
+  filesChanged?: string[] | null;
+  verificationStatus?: string | null;
+  mergeReadiness?: string | null;
 }

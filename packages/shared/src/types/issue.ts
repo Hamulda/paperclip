@@ -4,6 +4,7 @@ import type {
   IssueExecutionStageType,
   IssueExecutionStateStatus,
   IssueOriginKind,
+  IssuePhase,
   IssuePriority,
   IssueStatus,
 } from "../constants.js";
@@ -184,6 +185,7 @@ export interface Issue {
   title: string;
   description: string | null;
   status: IssueStatus;
+  phase?: IssuePhase | null;
   priority: IssuePriority;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -258,4 +260,67 @@ export interface IssueAttachment {
   createdAt: Date;
   updatedAt: Date;
   contentPath: string;
+}
+
+// ---------------------------------------------------------------------------
+// Structured Agent Artifacts
+// ---------------------------------------------------------------------------
+
+export type ArtifactType = "planner" | "plan_reviewer" | "executor" | "reviewer";
+export type ArtifactStatus = "draft" | "published" | "superseded" | "failed";
+
+/** Planner artifact — emitted after planning phase */
+export interface PlannerArtifact {
+  goal: string;
+  acceptanceCriteria: string[];
+  touchedFiles: string[];
+  forbiddenFiles: string[];
+  testPlan: string;
+  risks: string[];
+}
+
+/** Plan reviewer artifact — emitted after plan_review phase */
+export interface PlanReviewerArtifact {
+  verdict: "approved" | "rejected";
+  scopeChanges: string[];
+  notes: string[];
+}
+
+/** Executor artifact — emitted after executing phase */
+export interface ExecutorArtifact {
+  filesChanged: string[];
+  changesSummary: string;
+  deviationsFromPlan: string[];
+  testsRun: string[];
+  remainingWork: string[];
+}
+
+/** Reviewer artifact — emitted after code_review phase */
+export interface ReviewerArtifact {
+  verdict: "approved" | "changes_requested" | "rejected";
+  issuesFound: string[];
+  fixesMade: string[];
+  verificationStatus: "verified" | "needs_verification" | "blocked";
+  mergeReadiness: "ready" | "blocked" | "conditional";
+}
+
+export type IssueArtifactMetadata =
+  | PlannerArtifact
+  | PlanReviewerArtifact
+  | ExecutorArtifact
+  | ReviewerArtifact;
+
+export interface IssueArtifact {
+  id: string;
+  companyId: string;
+  issueId: string;
+  artifactType: ArtifactType;
+  status: ArtifactStatus;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  createdByRunId: string | null;
+  summary: string | null;
+  metadata: IssueArtifactMetadata | null;
+  createdAt: Date;
+  updatedAt: Date;
 }

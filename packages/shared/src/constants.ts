@@ -122,6 +122,31 @@ export const ISSUE_STATUSES = [
 ] as const;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
+export const ISSUE_PHASES = [
+  "triage",
+  "planning",
+  "plan_review",
+  "ready_for_execution",
+  "executing",
+  "code_review",
+  "integration",
+  "done",
+  "blocked",
+] as const;
+export type IssuePhase = (typeof ISSUE_PHASES)[number];
+
+export const ISSUE_PHASE_LABELS: Record<IssuePhase, string> = {
+  triage: "Triage",
+  planning: "Planning",
+  plan_review: "Plan Review",
+  ready_for_execution: "Ready",
+  executing: "Executing",
+  code_review: "Code Review",
+  integration: "Integration",
+  done: "Done",
+  blocked: "Blocked",
+};
+
 export const INBOX_MINE_ISSUE_STATUSES = [
   "backlog",
   "todo",

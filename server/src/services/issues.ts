@@ -26,6 +26,12 @@ import type { IssueRelationIssueSummary } from "@paperclipai/shared";
 import { extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
+  assertPhaseTransition,
+  applyPhaseSideEffects,
+  isIssuePhase,
+  type IssuePhase,
+} from "./issue-phase.js";
+import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
@@ -543,6 +549,7 @@ const issueListSelect = {
     END
   `,
   status: issues.status,
+  phase: issues.phase,
   priority: issues.priority,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
@@ -1572,6 +1579,14 @@ export function issueService(db: Db) {
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
+        if (values.phase) {
+          if (values.phase === "ready_for_execution" || values.phase === "executing") {
+            values.startedAt = values.startedAt ?? new Date();
+          }
+          if (values.phase === "done") {
+            values.completedAt = values.completedAt ?? new Date();
+          }
+        }
         if (values.status === "done") {
           values.completedAt = new Date();
         }
@@ -1635,6 +1650,10 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      if (issueData.phase !== undefined) {
+        assertPhaseTransition(existing.phase as IssuePhase | null, issueData.phase as IssuePhase | null);
+      }
+
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -1670,6 +1689,7 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      applyPhaseSideEffects(issueData.phase as Parameters<typeof applyPhaseSideEffects>[0], patch);
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }

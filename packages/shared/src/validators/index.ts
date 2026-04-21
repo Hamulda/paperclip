@@ -171,6 +171,13 @@ export {
 } from "./work-product.js";
 
 export {
+  createIssueArtifactSchema,
+  artifactMetadataSchema,
+  type CreateIssueArtifact,
+  type ArtifactMetadata,
+} from "./artifacts.js";
+
+export {
   executionWorkspaceConfigSchema,
   updateExecutionWorkspaceSchema,
   executionWorkspaceStatusSchema,

@@ -8,6 +8,8 @@ import { PageSkeleton } from "@/components/PageSkeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { cn } from "@/lib/utils";
 import { useSearchParams, useNavigate } from "@/lib/router";
+import type { IssuePhase } from "@paperclipai/shared";
+import { ISSUE_PHASE_LABELS } from "@paperclipai/shared";
 import {
   Bot,
   CircleDot,
@@ -110,6 +112,51 @@ function SectionCard({
   );
 }
 
+function PhaseBadge({ phase }: { phase: string | null | undefined }) {
+  if (!phase) return null;
+  const labels: Partial<Record<string, string>> = ISSUE_PHASE_LABELS;
+  const label = (labels as Record<string, string>)[phase] ?? phase;
+  const colors: Record<string, string> = {
+    triage: "text-purple-500 bg-purple-500/10",
+    planning: "text-blue-500 bg-blue-500/10",
+    plan_review: "text-violet-500 bg-violet-500/10",
+    ready_for_execution: "text-cyan-500 bg-cyan-500/10",
+    executing: "text-green-500 bg-green-500/10",
+    code_review: "text-amber-500 bg-amber-500/10",
+    integration: "text-orange-500 bg-orange-500/10",
+    done: "text-green-600 bg-green-500/10",
+    blocked: "text-red-500 bg-red-500/10",
+  };
+  return (
+    <span className={cn("inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium shrink-0", colors[phase] ?? "text-muted bg-muted/50")}>
+      {label}
+    </span>
+  );
+}
+
+function ReviewSignalBadge({ verificationStatus, mergeReadiness }: { verificationStatus: string | null; mergeReadiness: string | null }) {
+  if (!verificationStatus && !mergeReadiness) return null;
+  if (verificationStatus === "verified" || mergeReadiness === "ready") {
+    return <span className="text-xs text-green-600 font-medium shrink-0">✓ merge ready</span>;
+  }
+  if (verificationStatus === "blocked" || mergeReadiness === "blocked") {
+    return <span className="text-xs text-red-500 font-medium shrink-0">✗ blocked</span>;
+  }
+  if (verificationStatus === "needs_verification" || mergeReadiness === "conditional") {
+    return <span className="text-xs text-amber-500 font-medium shrink-0">~ rework</span>;
+  }
+  return null;
+}
+
+function BlockedBadge({ blockers }: { blockers: string[] }) {
+  if (!blockers.length) return null;
+  return (
+    <span className="text-xs text-red-500 font-medium shrink-0" title={blockers.join("; ")}>
+      ⚠ blocked
+    </span>
+  );
+}
+
 function StatusBadge({ status }: { status: string }) {
   const configs: Record<string, { icon: React.ComponentType<{ className?: string }>; className: string }> = {
     running: { icon: CircleDot, className: "text-green-500 bg-green-500/10" },
@@ -167,7 +214,7 @@ function AgentRow({ agent }: { agent: { id: string; name: string; status: string
   );
 }
 
-function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: string | null; issueTitle: string | null; status: string; startedAt: string | null; swarmRole: string | null } }) {
+function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: string | null; issueTitle: string | null; status: string; startedAt: string | null; swarmRole: string | null; phase?: string | null; blockers?: string[]; verificationStatus?: string | null; mergeReadiness?: string | null; ownerAgentName?: string | null } }) {
   const navigate = useNavigate();
   return (
     <div
@@ -185,11 +232,17 @@ function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: 
             <span className="text-muted-foreground">No issue</span>
           )}
           <span className="truncate text-muted-foreground">{run.issueTitle ?? ""}</span>
+          <PhaseBadge phase={run.phase} />
           {run.swarmRole && (
             <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded shrink-0">
               {run.swarmRole}
             </span>
           )}
+          {run.ownerAgentName && (
+            <span className="text-xs text-muted-foreground shrink-0">{run.ownerAgentName}</span>
+          )}
+          <ReviewSignalBadge verificationStatus={run.verificationStatus ?? null} mergeReadiness={run.mergeReadiness ?? null} />
+          <BlockedBadge blockers={run.blockers ?? []} />
         </div>
         <p className="text-xs text-muted-foreground truncate">
           {run.startedAt ? new Date(run.startedAt).toLocaleTimeString() : "Unknown start"}
@@ -405,6 +458,53 @@ function AutoClaimSuggestionRow({ suggestion }: { suggestion: { source: string; 
   );
 }
 
+function ArtifactRow({ artifact }: { artifact: { id: string; artifactType: string; status: string; summary: string | null; actorAgentName: string | null; createdAt: string; verificationStatus?: string | null; mergeReadiness?: string | null; goal?: string | null; verdict?: string | null; filesChanged?: string[] | null } }) {
+  const artifactTypeLabels: Record<string, string> = {
+    planner: "Planner",
+    plan_reviewer: "Plan Reviewer",
+    executor: "Executor",
+    reviewer: "Reviewer",
+  };
+  const typeColor: Record<string, string> = {
+    planner: "text-blue-500 bg-blue-500/10",
+    plan_reviewer: "text-violet-500 bg-violet-500/10",
+    executor: "text-green-500 bg-green-500/10",
+    reviewer: "text-amber-500 bg-amber-500/10",
+  };
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <FileText className="h-4 w-4 shrink-0 text-muted-foreground mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className={cn("inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium", typeColor[artifact.artifactType] ?? "text-muted bg-muted/50")}>
+            {artifactTypeLabels[artifact.artifactType] ?? artifact.artifactType}
+          </span>
+          {artifact.actorAgentName && (
+            <span className="text-xs text-muted-foreground">{artifact.actorAgentName}</span>
+          )}
+          <span className="text-xs text-muted-foreground ml-auto">
+            {new Date(artifact.createdAt).toLocaleTimeString()}
+          </span>
+        </div>
+        {artifact.summary && (
+          <p className="text-xs text-muted-foreground truncate mt-0.5">{artifact.summary}</p>
+        )}
+        {artifact.verdict && (
+          <p className="text-xs text-muted-foreground mt-0.5">Verdict: {artifact.verdict}</p>
+        )}
+        {artifact.verificationStatus && (
+          <p className="text-xs text-muted-foreground mt-0.5">Status: {artifact.verificationStatus}</p>
+        )}
+        {artifact.mergeReadiness && (
+          <p className={cn("text-xs font-medium mt-0.5", artifact.mergeReadiness === "ready" ? "text-green-600" : artifact.mergeReadiness === "blocked" ? "text-red-500" : "text-amber-500")}>
+            {artifact.mergeReadiness === "ready" ? "✓" : artifact.mergeReadiness === "blocked" ? "✗" : "~"} merge: {artifact.mergeReadiness}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function LatestHandoffSummaryRow({ handoff }: { handoff: { agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; remainingWork: string[]; blockers: string[]; emittedAt: string } }) {
   return (
     <div className="space-y-2">
@@ -471,7 +571,7 @@ function FairnessSignal({ stuckRuns, activeRuns }: { stuckRuns: number; activeRu
   );
 }
 
-function ReviewQueueItem({ handoff }: { handoff: { agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; recommendedNextStep: string; emittedAt: string } }) {
+function ReviewQueueItem({ handoff }: { handoff: { agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; recommendedNextStep: string; emittedAt: string; verificationStatus?: string | null; mergeReadiness?: string | null; blockers?: string[] } }) {
   return (
     <div className="flex items-start gap-2 py-2 text-sm">
       <ClipboardCheck className="h-4 w-4 shrink-0 text-blue-500 mt-0.5" />
@@ -486,6 +586,12 @@ function ReviewQueueItem({ handoff }: { handoff: { agentName: string; swarmRole:
           {handoff.issueIdentifier && (
             <span className="text-xs text-blue-500">[{handoff.issueIdentifier}]</span>
           )}
+          <ReviewSignalBadge verificationStatus={handoff.verificationStatus ?? null} mergeReadiness={handoff.mergeReadiness ?? null} />
+          {(handoff.blockers?.length ?? 0) > 0 && (
+            <span className="text-xs text-red-500 font-medium shrink-0" title={handoff.blockers?.join("; ")}>
+              ⚠ blocked
+            </span>
+          )}
           <span className="text-xs text-muted-foreground ml-auto">
             {new Date(handoff.emittedAt).toLocaleTimeString()}
           </span>
@@ -499,7 +605,7 @@ function ReviewQueueItem({ handoff }: { handoff: { agentName: string; swarmRole:
   );
 }
 
-function CollaborationHintRow({ hint }: { hint: { type: string; message: string; urgency: string; relatedIssue: string | null } }) {
+function CollaborationHintRow({ hint }: { hint: { type: string; message: string; urgency: string; relatedIssue?: string | null } }) {
   const urgencyColors: Record<string, string> = {
     high: "text-red-500 bg-red-500/10",
     medium: "text-amber-500 bg-amber-500/10",
@@ -820,6 +926,22 @@ export function SwarmCockpit() {
             <div className="divide-y divide-border max-h-48 overflow-y-auto">
               {data.autoClaimSuggestions.slice(0, 8).map((suggestion, i) => (
                 <AutoClaimSuggestionRow key={i} suggestion={suggestion} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Recent Artifacts"
+          icon={FileText}
+          className="md:col-span-2 lg:col-span-2"
+        >
+          {!data.recentArtifacts || data.recentArtifacts.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No recent artifacts</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.recentArtifacts.slice(0, 10).map((artifact) => (
+                <ArtifactRow key={artifact.id} artifact={artifact} />
               ))}
             </div>
           )}

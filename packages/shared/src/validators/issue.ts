@@ -4,6 +4,7 @@ import {
   ISSUE_EXECUTION_POLICY_MODES,
   ISSUE_EXECUTION_STAGE_TYPES,
   ISSUE_EXECUTION_STATE_STATUSES,
+  ISSUE_PHASES,
   ISSUE_PRIORITIES,
   ISSUE_STATUSES,
 } from "../constants.js";
@@ -123,6 +124,7 @@ export const createIssueSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional().nullable(),
   status: z.enum(ISSUE_STATUSES).optional().default("backlog"),
+  phase: z.enum(ISSUE_PHASES).optional().nullable(),
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
