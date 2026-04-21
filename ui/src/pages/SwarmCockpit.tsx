@@ -303,6 +303,7 @@ function AutoClaimSuggestionRow({ suggestion }: { suggestion: { source: "issue_l
   const sourceColors: Record<string, string> = {
     issue_labels: "text-purple-500 bg-purple-500/10",
     issue_description: "text-blue-500 bg-blue-500/10",
+    issue_title: "text-violet-500 bg-violet-500/10",
     diff: "text-green-500 bg-green-500/10",
   };
   const colorClass = sourceColors[suggestion.source] ?? "text-muted bg-muted/50";

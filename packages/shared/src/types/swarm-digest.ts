@@ -33,7 +33,7 @@ export interface SwarmDigestRecommendedAvoidPaths {
 }
 
 export interface SwarmDigestAutoClaimSuggestion {
-  source: "issue_labels" | "issue_description" | "diff"; // where suggestion came from
+  source: "issue_labels" | "issue_description" | "issue_title" | "diff"; // where suggestion came from
   path: string;
   claimType: string;
   reason: string; // human-readable reason for suggestion

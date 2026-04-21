@@ -40,6 +40,7 @@ feedback-export-*
 __pycache__/
 *.pyc
 *.bak
+*.omc
 .venv/
 
 # Editor / tool temp files

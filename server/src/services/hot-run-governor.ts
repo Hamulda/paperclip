@@ -146,6 +146,7 @@ export async function tryPromoteNextHotCodingRun(
   db: Db,
   companyId: string,
   excludeAgentId: string,
+  startNextQueuedRunForAgent: (agentId: string) => Promise<void>,
 ): Promise<string | void> {
   const hotCodingTypes = [...SESSIONED_LOCAL_ADAPTERS];
   if (hotCodingTypes.length === 0) return;
@@ -164,6 +165,8 @@ export async function tryPromoteNextHotCodingRun(
     .limit(1);
 
   if (candidateRows.length > 0) {
-    return candidateRows[0]!.agentId;
+    const promotedAgentId = candidateRows[0]!.agentId;
+    await startNextQueuedRunForAgent(promotedAgentId);
+    return promotedAgentId;
   }
 }

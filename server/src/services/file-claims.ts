@@ -216,6 +216,20 @@ export function filterProtectedPaths(
 }
 
 /**
+ * Classify a raw path string into a ClaimType.
+ * Uses the same heuristics as extractClaimPathsFromIssue for consistency.
+ */
+function classifyPathType(rawPath: string): ClaimType {
+  if (rawPath.includes("**") || rawPath.includes("*")) {
+    return "glob";
+  }
+  if (rawPath.endsWith("/")) {
+    return "directory";
+  }
+  return "file";
+}
+
+/**
  * Extract claim path suggestions from a git diff.
  * Supports:
  * - Added/modified file paths (lines starting with + but not +++)
@@ -227,10 +241,12 @@ export function extractClaimPathsFromDiff(diff: string): ClaimInput[] {
 
   function addClaim(path: string) {
     const normalized = normalizePath(path);
-    const key = `file:${normalized}`;
-    if (!seen.has(key) && normalized) {
+    if (!normalized) return;
+    const type = classifyPathType(path);
+    const key = `${type}:${normalized}`;
+    if (!seen.has(key)) {
       seen.add(key);
-      claims.push({ claimPath: normalized, claimType: "file" });
+      claims.push({ claimPath: normalized, claimType: type });
     }
   }
 

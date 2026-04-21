@@ -631,6 +631,7 @@ describe("SwarmCockpit", () => {
         autoClaimSuggestions: [
           { source: "issue_labels", path: "src/feature/", claimType: "directory", reason: "Priority label detected", issueIdentifier: "PAP-1" },
           { source: "issue_description", path: "src/auth.ts", claimType: "file", reason: "Mentioned in issue body" },
+          { source: "issue_title", path: "src/title.ts", claimType: "file", reason: "Keyword in title", issueIdentifier: "PAP-3" },
           { source: "diff", path: "src/bugfix.ts", claimType: "file", reason: "Changed in recent diff", issueIdentifier: "PAP-2" },
         ],
       }),
@@ -647,6 +648,8 @@ describe("SwarmCockpit", () => {
     expect(container.textContent).toContain("src/bugfix.ts");
     expect(container.textContent).toContain("diff");
     expect(container.textContent).toContain("Priority label detected");
+    expect(container.textContent).toContain("src/title.ts");
+    expect(container.textContent).toContain("issue_title");
   });
 
   it("renders Auto-Claim Suggestions empty state", async () => {

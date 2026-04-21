@@ -743,7 +743,7 @@ export async function buildSwarmDigest(
       if (!suggestionSeen.has(key)) {
         suggestionSeen.add(key);
         autoClaimSuggestions.push({
-          source: "issue_description",
+          source: "issue_title",
           path: claim.claimPath,
           claimType: claim.claimType,
           reason: `Suggested by issue ${issue.identifier ?? run.issueId} title`,

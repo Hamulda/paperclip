@@ -913,12 +913,12 @@ describe("heartbeat file claims sequencing", () => {
     expect(typeof releaseClaims).toBe("function");
   });
 
-  it("acquire happens before digest in the executeRun comment ordering", async () => {
-    const heartbeatContent = await import("fs").then(fs =>
-      fs.readFileSync("/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts", "utf8")
+  it("acquire happens before digest in enrichRunContextWithSwarmState", async () => {
+    const enrichContent = await import("fs").then(fs =>
+      fs.readFileSync("/Users/vojtechhamada/paperclip/server/src/services/enrich-run-context.ts", "utf8")
     );
-    const acquireIdx = heartbeatContent.indexOf("// Acquire file/directory claims for this run FIRST");
-    const digestIdx = heartbeatContent.indexOf("// Build swarm digest for collaborator awareness (AFTER claims acquired");
+    const acquireIdx = enrichContent.indexOf("acquireClaims");
+    const digestIdx = enrichContent.indexOf("buildSwarmDigest");
     expect(acquireIdx).toBeGreaterThan(-1);
     expect(digestIdx).toBeGreaterThan(-1);
     expect(acquireIdx).toBeLessThan(digestIdx);
