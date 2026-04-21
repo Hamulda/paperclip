@@ -12,7 +12,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, executionWorkspaces, workspaceRuntimeServices, issues, fileClaims, issueComments } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, ne, sql, lt, isNotNull, or } from "drizzle-orm";
 import { asString, parseObject } from "../adapters/utils.js";
-import { getActiveClaimsForRun, listConflicts, extractClaimPathsFromIssue, extractClaimPathsFromDiff } from "./file-claims.js";
+import { getActiveClaimsForRun, listConflicts, extractClaimPathsFromIssue } from "./file-claims.js";
 import { parseHandoffComment, isHandoffComment, HANDOFF_COMMENT_PREFIX } from "./handoff-comments.js";
 import type {
   SwarmDigest,

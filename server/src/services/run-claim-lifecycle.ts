@@ -4,6 +4,7 @@
 
 import { asNumber } from "../adapters/utils.js";
 import type { agents } from "@paperclipai/db";
+import { normalizeMaxConcurrentHotCodingRuns } from "./hot-run-governor.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,10 +64,4 @@ export function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
     maxHotCodingRuns: normalizeMaxConcurrentHotCodingRuns(heartbeat.maxHotCodingRuns),
   };
-}
-
-function normalizeMaxConcurrentHotCodingRuns(value: unknown) {
-  const parsed = Math.floor(asNumber(value, 2));
-  if (!Number.isFinite(parsed)) return 2;
-  return Math.max(1, Math.min(8, parsed));
 }

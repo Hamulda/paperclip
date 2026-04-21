@@ -754,6 +754,394 @@ describeEmbeddedPostgres("heartbeat hot coding concurrency governor", () => {
     expect(capacity).toBe(9);
   });
 
+  it("countRunningHotCodingRuns is company-scoped: runs from company A do not count for company B", async () => {
+    // Set up two companies, each with hot coding agents
+    const [companyA, companyB] = [randomUUID(), randomUUID()];
+    await createCompany(companyA);
+    await createCompany(companyB);
+
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId: companyA,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId: companyB,
+      name: "AgentB-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    // Create a running hot run for company A
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: companyA,
+      agentId: agentA,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    // Create 2 running hot runs for company B
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: companyB,
+      agentId: agentB,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: companyB,
+      agentId: agentB,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    const { countRunningHotCodingRuns } = await import("../../services/hot-run-governor.js");
+
+    const [countA, countB] = await Promise.all([
+      countRunningHotCodingRuns(db, companyA),
+      countRunningHotCodingRuns(db, companyB),
+    ]);
+
+    expect(countA).toBe(1); // Only company A's run
+    expect(countB).toBe(2); // Only company B's runs
+  });
+
+  it("countRunningHotCodingRuns excludes non-hot-coding adapter types", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const hotAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: hotAgentId,
+      companyId,
+      name: "HotAgent-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    const remoteAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: remoteAgentId,
+      companyId,
+      name: "RemoteAgent-http_remote",
+      role: "engineer",
+      status: "running",
+      adapterType: "http_remote",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    // One running hot run and one running remote run
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: hotAgentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: remoteAgentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    const { countRunningHotCodingRuns } = await import("../../services/hot-run-governor.js");
+    const count = await countRunningHotCodingRuns(db, companyId);
+
+    // Only the hot coding run counts; http_remote is not hot coding
+    expect(count).toBe(1);
+  });
+
+  it("countRunningHotCodingRuns project-scoped: only counts runs for the given projectId", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ProjectAgent-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    const projectA = randomUUID();
+    const projectB = randomUUID();
+
+    // Three running hot runs: two for projectA, one for projectB
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { projectId: projectA },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { projectId: projectA },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { projectId: projectB },
+    });
+
+    const { countRunningHotCodingRuns } = await import("../../services/hot-run-governor.js");
+
+    const [countA, countB, countAll] = await Promise.all([
+      countRunningHotCodingRuns(db, companyId, projectA),
+      countRunningHotCodingRuns(db, companyId, projectB),
+      countRunningHotCodingRuns(db, companyId),
+    ]);
+
+    expect(countA).toBe(2);
+    expect(countB).toBe(1);
+    expect(countAll).toBe(3);
+  });
+
+  it("tryPromoteNextHotCodingRun picks the oldest queued run from another agent", async () => {
+    // Agent A and B in same company. Agent A is at capacity with a running hot run.
+    // Agent B has two queued runs. The oldest should be picked first.
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 10, maxHotCodingRuns: 1 },
+      }),
+      permissions: {},
+    });
+
+    const agentB = randomUUID();
+    await db.insert(agents).values({
+      id: agentB,
+      companyId,
+      name: "AgentB-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({
+        heartbeat: { enabled: true, intervalSec: 60, maxConcurrentRuns: 10, maxHotCodingRuns: 1 },
+      }),
+      permissions: {},
+    });
+
+    // Agent A has a running hot run (filling its slot)
+    const runA = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runA,
+      companyId,
+      agentId: agentA,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    // Agent B has two queued runs (created at different times — older one first)
+    const runBOld = randomUUID();
+    const runBNew = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runBOld,
+      companyId,
+      agentId: agentB,
+      invocationSource: "assignment",
+      status: "queued",
+      contextSnapshot: { issueId: randomUUID() },
+      createdAt: new Date(Date.now() - 10_000), // older
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runBNew,
+      companyId,
+      agentId: agentB,
+      invocationSource: "assignment",
+      status: "queued",
+      contextSnapshot: { issueId: randomUUID() },
+      createdAt: new Date(Date.now() - 5_000), // newer
+    });
+
+    const { tryPromoteNextHotCodingRun } = await import("../../services/hot-run-governor.js");
+
+    const promotedAgentId = await tryPromoteNextHotCodingRun(
+      db,
+      companyId,
+      agentA, // exclude this agent
+      async (targetAgentId: string) => {
+        // Update the oldest queued run for the target agent to running
+        await db
+          .update(heartbeatRuns)
+          .set({ status: "running" })
+          .where(and(
+            eq(heartbeatRuns.agentId, targetAgentId),
+            eq(heartbeatRuns.status, "queued"),
+          ))
+          .returning();
+      },
+    );
+
+    expect(promotedAgentId).toBe(agentB);
+
+    // Verify the oldest run was picked (not the newest)
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentB));
+
+    const runningRun = runs.find(r => r.status === "running");
+    expect(runningRun?.id).toBe(runBOld); // oldest was promoted
+    const stillQueued = runs.filter(r => r.status === "queued");
+    expect(stillQueued.length).toBe(1);
+    expect(stillQueued[0]!.id).toBe(runBNew); // newest stayed queued
+  });
+
+  it("tryPromoteNextHotCodingRun skips excluded agent", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    // Three agents
+    const [agentA, agentB, agentC] = [randomUUID(), randomUUID(), randomUUID()];
+    for (const agentId of [agentA, agentB, agentC]) {
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${agentId.slice(0, 8)}`,
+        role: "engineer",
+        status: "running",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+        permissions: {},
+      });
+    }
+
+    // Agent A has a running hot run
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: agentA,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    // Agent B and C each have one queued run
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: agentB,
+      invocationSource: "assignment",
+      status: "queued",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: agentC,
+      invocationSource: "assignment",
+      status: "queued",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    const { tryPromoteNextHotCodingRun } = await import("../../services/hot-run-governor.js");
+
+    // Exclude agent B — only agent C should be promoted
+    const promotedAgentId = await tryPromoteNextHotCodingRun(
+      db,
+      companyId,
+      agentB,
+      async () => { /* no-op */ },
+    );
+
+    expect(promotedAgentId).toBe(agentC);
+  });
+
+  it("tryPromoteNextHotCodingRun returns void when no queued hot runs exist", async () => {
+    const companyId = randomUUID();
+    await createCompany(companyId);
+
+    const agentA = randomUUID();
+    await db.insert(agents).values({
+      id: agentA,
+      companyId,
+      name: "AgentA-claude_local",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: JSON.stringify({ heartbeat: { enabled: true } }),
+      permissions: {},
+    });
+
+    // Agent A has the only run and it's already running (no queued runs anywhere)
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: agentA,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+
+    const { tryPromoteNextHotCodingRun } = await import("../../services/hot-run-governor.js");
+
+    const result = await tryPromoteNextHotCodingRun(
+      db,
+      companyId,
+      agentA,
+      async () => { throw new Error("should not be called"); },
+    );
+
+    expect(result).toBeUndefined();
+  });
+
   it("tickTimers refreshes expiring file claims", async () => {
     const companyId = randomUUID();
     await createCompany(companyId);
@@ -957,5 +1345,94 @@ describe("hot-run-governor import path consistency", () => {
   it("getEffectiveHotCodingCapacity is exported from hot-run-governor", async () => {
     const gov = await import("../services/hot-run-governor.js");
     expect(typeof gov.getEffectiveHotCodingCapacity).toBe("function");
+  });
+});
+
+describe("isHotCodingAdapter and SESSIONED_LOCAL_ADAPTERS", () => {
+  // Pure unit tests — no DB required
+
+  it("isHotCodingAdapter returns true for all SESSIONED_LOCAL_ADAPTERS entries", async () => {
+    const { isHotCodingAdapter, SESSIONED_LOCAL_ADAPTERS } = await import(
+      "../services/hot-run-governor.js"
+    );
+    for (const adapter of SESSIONED_LOCAL_ADAPTERS) {
+      expect(isHotCodingAdapter(adapter)).toBe(true);
+    }
+  });
+
+  it("isHotCodingAdapter returns false for non-sessioned adapter types", async () => {
+    const { isHotCodingAdapter } = await import("../services/hot-run-governor.js");
+    const nonHotAdapters = [
+      "http_remote",
+      "docker",
+      "ssh_remote",
+      "kubernetes",
+      "aws_lambda",
+      "azure_functions",
+      "cloudflare_workers",
+      "openai",
+      "anthropic",
+    ];
+    for (const adapter of nonHotAdapters) {
+      expect(isHotCodingAdapter(adapter)).toBe(false);
+    }
+  });
+
+  it("SESSIONED_LOCAL_ADAPTERS contains exactly the expected hot coding adapters", async () => {
+    const { SESSIONED_LOCAL_ADAPTERS } = await import("../services/hot-run-governor.js");
+    expect(SESSIONED_LOCAL_ADAPTERS).toBeInstanceOf(Set);
+    expect(SESSIONED_LOCAL_ADAPTERS.size).toBeGreaterThan(0);
+    // All entries must be non-empty strings
+    for (const adapter of SESSIONED_LOCAL_ADAPTERS) {
+      expect(typeof adapter).toBe("string");
+      expect(adapter.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT and MAX are exported and sane", async () => {
+    const {
+      HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT,
+      HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX,
+    } = await import("../services/hot-run-governor.js");
+    expect(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT).toBe(2);
+    expect(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX).toBe(8);
+    expect(HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_DEFAULT).toBeLessThan(
+      HEARTBEAT_MAX_CONCURRENT_HOT_CODING_RUNS_MAX,
+    );
+  });
+
+  it("normalizeMaxConcurrentHotCodingRuns clamps to [1, MAX] range", async () => {
+    const { normalizeMaxConcurrentHotCodingRuns } = await import(
+      "../services/hot-run-governor.js"
+    );
+    // Below minimum → clamped to 1
+    expect(normalizeMaxConcurrentHotCodingRuns(-10)).toBe(1);
+    expect(normalizeMaxConcurrentHotCodingRuns(0)).toBe(1);
+    // Within range → unchanged
+    expect(normalizeMaxConcurrentHotCodingRuns(3)).toBe(3);
+    // Above maximum → clamped to MAX
+    expect(normalizeMaxConcurrentHotCodingRuns(99)).toBe(8);
+    // Non-numeric → default (2)
+    expect(normalizeMaxConcurrentHotCodingRuns("abc")).toBe(2);
+    expect(normalizeMaxConcurrentHotCodingRuns(null)).toBe(2);
+    expect(normalizeMaxConcurrentHotCodingRuns(undefined)).toBe(2);
+  });
+
+  it("run-claim-lifecycle imports normalizeMaxConcurrentHotCodingRuns from hot-run-governor", async () => {
+    // Verify the refactoring: run-claim-lifecycle no longer defines its own copy
+    const lifecycleContent = await import("fs").then(fs =>
+      fs.readFileSync(
+        "/Users/vojtechhamada/paperclip/server/src/services/run-claim-lifecycle.ts",
+        "utf8",
+      ),
+    );
+    // Must import the function from the governor
+    expect(lifecycleContent).toContain(
+      "import { normalizeMaxConcurrentHotCodingRuns } from \"./hot-run-governor.js\"",
+    );
+    // Must NOT have a local definition (the old duplicate)
+    expect(lifecycleContent).not.toContain(
+      "function normalizeMaxConcurrentHotCodingRuns",
+    );
   });
 });
