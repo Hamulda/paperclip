@@ -2118,3 +2118,61 @@ describe("improved auto-claim suggestion reasons", () => {
     expect(formatted).toContain("explicitly claimed in issue description");
   });
 });
+
+describe("buildSwarmDigest Phase 4/5 optimization invariants", () => {
+  it("claimedPathsResult query is guarded by projectId && !currentRunId (no spurious DB round-trip)", () => {
+    // When currentRunId is provided, Phase 5 uses getActiveClaimsForRun instead of claimedPathsResult.
+    // The claimedPathsResult query in Phase 4 is gated by projectId && !currentRunId.
+    // This saves one fileClaims DB round-trip when currentRunId is set.
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+    expect(source).toMatch(/projectId && !currentRunId/);
+  });
+
+  it("contextSnapshot is parsed once and cached via runContextCache for Phase 6 reuse", () => {
+    // Phase 3 parses contextSnapshot for each run row and caches via runContextCache.
+    // Phase 6 accesses the cache instead of calling parseObject again.
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+    // Phase 3: cache the parsed context
+    expect(source).toMatch(/runContextCache\.set\(run\.id, context\)/);
+    // Phase 6: access via cache, not parseObject directly for runs
+    expect(source).toMatch(/runContextCache\.get\(run\.id\)/);
+    // Same for stuck runs
+    expect(source).toMatch(/stuckRunContextCache\.set\(run\.id, context\)/);
+    expect(source).toMatch(/stuckRunContextCache\.get\(run\.id\)/);
+  });
+
+  it("currentClaimsPromise is declared before Phase 4 Promise.all (fires in parallel)", () => {
+    // When currentRunId is set, currentClaimsPromise is created before Promise.all,
+    // so getActiveClaimsForRun fires concurrently with Phase 4 queries.
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+    const phase4StartIdx = source.indexOf("const [serviceRows, degradedServiceRows, claimedPathsResult] = await Promise.all([");
+    const promiseDeclIdx = source.indexOf("const currentClaimsPromise");
+    expect(promiseDeclIdx).toBeGreaterThan(0);
+    expect(promiseDeclIdx).toBeLessThan(phase4StartIdx);
+  });
+
+  it("Phase 6 uses cached contexts and does not call parseObject on run/stuck rows", () => {
+    // Phase 6 must NOT call parseObject(run.contextSnapshot) for runRows or stuckRunRows.
+    // Instead it reads from runContextCache / stuckRunContextCache.
+    // This is verified by the absence of parseObject calls in the Phase 6 section.
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+    // Extract Phase 6 section (after "// PHASE 6")
+    const phase6Start = source.indexOf("// PHASE 6");
+    const phase6Section = source.slice(phase6Start);
+    // Phase 6 should not call parseObject on run or stuck run rows
+    expect(phase6Section).not.toMatch(/parseObject\(run\.contextSnapshot\)/);
+    expect(phase6Section).not.toMatch(/parseObject\(stuckRunRows/);
+  });
+});

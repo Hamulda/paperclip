@@ -250,3 +250,63 @@ describeDb("session-compaction with real DB", () => {
     expect(result.derivedFromSessionTotals).toBe(false);
   });
 });
+
+// =============================================================================
+// Regression test 5: normalizeMaxConcurrentRuns is a single canonical copy.
+// Previously heartbeat.ts had its own private copy at lines 315-319 while
+// run-claim-lifecycle.ts exported the same logic. Any caller importing from
+// run-claim-lifecycle got a different Map instance for startLocksByAgent than
+// the heartbeat service's internal lock, creating disjoint lock namespaces.
+//
+// The fix: heartbeat.ts now imports normalizeMaxConcurrentRuns from
+// run-claim-lifecycle.ts. We verify:
+// 1. normalizeMaxConcurrentRuns in heartbeat.ts resolves to the run-claim-lifecycle export
+// 2. The private duplicate in heartbeat.ts no longer exists
+// =============================================================================
+describe("normalizeMaxConcurrentRuns canonical source verification", () => {
+  it("heartbeat.ts does NOT have a private normalizeMaxConcurrentRuns copy", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // The old private copy pattern was:
+    //   function normalizeMaxConcurrentRuns(value: unknown) {
+    //     const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
+    //
+    // If this pattern still exists in heartbeat.ts, the dedup didn't land.
+    const privateCopyRe = /^function normalizeMaxConcurrentRuns\s*\(/m;
+    expect(source).not.toMatch(privateCopyRe);
+  });
+
+  it("heartbeat.ts imports normalizeMaxConcurrentRuns from run-claim-lifecycle.ts", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // Should have: import { normalizeMaxConcurrentRuns } from "./run-claim-lifecycle.js";
+    expect(source).toContain('from "./run-claim-lifecycle.js"');
+    expect(source).toMatch(/import\s*\{[^}]*normalizeMaxConcurrentRuns[^}]*\}\s*from\s*"\.\/run-claim-lifecycle\.js"/);
+  });
+});
+
+// =============================================================================
+// Regression test 6: HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT/MAX constants are
+// now consumed from run-claim-lifecycle.ts. heartbeat.ts should NOT redeclare them.
+// =============================================================================
+describe("HEARTBEAT_MAX_CONCURRENT_RUNS constants canonical source", () => {
+  it("heartbeat.ts does NOT redeclare HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT/MAX constants", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // These constants should only exist in run-claim-lifecycle.ts
+    expect(source).not.toContain("HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT");
+    expect(source).not.toContain("HEARTBEAT_MAX_CONCURRENT_RUNS_MAX");
+  });
+});

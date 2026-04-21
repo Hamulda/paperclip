@@ -275,19 +275,25 @@ export async function buildSwarmDigest(
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PHASE 3 — Derive issue IDs from phase-2 results; fire parallel issue fetch
+  // Cache parsed contexts to avoid re-parsing them in Phase 6
   // ─────────────────────────────────────────────────────────────────────────────
   const activeIssueIds = new Set<string>();
   const stuckIssueIds = new Set<string>();
   const allHandoffIssueIds = new Set<string>();
 
+  // Parse contexts once and cache for Phase 6 reuse
+  const runContextCache = new Map<string, Record<string, unknown>>();
   for (const run of runRows) {
     const context = parseObject(run.contextSnapshot);
+    runContextCache.set(run.id, context);
     const issueId = readNonEmptyString(context.issueId);
     if (issueId) activeIssueIds.add(issueId);
   }
 
+  const stuckRunContextCache = new Map<string, Record<string, unknown>>();
   for (const run of stuckRunRows) {
     const context = parseObject(run.contextSnapshot);
+    stuckRunContextCache.set(run.id, context);
     const issueId = readNonEmptyString(context.issueId);
     if (issueId) stuckIssueIds.add(issueId);
   }
@@ -341,8 +347,8 @@ export async function buildSwarmDigest(
   // PHASE 4 — Workspace-dependent queries
   // - services (needs activeWorkspaceIds from workspaces)
   // - degraded services (needs activeWorkspaceIds from workspaces)
-  // - file claim conflicts (needs currentRunId context)
-  // - claimed paths (needs projectId, fires after issues)
+  // - claimed paths (only used when currentRunId is absent; deferred to Phase 5 otherwise)
+  // getActiveClaimsForRun fires here when currentRunId exists (parallel with Phase 4)
   // ─────────────────────────────────────────────────────────────────────────────
   const workspaces: SwarmDigestWorkspace[] = workspaceRows.map(
     (w): SwarmDigestWorkspace => ({
@@ -356,6 +362,11 @@ export async function buildSwarmDigest(
   );
 
   const activeWorkspaceIds = workspaces.map((w) => w.id);
+
+  // Fire getActiveClaimsForRun in parallel with Phase 4 when currentRunId exists
+  // (claimedPathsResult is only needed when currentRunId is absent)
+  const currentClaimsPromise =
+    currentRunId ? getActiveClaimsForRun(db, companyId, currentRunId, projectId) : Promise.resolve([]);
 
   const [serviceRows, degradedServiceRows, claimedPathsResult] = await Promise.all([
     activeWorkspaceIds.length > 0
@@ -407,7 +418,8 @@ export async function buildSwarmDigest(
       )
       .limit(MAX_DEGRADED_SERVICES),
 
-    projectId
+    // Only query claimed paths when currentRunId is absent (Phase 5 uses getActiveClaimsForRun otherwise)
+    projectId && !currentRunId
       ? db
           .select({
             claimPath: fileClaims.claimPath,
@@ -447,12 +459,12 @@ export async function buildSwarmDigest(
   }));
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // PHASE 5 — File claim conflicts
+  // PHASE 5 — File claim conflicts (resolves currentClaims from Phase 4 Promise)
   // ─────────────────────────────────────────────────────────────────────────────
   let fileClaimConflicts: SwarmDigestFileClaimConflict[] = [];
 
   if (currentRunId) {
-    const currentClaims = await getActiveClaimsForRun(db, companyId, currentRunId, projectId);
+    const currentClaims = await currentClaimsPromise;
     const paths = currentClaims.map((c) => c.claimPath);
 
     if (paths.length > 0) {
@@ -502,13 +514,13 @@ export async function buildSwarmDigest(
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // PHASE 6 — In-memory assembly
+  // PHASE 6 — In-memory assembly (reuses contexts cached in Phase 3)
   // ─────────────────────────────────────────────────────────────────────────────
 
-  // Build activeRuns
+  // Build activeRuns (reuse context parsed in Phase 3 via runContextCache)
   const activeRuns: SwarmDigestRun[] = runRows
     .map((run): SwarmDigestRun => {
-      const context = parseObject(run.contextSnapshot);
+      const context = runContextCache.get(run.id) ?? {};
       const issueId = readNonEmptyString(context.issueId) || null;
       const issueInfo = issueId ? issueMap.get(issueId) : null;
       return {
@@ -524,9 +536,9 @@ export async function buildSwarmDigest(
     })
     .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
 
-  // Build runsStuck
+  // Build runsStuck (reuse context parsed in Phase 3 via stuckRunContextCache)
   const runsStuck: SwarmDigestRunStuck[] = stuckRunRows.map((run) => {
-    const context = parseObject(run.contextSnapshot);
+    const context = stuckRunContextCache.get(run.id) ?? {};
     const issueId = readNonEmptyString(context.issueId) || null;
     const issueInfo = issueId ? stuckIssueMap.get(issueId) : null;
     const minutesWaiting = run.createdAt
