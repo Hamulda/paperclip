@@ -121,6 +121,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { phaseRepresentsWork, phaseRepresentsActive } from "./issue-phase.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive } from "./local-service-supervisor.js";
@@ -409,6 +410,16 @@ function normalizeBilledCostCents(costUsd: number | null | undefined, billingTyp
   return Math.max(0, Math.round(costUsd * 100));
 }
 
+function canStartExecutionRunForPhase(phase: string | null | undefined): boolean {
+  if (!phase) return false;
+  return phaseRepresentsWork(phase as Parameters<typeof phaseRepresentsWork>[0]);
+}
+
+function isPhaseAutoExecutable(phase: string | null | undefined): boolean {
+  if (!phase) return false;
+  return phase === "ready_for_execution" || phase === "executing";
+}
+
 async function resolveLedgerScopeForRun(
   db: Db,
   companyId: string,
@@ -527,6 +538,7 @@ export function heartbeatService(db: Db) {
         identifier: issues.identifier,
         title: issues.title,
         status: issues.status,
+        phase: issues.phase,
         priority: issues.priority,
         projectId: issues.projectId,
         projectWorkspaceId: issues.projectWorkspaceId,
@@ -1175,6 +1187,25 @@ export function heartbeatService(db: Db) {
     if (budgetBlock) {
       await cancelRunInternal(run.id, budgetBlock.reason);
       return null;
+    }
+
+    // Phase gate: if this run targets an issue, the issue must be in an auto-executable phase
+    // (ready_for_execution or executing). This prevents executing runs from spawning on issues
+    // that are still in planning, code_review, etc.
+    const claimIssueId = readNonEmptyString(context.issueId);
+    if (claimIssueId) {
+      const [issue] = await db
+        .select({ phase: issues.phase })
+        .from(issues)
+        .where(and(eq(issues.id, claimIssueId), eq(issues.companyId, run.companyId)))
+        .limit(1);
+      if (issue && !isPhaseAutoExecutable(issue.phase as Parameters<typeof isPhaseAutoExecutable>[0])) {
+        await cancelRunInternal(
+          run.id,
+          `Issue phase '${issue.phase}' is not eligible for run execution (requires ready_for_execution or executing)`,
+        );
+        return null;
+      }
     }
 
     const claimedAt = new Date();
@@ -1887,9 +1918,28 @@ export function heartbeatService(db: Db) {
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
+
+    // Phase gate: reject done/blocked issues before attempting any checkout or execution
+    if (issueContext && !phaseRepresentsActive(issueContext.phase as Parameters<typeof phaseRepresentsActive>[0])) {
+      logger.info({ issueId, phase: issueContext.phase }, "heartbeat run skipped: issue phase is terminal or blocked");
+      await setRunStatus(runId, "cancelled", {
+        error: `Issue phase '${issueContext.phase}' is not eligible for execution`,
+        errorCode: "phase_not_executable",
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: `Issue phase '${issueContext.phase}' is not eligible for execution`,
+      });
+      const failedRun = await getRun(runId);
+      if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      return;
+    }
+
     if (
       issueId &&
       issueContext &&
+      canStartExecutionRunForPhase(issueContext.phase) &&
       shouldAutoCheckoutIssueForWake({
         contextSnapshot: context,
         issueStatus: issueContext.status,
@@ -3045,6 +3095,7 @@ export function heartbeatService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            phase: issues.phase,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
           })
@@ -3059,6 +3110,25 @@ export function heartbeatService(db: Db) {
             source,
             triggerDetail,
             reason: "issue_execution_issue_not_found",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
+        // Phase gate: skip wakeup if the issue is in a terminal or blocked phase
+        // (done/blocked issues cannot be automatically executed)
+        if (!phaseRepresentsActive(issue.phase as Parameters<typeof phaseRepresentsActive>[0])) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_phase_not_executable",
             payload,
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,

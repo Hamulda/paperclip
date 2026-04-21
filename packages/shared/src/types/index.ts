@@ -217,6 +217,7 @@ export type {
   SwarmDigestReviewQueue,
   SwarmDigestCollaborationHint,
   SwarmDigestArtifact,
+  SwarmDigestIssueSummary,
   ProtectedPathsEnforcement,
   VerificationStatus,
 } from "./swarm-digest.js";

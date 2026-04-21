@@ -321,6 +321,9 @@ export interface IssueArtifact {
   createdByRunId: string | null;
   summary: string | null;
   metadata: IssueArtifactMetadata | null;
+  supersededBy: string | null;
+  supersedes: string | null;
+  revisionCount: number;
   createdAt: Date;
   updatedAt: Date;
 }

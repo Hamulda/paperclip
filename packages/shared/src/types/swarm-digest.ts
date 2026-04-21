@@ -62,6 +62,12 @@ export interface SwarmDigestRun {
   mergeReadiness?: string | null;
   ownerAgentName?: string | null;
   blockers?: string[];
+  /** Number of artifact revisions for this run (rework signal) */
+  revisionCount?: number;
+  /** Human-readable reason the run is blocked, if any */
+  blockedReason?: string | null;
+  /** The next role expected to act on this issue after current phase completes */
+  expectedNextRole?: string | null;
 }
 
 export interface SwarmDigestWorkspace {
@@ -183,6 +189,8 @@ export interface SwarmCockpitDigest extends SwarmDigest {
   reviewQueue: SwarmDigestReviewQueue;
   collaborationHints: SwarmDigestCollaborationHint[];
   recentArtifacts: SwarmDigestArtifact[];
+  /** Per-issue workflow summary: owner, phase, rework signal, blocked reason, expected next role, artifact chain */
+  issueWorkflowSummary: SwarmDigestIssueSummary[];
 }
 
 // ---------------------------------------------------------------------------
@@ -202,4 +210,34 @@ export interface SwarmDigestArtifact {
   filesChanged?: string[] | null;
   verificationStatus?: string | null;
   mergeReadiness?: string | null;
+  /** Number of revisions for this artifact type (1 = first, 2+ = rework) */
+  revisionCount?: number;
+  /** Chain depth: total published artifacts for this issue (longer = more rework cycles) */
+  artifactChainDepth?: number;
+  /** Issue this artifact belongs to (for chain depth computation) */
+  issueId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Per-issue workflow summary for digest
+// ---------------------------------------------------------------------------
+
+export interface SwarmDigestIssueSummary {
+  issueId: string;
+  issueIdentifier: string | null;
+  issueTitle: string | null;
+  phase: string | null;
+  assigneeAgentName: string | null;
+  /** Whether the issue is in a rework cycle (revisionCount >= 2 for current phase) */
+  isRework: boolean;
+  /** Number of times this phase has been reworked */
+  reworkCount: number;
+  /** Why the issue is blocked, if phase is blocked */
+  blockedReason: string | null;
+  /** Next role expected after current phase completes */
+  expectedNextRole: string | null;
+  /** Next phase expected after current phase completes */
+  expectedNextPhase: string | null;
+  /** Artifact types already produced for this issue (artifact chain summary) */
+  artifactChain: string[];
 }

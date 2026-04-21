@@ -419,6 +419,7 @@ export type {
   SwarmDigestClaimedPath,
   SwarmDigestProtectedPaths,
   SwarmDigestArtifact,
+  SwarmDigestIssueSummary,
   SwarmDigestAutoClaimSuggestion,
   SwarmDigestReviewQueue,
   SwarmDigestCollaborationHint,

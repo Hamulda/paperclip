@@ -30,6 +30,9 @@ import {
   Star,
   ClipboardCheck,
   MessageSquare,
+  Repeat,
+  UserCheck,
+  ChevronRight,
 } from "lucide-react";
 
 function SummaryStrip({ data, isFetching }: { data: SwarmCockpitDigest; isFetching: boolean }) {
@@ -634,6 +637,71 @@ function CollaborationHintRow({ hint }: { hint: { type: string; message: string;
   );
 }
 
+function ArtifactChainPips({ chain }: { chain: string[] }) {
+  const typeOrder = ["planner", "plan_reviewer", "executor", "reviewer"];
+  const produced = new Set(chain);
+  return (
+    <div className="flex items-center gap-0.5">
+      {typeOrder.map((type) => (
+        <span
+          key={type}
+          className={cn(
+            "h-1.5 w-1.5 rounded-full",
+            produced.has(type) ? "bg-blue-500" : "bg-muted"
+          )}
+          title={type}
+        />
+      ))}
+    </div>
+  );
+}
+
+function IssueWorkflowRow({ summary }: { summary: { issueIdentifier: string | null; issueTitle: string | null; phase: string | null; assigneeAgentName: string | null; isRework: boolean; reworkCount: number; blockedReason: string | null; expectedNextRole: string | null; expectedNextPhase: string | null; artifactChain: string[] } }) {
+  const navigate = useNavigate();
+  return (
+    <div
+      className="flex items-start gap-2 py-2 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors"
+      onClick={() => summary.issueIdentifier && navigate(`/issues/${summary.issueIdentifier}`)}
+      role={summary.issueIdentifier ? "button" : undefined}
+      tabIndex={summary.issueIdentifier ? 0 : undefined}
+      onKeyDown={(e) => { if (summary.issueIdentifier && e.key === "Enter") navigate(`/issues/${summary.issueIdentifier}`); }}
+    >
+      <ArtifactChainPips chain={summary.artifactChain} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {summary.issueIdentifier ? (
+            <span className="text-blue-600 dark:text-blue-400 font-medium hover:underline text-xs">{summary.issueIdentifier}</span>
+          ) : (
+            <span className="text-muted-foreground text-xs">No issue</span>
+          )}
+          {summary.phase && <PhaseBadge phase={summary.phase} />}
+          {summary.assigneeAgentName && (
+            <span className="text-xs text-muted-foreground shrink-0">{summary.assigneeAgentName}</span>
+          )}
+          {summary.isRework && (
+            <span className="inline-flex items-center gap-0.5 text-xs text-amber-500 shrink-0" title={`${summary.reworkCount} rework(s)`}>
+              <Repeat className="h-3 w-3" />
+              {summary.reworkCount}
+            </span>
+          )}
+          {summary.blockedReason && (
+            <span className="text-xs text-red-500 shrink-0" title={summary.blockedReason}>⚠ {summary.blockedReason}</span>
+          )}
+          {summary.expectedNextRole && (
+            <span className="inline-flex items-center gap-0.5 text-xs text-blue-500 shrink-0" title={`Next: ${summary.expectedNextRole} → ${summary.expectedNextPhase}`}>
+              <ChevronRight className="h-3 w-3" />
+              {summary.expectedNextRole}
+            </span>
+          )}
+        </div>
+        {summary.issueTitle && (
+          <p className="text-xs text-muted-foreground truncate">{summary.issueTitle}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SwarmCockpit() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -841,6 +909,18 @@ export function SwarmCockpit() {
               ))}
               {data.reviewQueue.readyForReview.slice(0, 5).map((handoff) => (
                 <ReviewQueueItem key={`ready-${handoff.id}`} handoff={handoff} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Issue Workflow" icon={UserCheck} className="md:col-span-2 lg:col-span-1">
+          {!data.issueWorkflowSummary || data.issueWorkflowSummary.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No active issues</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.issueWorkflowSummary.slice(0, 10).map((summary) => (
+                <IssueWorkflowRow key={summary.issueId} summary={summary} />
               ))}
             </div>
           )}

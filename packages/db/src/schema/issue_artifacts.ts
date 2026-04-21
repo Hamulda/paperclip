@@ -1,4 +1,4 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { index, integer, jsonb, pgTable, text, timestamp, type AnyPgColumn, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
@@ -9,6 +9,14 @@ export type ArtifactType = (typeof ARTIFACT_TYPES)[number];
 
 export const ARTIFACT_STATUSES = ["draft", "published", "superseded", "failed"] as const;
 export type ArtifactStatus = (typeof ARTIFACT_STATUSES)[number];
+
+/** Maps artifact type to the phase that must be active for it to advance the workflow */
+export const PHASE_FOR_ARTIFACT_TYPE: Record<ArtifactType, string> = {
+  planner: "planning",
+  plan_reviewer: "plan_review",
+  executor: "executing",
+  reviewer: "code_review",
+};
 
 export const issueArtifacts = pgTable(
   "issue_artifacts",
@@ -23,6 +31,9 @@ export const issueArtifacts = pgTable(
     createdByRunId: uuid("created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     summary: text("summary"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+    supersededBy: uuid("superseded_by").references((): AnyPgColumn => issueArtifacts.id, { onDelete: "set null" }),
+    supersedes: uuid("supersedes").references((): AnyPgColumn => issueArtifacts.id, { onDelete: "set null" }),
+    revisionCount: integer("revision_count").notNull().default(1),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -34,5 +45,7 @@ export const issueArtifacts = pgTable(
     ),
     companyStatusIdx: index("issue_artifacts_company_status_idx").on(table.companyId, table.status),
     issueUpdatedIdx: index("issue_artifacts_issue_updated_idx").on(table.issueId, table.updatedAt),
+    supersededByIdx: index("issue_artifacts_superseded_by_idx").on(table.supersededBy),
+    supersedesIdx: index("issue_artifacts_supersedes_idx").on(table.supersedes),
   }),
 );
