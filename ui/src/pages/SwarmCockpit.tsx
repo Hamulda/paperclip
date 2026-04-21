@@ -5,8 +5,9 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { queryKeys } from "@/lib/queryKeys";
 import { swarmDigestApi, type SwarmCockpitDigest } from "@/api/swarm-digest";
 import { PageSkeleton } from "@/components/PageSkeleton";
+import { EmptyState } from "@/components/EmptyState";
 import { cn } from "@/lib/utils";
-import { useSearchParams } from "@/lib/router";
+import { useSearchParams, useNavigate } from "@/lib/router";
 import {
   Bot,
   CircleDot,
@@ -27,16 +28,63 @@ import {
   Star,
 } from "lucide-react";
 
+function SummaryStrip({ data }: { data: SwarmCockpitDigest }) {
+  const navigate = useNavigate();
+  const alerts = [
+    { count: data.fileClaimConflicts.length, label: "conflicts", urgent: true },
+    { count: data.runsStuck.length, label: "stuck", urgent: true },
+    { count: data.servicesDegraded.length, label: "degraded", urgent: true },
+    { count: data.fileClaimStale.filter(c => c.minutesUntilExpiry <= 1).length, label: "expiring", urgent: true },
+    { count: data.activeRuns.length, label: "active runs", urgent: false },
+    { count: data.activeAgents.length, label: "agents", urgent: false },
+  ].filter(a => a.count > 0);
+
+  return (
+    <div className="flex items-center gap-3 px-1 py-2 rounded-lg bg-muted/30 border border-border/50 text-xs">
+      <span className="text-muted-foreground font-medium shrink-0">Swarm</span>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {alerts.map(alert => (
+          <button
+            key={alert.label}
+            onClick={() => {
+              if (alert.label === "stuck") navigate("/issues/backlog");
+              else if (alert.label === "active runs") navigate("/issues/active");
+            }}
+            className={cn(
+              "inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium transition-colors",
+              alert.urgent
+                ? "bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20 cursor-pointer"
+                : "bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20 cursor-pointer"
+            )}
+          >
+            <span className="font-mono">{alert.count}</span>
+            <span> </span>
+            <span>{alert.label}</span>
+          </button>
+        ))}
+        {alerts.length === 0 && (
+          <span className="text-green-600 dark:text-green-400 font-medium">All clear</span>
+        )}
+      </div>
+      <div className="ml-auto shrink-0 text-muted-foreground">
+        {data.activeAgents.length} agents · {data.activeRuns.length} runs
+      </div>
+    </div>
+  );
+}
+
 function SectionCard({
   title,
   icon: Icon,
   children,
   className,
+  alertCount,
 }: {
   title: string;
   icon: React.ComponentType<{ className?: string }>;
   children: React.ReactNode;
   className?: string;
+  alertCount?: number;
 }) {
   return (
     <div className={cn("rounded-lg border bg-card p-4 shadow-sm", className)}>
@@ -45,6 +93,11 @@ function SectionCard({
         <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
           {title}
         </h3>
+        {alertCount !== undefined && alertCount > 0 && (
+          <span className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-red-500/10 text-xs font-mono font-medium text-red-600 dark:text-red-400">
+            {alertCount}
+          </span>
+        )}
       </div>
       {children}
     </div>
@@ -109,13 +162,23 @@ function AgentRow({ agent }: { agent: { id: string; name: string; status: string
 }
 
 function RunRow({ run }: { run: { id: string; agentId: string; issueIdentifier: string | null; issueTitle: string | null; status: string; startedAt: string | null; swarmRole: string | null } }) {
+  const navigate = useNavigate();
   return (
-    <div className="flex items-center justify-between py-2 text-sm">
+    <div
+      className="flex items-center justify-between py-2 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors"
+      onClick={() => run.issueIdentifier && navigate(`/issues/${run.issueIdentifier}`)}
+      role={run.issueIdentifier ? "button" : undefined}
+      tabIndex={run.issueIdentifier ? 0 : undefined}
+      onKeyDown={(e) => { if (run.issueIdentifier && e.key === "Enter") navigate(`/issues/${run.issueIdentifier}`); }}
+    >
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5 flex-wrap">
-          <p className="truncate font-medium">
-            {run.issueIdentifier ? `[${run.issueIdentifier}]` : "No issue"} {run.issueTitle ?? ""}
-          </p>
+          {run.issueIdentifier ? (
+            <span className="text-blue-600 dark:text-blue-400 font-medium hover:underline">{run.issueIdentifier}</span>
+          ) : (
+            <span className="text-muted-foreground">No issue</span>
+          )}
+          <span className="truncate text-muted-foreground">{run.issueTitle ?? ""}</span>
           {run.swarmRole && (
             <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded shrink-0">
               {run.swarmRole}
@@ -204,13 +267,23 @@ function DegradedServiceRow({ svc }: { svc: { id: string; serviceName: string; s
 }
 
 function StuckRunRow({ run }: { run: { id: string; issueIdentifier: string | null; issueTitle: string | null; status: string; minutesWaiting: number } }) {
+  const navigate = useNavigate();
   return (
-    <div className="flex items-start gap-2 py-2 text-sm">
+    <div
+      className="flex items-start gap-2 py-2 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors"
+      onClick={() => run.issueIdentifier && navigate(`/issues/${run.issueIdentifier}`)}
+      role={run.issueIdentifier ? "button" : undefined}
+      tabIndex={run.issueIdentifier ? 0 : undefined}
+      onKeyDown={(e) => { if (run.issueIdentifier && e.key === "Enter") navigate(`/issues/${run.issueIdentifier}`); }}
+    >
       <Clock className="h-4 w-4 shrink-0 text-yellow-500 mt-0.5" />
       <div className="min-w-0 flex-1">
-        <p className="truncate font-medium">
-          {run.issueIdentifier ? `[${run.issueIdentifier}]` : "No issue"} {run.issueTitle ?? ""}
-        </p>
+        {run.issueIdentifier ? (
+          <span className="text-blue-600 dark:text-blue-400 font-medium hover:underline">{run.issueIdentifier}</span>
+        ) : (
+          <span className="text-muted-foreground">No issue</span>
+        )}
+        <span className="text-muted-foreground ml-1">{run.issueTitle ?? ""}</span>
         <p className="text-xs text-muted-foreground">
           Waiting {run.minutesWaiting}m
         </p>
@@ -299,7 +372,7 @@ function ProtectedPathsRow({ path }: { path: string }) {
   );
 }
 
-function AutoClaimSuggestionRow({ suggestion }: { suggestion: { source: "issue_labels" | "issue_description" | "diff"; path: string; claimType: string; reason: string; issueIdentifier?: string } }) {
+function AutoClaimSuggestionRow({ suggestion }: { suggestion: { source: string; path: string; claimType: string; reason: string; issueIdentifier?: string } }) {
   const sourceColors: Record<string, string> = {
     issue_labels: "text-purple-500 bg-purple-500/10",
     issue_description: "text-blue-500 bg-blue-500/10",
@@ -435,24 +508,78 @@ export function SwarmCockpit() {
           <span>Project-scoped view</span>
         </div>
       )}
+      <SummaryStrip data={data} />
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        <SectionCard title="Active Agents" icon={Bot} className="md:col-span-2 lg:col-span-1">
-          {data.activeAgents.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No active agents</p>
+        {/* Critical — alerts first */}
+        <SectionCard
+          title="File Claim Conflicts"
+          icon={AlertTriangle}
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={data.fileClaimConflicts.length}
+        >
+          {data.fileClaimConflicts.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No conflicts</p>
           ) : (
-            <div className="divide-y divide-border">
-              {data.activeAgents.slice(0, 8).map((agent) => (
-                <AgentRow key={agent.id} agent={agent} />
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.fileClaimConflicts.slice(0, 10).map((conflict, i) => (
+                <ConflictRow key={i} conflict={conflict} />
               ))}
-              {data.activeAgents.length > 8 && (
-                <p className="text-xs text-muted-foreground py-2 text-center">
-                  +{data.activeAgents.length - 8} more
-                </p>
-              )}
             </div>
           )}
         </SectionCard>
 
+        <SectionCard
+          title="Stuck Runs"
+          icon={Clock}
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={data.runsStuck.length}
+        >
+          {data.runsStuck.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No stuck runs</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.runsStuck.slice(0, 10).map((run) => (
+                <StuckRunRow key={run.id} run={run} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Failed/Degraded Services"
+          icon={AlertCircle}
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={data.servicesDegraded.length}
+        >
+          {data.servicesDegraded.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No degraded services</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.servicesDegraded.slice(0, 10).map((svc) => (
+                <DegradedServiceRow key={svc.id} svc={svc} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Stale Claims"
+          icon={Clock}
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={data.fileClaimStale.filter(c => c.minutesUntilExpiry <= 1).length}
+        >
+          {data.fileClaimStale.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No expiring claims</p>
+          ) : (
+            <div className="divide-y divide-border max-h-48 overflow-y-auto">
+              {data.fileClaimStale.slice(0, 10).map((claim) => (
+                <StaleClaimRow key={claim.id} claim={claim} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        {/* Operational */}
         <SectionCard title="Hot Slot Usage" icon={Zap} className="md:col-span-2 lg:col-span-1">
           <HotSlotMeter current={data.hotSlotUsage.current} max={data.hotSlotUsage.max} />
           {data.queuedHotRunsCount > 0 && (
@@ -470,6 +597,23 @@ export function SwarmCockpit() {
               {data.activeRuns.slice(0, 10).map((run) => (
                 <RunRow key={run.id} run={run} />
               ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard title="Active Agents" icon={Bot} className="md:col-span-2 lg:col-span-1">
+          {data.activeAgents.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No active agents</p>
+          ) : (
+            <div className="divide-y divide-border">
+              {data.activeAgents.slice(0, 8).map((agent) => (
+                <AgentRow key={agent.id} agent={agent} />
+              ))}
+              {data.activeAgents.length > 8 && (
+                <p className="text-xs text-muted-foreground py-2 text-center">
+                  +{data.activeAgents.length - 8} more
+                </p>
+              )}
             </div>
           )}
         </SectionCard>
@@ -498,59 +642,28 @@ export function SwarmCockpit() {
           )}
         </SectionCard>
 
-        <SectionCard title="File Claim Conflicts" icon={AlertTriangle} className="md:col-span-2 lg:col-span-1">
-          {data.fileClaimConflicts.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No conflicts</p>
-          ) : (
-            <div className="divide-y divide-border max-h-48 overflow-y-auto">
-              {data.fileClaimConflicts.slice(0, 10).map((conflict, i) => (
-                <ConflictRow key={i} conflict={conflict} />
-              ))}
-            </div>
-          )}
+        <SectionCard title="Queue Fairness" icon={Scale} className="md:col-span-2 lg:col-span-1">
+          <FairnessSignal stuckRuns={data.runsStuck.length} activeRuns={data.activeRuns.length} />
         </SectionCard>
 
-        <SectionCard title="Stale Claims" icon={Clock} className="md:col-span-2 lg:col-span-1">
-          {data.fileClaimStale.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No expiring claims</p>
-          ) : (
-            <div className="divide-y divide-border max-h-48 overflow-y-auto">
-              {data.fileClaimStale.slice(0, 10).map((claim) => (
-                <StaleClaimRow key={claim.id} claim={claim} />
-              ))}
-            </div>
-          )}
-        </SectionCard>
-
-        <SectionCard title="Failed/Degraded Services" icon={AlertCircle} className="md:col-span-2 lg:col-span-1">
-          {data.servicesDegraded.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No degraded services</p>
-          ) : (
-            <div className="divide-y divide-border max-h-48 overflow-y-auto">
-              {data.servicesDegraded.slice(0, 10).map((svc) => (
-                <DegradedServiceRow key={svc.id} svc={svc} />
-              ))}
-            </div>
-          )}
-        </SectionCard>
-
-        <SectionCard title="Stuck Runs" icon={Clock} className="md:col-span-2 lg:col-span-1">
-          {data.runsStuck.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No stuck runs</p>
-          ) : (
-            <div className="divide-y divide-border max-h-48 overflow-y-auto">
-              {data.runsStuck.slice(0, 10).map((run) => (
-                <StuckRunRow key={run.id} run={run} />
-              ))}
-            </div>
-          )}
-        </SectionCard>
-
+        {/* Informational */}
         <SectionCard title="Latest Handoff" icon={Star} className="md:col-span-2 lg:col-span-2">
           {!data.latestHandoff ? (
             <p className="text-sm text-muted-foreground py-4 text-center">No handoff yet</p>
           ) : (
             <LatestHandoffSummaryRow handoff={data.latestHandoff} />
+          )}
+        </SectionCard>
+
+        <SectionCard title="Recent Handoffs" icon={ArrowRight} className="md:col-span-2 lg:col-span-2">
+          {data.recentHandoffs.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No recent handoffs</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.recentHandoffs.slice(0, 10).map((handoff) => (
+                <HandoffRow key={handoff.id} handoff={handoff} />
+              ))}
+            </div>
           )}
         </SectionCard>
 
@@ -580,10 +693,10 @@ export function SwarmCockpit() {
 
         <SectionCard title="Protected Paths" icon={Shield} className="md:col-span-2 lg:col-span-1">
           <p className="text-xs text-muted-foreground mb-2">
-            Hard-blocked patterns ({data.protectedPaths.enforcedBy})
+            {data.protectedPaths.enforcement === "hard_block" ? "Hard Block" : "Soft Warning"} — {data.protectedPaths.defaultPatterns.length} defaults, {data.protectedPaths.configurablePatterns.length} project
           </p>
           <div className="max-h-32 overflow-y-auto space-y-1">
-            {data.protectedPaths.paths.slice(0, 15).map((path) => (
+            {data.protectedPaths.defaultPatterns.slice(0, 10).map((path) => (
               <ProtectedPathsRow key={path} path={path} />
             ))}
           </div>
@@ -596,22 +709,6 @@ export function SwarmCockpit() {
             <div className="divide-y divide-border max-h-48 overflow-y-auto">
               {data.autoClaimSuggestions.slice(0, 8).map((suggestion, i) => (
                 <AutoClaimSuggestionRow key={i} suggestion={suggestion} />
-              ))}
-            </div>
-          )}
-        </SectionCard>
-
-        <SectionCard title="Queue Fairness" icon={Scale} className="md:col-span-2 lg:col-span-1">
-          <FairnessSignal stuckRuns={data.runsStuck.length} activeRuns={data.activeRuns.length} />
-        </SectionCard>
-
-        <SectionCard title="Recent Handoffs" icon={ArrowRight} className="md:col-span-2 lg:col-span-2">
-          {data.recentHandoffs.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4 text-center">No recent handoffs</p>
-          ) : (
-            <div className="divide-y divide-border max-h-64 overflow-y-auto">
-              {data.recentHandoffs.slice(0, 10).map((handoff) => (
-                <HandoffRow key={handoff.id} handoff={handoff} />
               ))}
             </div>
           )}

@@ -40,9 +40,12 @@ export interface SwarmDigestAutoClaimSuggestion {
   issueIdentifier?: string; // linked issue if source is issue_labels or issue_description
 }
 
+export type ProtectedPathsEnforcement = "hard_block" | "soft_warning";
+
 export interface SwarmDigestProtectedPaths {
-  paths: string[]; // hard-blocked paths that should never be claimed
-  enforcedBy: "server" | "config"; // who enforces these rules
+  defaultPatterns: string[]; // server-enforced defaults, never configurable
+  configurablePatterns: string[]; // project-level overrides
+  enforcement: ProtectedPathsEnforcement; // how violations are handled
 }
 
 export interface SwarmDigestRun {
@@ -111,6 +114,8 @@ export interface SwarmDigestRunStuck {
   minutesWaiting: number;
 }
 
+export type VerificationStatus = "ready_for_review" | "needs_verification" | "verified" | "blocked";
+
 export interface SwarmDigestHandoff {
   id: string;
   agentId: string;
@@ -127,6 +132,7 @@ export interface SwarmDigestHandoff {
   recommendedNextStep: string;
   avoidPaths: string[];
   emittedAt: string;
+  verificationStatus: VerificationStatus | null;
 }
 
 export interface SwarmDigest {

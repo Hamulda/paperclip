@@ -6,7 +6,7 @@ import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
-import { parseSessionCompactionPolicy } from "./runtime-config-builder.js";
+import { parseSessionCompactionPolicy } from "./heartbeat.js";
 import { readRawUsageTotals, deriveNormalizedUsageDelta, type UsageTotals } from "./run-usage.js";
 import { hasSessionCompactionThresholds } from "@paperclipai/adapter-utils";
 import { formatCount } from "./run-usage.js";

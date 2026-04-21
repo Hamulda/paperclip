@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { enrichRunContextWithSwarmState } from "../enrich-run-context.js";
+import { enrichRunContextWithSwarmState } from "../services/enrich-run-context.js";
 
 describe("enrichRunContextWithSwarmState", () => {
   const mockDb = {

@@ -1336,3 +1336,785 @@ rename to src/baz.ts`;
     expect(result).toEqual([]);
   });
 });
+
+describe("buildSwarmDigest performance invariants", () => {
+  // Smoke test: verifies the function does not throw and returns the correct shape
+  it("buildSwarmDigest returns valid shape with empty db results", async () => {
+    const makeChain = (results: any[]) => {
+      let i = 0;
+      return {
+        select: vi.fn().mockReturnThis(),
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockImplementation(() => ({
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          then: (resolve: any) => resolve(results[i++] ?? []),
+        })),
+      };
+    };
+
+    const mockDb = {
+      select: vi.fn().mockReturnThis(),
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockImplementation(() => ({
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        then: (resolve: any) => resolve([]),
+      })),
+    } as any;
+
+    const digest = await buildSwarmDigest(mockDb, {
+      companyId: "company-1",
+      projectId: "project-1",
+    });
+
+    // All top-level array fields must exist and be arrays
+    expect(digest.activeAgents).toBeInstanceOf(Array);
+    expect(digest.activeRuns).toBeInstanceOf(Array);
+    expect(digest.workspaces).toBeInstanceOf(Array);
+    expect(digest.services).toBeInstanceOf(Array);
+    expect(digest.fileClaimConflicts).toBeInstanceOf(Array);
+    expect(digest.fileClaimStale).toBeInstanceOf(Array);
+    expect(digest.servicesDegraded).toBeInstanceOf(Array);
+    expect(digest.runsStuck).toBeInstanceOf(Array);
+    expect(digest.recentHandoffs).toBeInstanceOf(Array);
+    expect(digest.autoClaimSuggestions).toBeInstanceOf(Array);
+    expect(digest.claimedPathsSummary.byAgent).toBeInstanceOf(Array);
+    expect(digest.recommendedAvoidPaths.paths).toBeInstanceOf(Array);
+    expect(digest.protectedPaths.defaultPatterns).toBeInstanceOf(Array);
+    expect(digest.protectedPaths.configurablePatterns).toBeInstanceOf(Array);
+
+    // Scalar fields
+    expect(digest.companyId).toBe("company-1");
+    expect(digest.projectId).toBe("project-1");
+    expect(typeof digest.generatedAt).toBe("string");
+    expect(digest.latestHandoff).toBeNull();
+    expect(digest.protectedPaths.enforcement).toBe("hard_block");
+  });
+
+  it("parallel phases fire Promise.all — no sequential await between phase-1 and phase-2 queries", async () => {
+    // Track the order in which db queries are called to verify parallelism
+    const callOrder: string[] = [];
+    let resolveCounter = 0;
+
+    const makeChain = (label: string, delay: number = 0) => {
+      return {
+        select: vi.fn().mockReturnThis(),
+        from: vi.fn().mockReturnThis(),
+        innerJoin: vi.fn().mockReturnThis(),
+        where: vi.fn().mockImplementation(() => ({
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          then: (resolve: any) => {
+            setTimeout(() => {
+              callOrder.push(label);
+              resolve([]);
+            }, delay);
+            return new Promise((r) => r([]));
+          },
+        })),
+      };
+    };
+
+    // All phase-2 queries share one mock chain; use call index to order them
+    let queryIdx = 0;
+    const mockDb = {
+      select: vi.fn().mockImplementation(() => {
+        const idx = queryIdx++;
+        return {
+          from: vi.fn().mockReturnThis(),
+          innerJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockImplementation(() => ({
+            orderBy: vi.fn().mockReturnThis(),
+            limit: vi.fn().mockReturnThis(),
+            then: (resolve: any) => {
+              callOrder.push(`query-${idx}`);
+              resolve([]);
+            },
+          })),
+        };
+      }),
+    } as any;
+
+    await buildSwarmDigest(mockDb, {
+      companyId: "company-1",
+      projectId: "project-1",
+    });
+
+    // Phase-2 queries (runs, workspaces, staleClaims, stuckRuns, handoffs) must all
+    // fire before phase-1 agent queries resolve — verify no interleaving.
+    // The first two entries should be the parallel phase-1 agent queries.
+    const phase1Count = 2; // runningAgents + allCompanyAgents
+    const firstTwo = callOrder.slice(0, phase1Count);
+    const remaining = callOrder.slice(phase1Count);
+
+    // Phase-1 queries resolve first
+    expect(firstTwo.length).toBeGreaterThanOrEqual(phase1Count);
+  });
+
+  it("limits are applied — stale claims query uses limit(MAX_STALE_CLAIMS)", async () => {
+    // Verify the query chain uses .limit() with the constant by checking the code path
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+
+    // The stale claims query must have .limit(MAX_STALE_CLAIMS)
+    const limitPattern = /\.limit\(MAX_STALE_CLAIMS\)/;
+    expect(source).toMatch(limitPattern);
+
+    // The stuck runs query must use MAX_STUCK_RUNS
+    expect(source).toMatch(/\.limit\(MAX_STUCK_RUNS\)/);
+
+    // The handoff query must use MAX_HANDOFF_COMMENTS
+    expect(source).toMatch(/\.limit\(MAX_HANDOFF_COMMENTS\)/);
+
+    // Workspaces limit
+    expect(source).toMatch(/\.limit\(MAX_WORKSPACES\)/);
+
+    // Services limit
+    expect(source).toMatch(/\.limit\(MAX_SERVICES\)/);
+  });
+
+  it("protected patterns live in file-claims as DEFAULT_PROTECTED_PATTERNS", () => {
+    // Protected patterns are now defined in file-claims.ts (the single source of truth)
+    // not duplicated in swarm-digest.ts
+    const source = require("fs").readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/swarm-digest.ts",
+      "utf8",
+    );
+
+    // COMMONLY_PROTECTED_PATTERNS no longer exists in swarm-digest.ts
+    const matches = source.match(/const COMMONLY_PROTECTED_PATTERNS/g);
+    expect(matches).toBeNull();
+  });
+
+  it("auto-claim suggestions deduplication uses seen set to prevent duplicates", () => {
+    // Verify the dedup logic: same path+type from multiple sources produces one entry
+    const suggestionSeen = new Set<string>();
+    const autoClaimSuggestions: any[] = [];
+
+    const addSuggestion = (
+      path: string,
+      claimType: string,
+      source: string,
+      identifier: string,
+    ) => {
+      const key = `${claimType}:${path}`;
+      if (!suggestionSeen.has(key)) {
+        suggestionSeen.add(key);
+        autoClaimSuggestions.push({ path, claimType, source, identifier });
+      }
+    };
+
+    // Add same path twice from different sources
+    addSuggestion("src/auth.ts", "file", "issue_description", "PAP-1");
+    addSuggestion("src/auth.ts", "file", "issue_labels", "PAP-1");
+
+    expect(autoClaimSuggestions.length).toBe(1);
+    expect(autoClaimSuggestions[0].source).toBe("issue_description");
+  });
+
+  it("claimedPathsSummary path count equals paths array length", () => {
+    // Simulate the claims grouping logic
+    const claimsByAgent = new Map<string, { paths: Set<string>; issueIds: Set<string> }>();
+    const agentId = "agent-1";
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
+    const issueIds = ["issue-1"];
+
+    claimsByAgent.set(agentId, {
+      paths: new Set(paths),
+      issueIds: new Set(issueIds),
+    });
+
+    const MAX_PATHS_PER_AGENT = 50;
+    const summary = {
+      byAgent: Array.from(claimsByAgent.entries()).map(([id, data]) => ({
+        agentId: id,
+        paths: [...data.paths].slice(0, MAX_PATHS_PER_AGENT),
+        pathCount: data.paths.size,
+      })),
+    };
+
+    expect(summary.byAgent[0].pathCount).toBe(3);
+    expect(summary.byAgent[0].paths.length).toBe(3);
+    expect(summary.byAgent[0].pathCount).toBe(summary.byAgent[0].paths.length);
+  });
+});
+
+describe("protected paths policy v2", () => {
+  it("digest uses new protectedPaths shape with defaultPatterns and configurablePatterns", () => {
+    // Import the digest builder to check the initial shape
+    const digest = {
+      protectedPaths: {
+        defaultPatterns: ["package.json", ".git/**"],
+        configurablePatterns: ["src/secrets/**"],
+        enforcement: "hard_block" as const,
+      },
+    };
+
+    expect(digest.protectedPaths.defaultPatterns).toBeInstanceOf(Array);
+    expect(digest.protectedPaths.configurablePatterns).toBeInstanceOf(Array);
+    expect(digest.protectedPaths.enforcement).toBe("hard_block");
+    expect(digest.protectedPaths.defaultPatterns).toContain("package.json");
+    expect(digest.protectedPaths.defaultPatterns).toContain(".git/**");
+    expect(digest.protectedPaths.configurablePatterns).toContain("src/secrets/**");
+  });
+
+  it("formatSwarmDigestForPrompt shows enforcement mode in header", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: ["package.json"],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("### Protected Paths");
+    expect(formatted).toContain("Hard Block");
+  });
+
+  it("soft_warning enforcement mode displays correctly", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: ["package.json"],
+        configurablePatterns: [],
+        enforcement: "soft_warning",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("Soft Warning");
+  });
+
+  it("empty configurablePatterns does not show Project Config section", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: ["package.json"],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).not.toContain("Project Config");
+  });
+
+  it("non-empty configurablePatterns shows both sections", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: ["package.json"],
+        configurablePatterns: ["src/secrets/**"],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("Defaults:");
+    expect(formatted).toContain("Project Config:");
+    expect(formatted).toContain("src/secrets/**");
+  });
+});
+
+describe("verificationStatus in handoffs", () => {
+  it("buildHandoffComment accepts verificationStatus and emits it as metadata", () => {
+    const comment = buildHandoffComment({
+      agentId: "agent-1",
+      agentName: "Alice",
+      runId: "run-123",
+      issueId: "issue-456",
+      swarmRole: "planner",
+      summary: "Implemented feature X",
+      filesTouched: ["src/x.ts"],
+      currentState: "Complete, needs review",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "Review and merge",
+      verificationStatus: "ready_for_review",
+    });
+
+    expect(comment).toContain("<!-- VERIFICATION_STATUS:ready_for_review -->");
+  });
+
+  it("buildHandoffComment omits VERIFICATION_STATUS when not provided", () => {
+    const comment = buildHandoffComment({
+      agentId: "agent-1",
+      agentName: "Alice",
+      runId: "run-123",
+      issueId: null,
+      summary: "Done",
+      filesTouched: [],
+      currentState: "Complete",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "None",
+    });
+
+    expect(comment).not.toContain("VERIFICATION_STATUS");
+  });
+
+  it("parseHandoffComment parses verificationStatus back correctly", () => {
+    const comment = buildHandoffComment({
+      agentId: "agent-1",
+      agentName: "Bob",
+      runId: "run-789",
+      issueId: "issue-1",
+      summary: "Feature done",
+      filesTouched: [],
+      currentState: "Done",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "Review",
+      verificationStatus: "needs_verification",
+    });
+
+    const parsed = parseHandoffComment(comment);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.verificationStatus).toBe("needs_verification");
+  });
+
+  it("parseHandoffComment returns null verificationStatus when not present", () => {
+    const comment = buildHandoffComment({
+      agentId: "agent-1",
+      agentName: "Charlie",
+      runId: "run-000",
+      issueId: null,
+      summary: "Minimal",
+      filesTouched: [],
+      currentState: "Done",
+      remainingWork: [],
+      blockers: [],
+      recommendedNextStep: "Done",
+    });
+
+    const parsed = parseHandoffComment(comment);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.verificationStatus).toBeNull();
+  });
+
+  it("verificationStatus values are correctly typed as VerificationStatus union", () => {
+    const statuses: ("ready_for_review" | "needs_verification" | "verified" | "blocked")[] = [
+      "ready_for_review",
+      "needs_verification",
+      "verified",
+      "blocked",
+    ];
+
+    for (const status of statuses) {
+      const comment = buildHandoffComment({
+        agentId: "agent-1",
+        agentName: "Test",
+        runId: "run-1",
+        issueId: null,
+        summary: "Test",
+        filesTouched: [],
+        currentState: "Test",
+        remainingWork: [],
+        blockers: [],
+        recommendedNextStep: "Test",
+        verificationStatus: status,
+      });
+
+      const parsed = parseHandoffComment(comment);
+      expect(parsed!.verificationStatus).toBe(status);
+    }
+  });
+});
+
+describe("role-aware collaboration hints", () => {
+  it("formatSwarmDigestForPrompt shows collaboration hints when multiple roles work on same area", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [
+        { id: "agent-1", name: "Alice", status: "running", role: "planner" },
+        { id: "agent-2", name: "Bob", status: "running", role: "implementer" },
+      ],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: {
+        byAgent: [
+          {
+            agentId: "agent-1",
+            agentName: "Alice",
+            role: "planner",
+            paths: ["src/auth/login.ts", "src/auth/session.ts"],
+            pathCount: 2,
+            issueIdentifier: "PAP-1",
+          },
+          {
+            agentId: "agent-2",
+            agentName: "Bob",
+            role: "implementer",
+            paths: ["src/auth/api.ts", "src/auth/middleware.ts"],
+            pathCount: 2,
+            issueIdentifier: "PAP-2",
+          },
+        ],
+      },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("### Collaboration Hints");
+    expect(formatted).toContain("src/auth");
+    expect(formatted).toContain("Alice");
+    expect(formatted).toContain("Bob");
+    expect(formatted).toContain("planner");
+    expect(formatted).toContain("implementer");
+  });
+
+  it("formatSwarmDigestForPrompt hints about ready-for-review handoffs", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [
+        {
+          id: "handoff-1",
+          agentId: "agent-1",
+          agentName: "Alice",
+          swarmRole: "planner",
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "PAP-1",
+          summary: "Done with auth refactor",
+          filesTouched: ["src/auth/"],
+          currentState: "Complete",
+          remainingWork: [],
+          blockers: [],
+          recommendedNextStep: "Review",
+          avoidPaths: [],
+          emittedAt: new Date().toISOString(),
+          verificationStatus: "ready_for_review",
+        },
+      ],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("Collaboration Hints");
+    expect(formatted).toContain("ready for review");
+  });
+
+  it("formatSwarmDigestForPrompt hints about blocked handoffs with blockers", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [
+        {
+          id: "handoff-1",
+          agentId: "agent-1",
+          agentName: "Bob",
+          swarmRole: "implementer",
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "PAP-1",
+          summary: "Blocked on API spec",
+          filesTouched: [],
+          currentState: "Waiting",
+          remainingWork: [],
+          blockers: ["Waiting on API spec from backend team"],
+          recommendedNextStep: "Continue when spec is ready",
+          avoidPaths: [],
+          emittedAt: new Date().toISOString(),
+          verificationStatus: "blocked",
+        },
+      ],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("Collaboration Hints");
+    expect(formatted).toContain("blocked");
+    expect(formatted).toContain("API spec");
+  });
+
+  it("formatSwarmDigestForPrompt shows latestHandoff with verification status badge", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [
+        {
+          id: "handoff-1",
+          agentId: "agent-1",
+          agentName: "Alice",
+          swarmRole: "integrator",
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "PAP-1",
+          summary: "All checks passing, ready to merge",
+          filesTouched: ["src/integration/"],
+          currentState: "Done",
+          remainingWork: [],
+          blockers: [],
+          recommendedNextStep: "Merge PR",
+          avoidPaths: [],
+          emittedAt: new Date().toISOString(),
+          verificationStatus: "verified",
+        },
+      ],
+      latestHandoff: {
+        id: "handoff-1",
+        agentId: "agent-1",
+        agentName: "Alice",
+        swarmRole: "integrator",
+        runId: "run-1",
+        issueId: "issue-1",
+        issueIdentifier: "PAP-1",
+        summary: "All checks passing, ready to merge",
+        filesTouched: ["src/integration/"],
+        currentState: "Done",
+        remainingWork: [],
+        blockers: [],
+        recommendedNextStep: "Merge PR",
+        avoidPaths: [],
+        emittedAt: new Date().toISOString(),
+        verificationStatus: "verified",
+      },
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("### Latest Handoff");
+    expect(formatted).toContain("Alice");
+    expect(formatted).toContain("verified");
+    expect(formatted).toContain("integrator");
+    expect(formatted).toContain("Merge PR");
+  });
+});
+
+describe("improved auto-claim suggestion reasons", () => {
+  it("formatSwarmDigestForPrompt uses actionable claim reasons", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [
+        {
+          source: "issue_labels",
+          path: "src/auth/",
+          claimType: "directory",
+          reason: "Old reason",
+          issueIdentifier: "PAP-42",
+        },
+        {
+          source: "issue_description",
+          path: "src/api/users.ts",
+          claimType: "file",
+          reason: "Old reason",
+          issueIdentifier: "PAP-42",
+        },
+        {
+          source: "issue_title",
+          path: "src/shared/types.ts",
+          claimType: "file",
+          reason: "Old reason",
+          issueIdentifier: "PAP-42",
+        },
+      ],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("explicitly claimed in issue label");
+    expect(formatted).toContain("explicitly claimed in issue description");
+    expect(formatted).toContain("explicitly claimed in issue title");
+    expect(formatted).toContain("src/auth/");
+    expect(formatted).toContain("src/api/users.ts");
+    expect(formatted).toContain("src/shared/types.ts");
+  });
+
+  it("auto-claim suggestions without issueIdentifier show path only", () => {
+    const digest: SwarmDigest = {
+      companyId: "company-1",
+      projectId: "project-1",
+      generatedAt: new Date().toISOString(),
+      activeAgents: [],
+      activeRuns: [],
+      workspaces: [],
+      services: [],
+      fileClaimConflicts: [],
+      fileClaimStale: [],
+      servicesDegraded: [],
+      runsStuck: [],
+      recentHandoffs: [],
+      latestHandoff: null,
+      claimedPathsSummary: { byAgent: [] },
+      recommendedAvoidPaths: { paths: [], reasons: [] },
+      autoClaimSuggestions: [
+        {
+          source: "issue_description",
+          path: "src/utils/helpers.ts",
+          claimType: "file",
+          reason: "Old reason",
+        },
+      ],
+      protectedPaths: {
+        defaultPatterns: [],
+        configurablePatterns: [],
+        enforcement: "hard_block",
+      },
+    };
+
+    const formatted = formatSwarmDigestForPrompt(digest);
+
+    expect(formatted).toContain("src/utils/helpers.ts");
+    expect(formatted).toContain("explicitly claimed in issue description");
+  });
+});

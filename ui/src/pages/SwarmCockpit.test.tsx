@@ -36,6 +36,7 @@ const searchParamsState = vi.hoisted(() => new URLSearchParams());
 
 vi.mock("@/lib/router", () => ({
   useSearchParams: () => [searchParamsState],
+  useNavigate: () => vi.fn(),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -58,7 +59,7 @@ function createMockDigest(overrides: Partial<SwarmCockpitDigest> = {}): SwarmCoc
     latestHandoff: null,
     claimedPathsSummary: { byAgent: [] },
     recommendedAvoidPaths: { paths: [], reasons: [] },
-    protectedPaths: { paths: [], enforcedBy: "server" },
+    protectedPaths: { defaultPatterns: [], configurablePatterns: [], enforcement: "hard_block" },
     autoClaimSuggestions: [],
     hotSlotUsage: { current: 0, max: 3 },
     queuedHotRunsCount: 0,
@@ -105,6 +106,8 @@ describe("SwarmCockpit", () => {
 
   async function flush() {
     await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
       await new Promise((r) => setTimeout(r, 0));
     });
   }
@@ -207,6 +210,7 @@ describe("SwarmCockpit", () => {
             minutesUntilExpiry: 0,
           },
         ],
+        activeAgents: [{ id: "a1", name: "Agent", status: "running", role: null }],
       }),
     );
 
@@ -219,6 +223,7 @@ describe("SwarmCockpit", () => {
   it("renders stuck runs with correct waiting time", async () => {
     mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
       createMockDigest({
+        activeAgents: [{ id: "a1", name: "Agent", status: "running", role: null }],
         runsStuck: [
           {
             id: "run-stuck-1",
@@ -260,6 +265,7 @@ describe("SwarmCockpit", () => {
   it("renders degraded services section with status and health", async () => {
     mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
       createMockDigest({
+        activeAgents: [{ id: "a1", name: "Agent", status: "running", role: null }],
         servicesDegraded: [
           {
             id: "svc-bad",
@@ -284,6 +290,7 @@ describe("SwarmCockpit", () => {
   it("renders handoff section with agent name and recommended next step", async () => {
     mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
       createMockDigest({
+        activeAgents: [{ id: "a1", name: "Charlie", status: "running", role: null }],
         recentHandoffs: [
           {
             id: "hc-1",
@@ -519,12 +526,13 @@ describe("SwarmCockpit", () => {
     expect(container.textContent).toContain("Agent is working here");
   });
 
-  it("renders Protected Paths section with enforcedBy label", async () => {
+  it("renders Protected Paths section with enforcement mode", async () => {
     mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
       createMockDigest({
         protectedPaths: {
-          paths: ["package.json", "pnpm-lock.yaml", "node_modules/**"],
-          enforcedBy: "server",
+          defaultPatterns: ["package.json", "pnpm-lock.yaml", "node_modules/**"],
+          configurablePatterns: [],
+          enforcement: "hard_block",
         },
       }),
     );
@@ -533,8 +541,7 @@ describe("SwarmCockpit", () => {
     await flush();
 
     expect(container.textContent).toContain("Protected Paths");
-    expect(container.textContent).toContain("Hard-blocked patterns");
-    expect(container.textContent).toContain("server");
+    expect(container.textContent).toContain("Hard Block");
     expect(container.textContent).toContain("package.json");
     expect(container.textContent).toContain("pnpm-lock.yaml");
   });
@@ -557,6 +564,7 @@ describe("SwarmCockpit", () => {
   it("renders Queue Fairness section with starvation warning", async () => {
     mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
       createMockDigest({
+        activeAgents: [{ id: "a1", name: "Agent", status: "running", role: null }],
         runsStuck: [
           { id: "run-stuck", agentId: "a1", issueId: "issue-1", issueIdentifier: "PAP-5", issueTitle: "Stuck", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
           { id: "run-stuck-2", agentId: "a2", issueId: "issue-2", issueIdentifier: "PAP-6", issueTitle: "Stuck2", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
@@ -662,5 +670,98 @@ describe("SwarmCockpit", () => {
 
     expect(container.textContent).toContain("Auto-Claim Suggestions");
     expect(container.textContent).toContain("No suggestions");
+  });
+
+  it("renders summary strip with alert counts and All Clear state", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeAgents: [{ id: "a1", name: "Alice", status: "running", role: null }],
+        activeRuns: [{ id: "r1", agentId: "a1", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null }],
+        runsStuck: [{ id: "s1", agentId: "a1", issueId: null, issueIdentifier: "PAP-5", issueTitle: "Stuck", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 5 }],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Swarm");
+    expect(container.textContent).toContain("1 stuck");
+    expect(container.textContent).toContain("1 agents");
+    expect(container.textContent).toContain("1 runs");
+  });
+
+  it("renders summary strip All Clear when no alerts", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(createMockDigest());
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("All clear");
+  });
+
+  it("renders alert count badge on SectionCard for stuck runs", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        runsStuck: [
+          { id: "s1", agentId: "a1", issueId: null, issueIdentifier: "PAP-5", issueTitle: "Stuck", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 5 },
+          { id: "s2", agentId: "a2", issueId: null, issueIdentifier: "PAP-6", issueTitle: "Stuck2", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 3 },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    const stuckSection = container.querySelectorAll(".bg-red-500\\/10");
+    expect(stuckSection.length).toBeGreaterThan(0);
+  });
+
+  it("renders expiring claims alert count when claims are <= 1 minute", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeAgents: [{ id: "a1", name: "Alice", status: "running", role: null }],
+        activeRuns: [{ id: "r1", agentId: "a1", issueId: null, issueIdentifier: null, issueTitle: null, status: "running", startedAt: null, swarmRole: null }],
+        fileClaimStale: [
+          { id: "claim-1", claimPath: "src/expiring.ts", claimType: "file", agentId: "agent-1", runId: "run-1", expiresAt: "2026-04-19T10:01:00.000Z", minutesUntilExpiry: 1 },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("1 expiring");
+  });
+
+  it("RunRow issueIdentifier is styled as clickable link", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        activeRuns: [
+          { id: "run-1", agentId: "agent-1", issueId: "issue-1", issueIdentifier: "PAP-42", issueTitle: "Fix bug", status: "running", startedAt: "2026-04-19T09:00:00.000Z", swarmRole: "planner" },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    const allText = container.textContent ?? "";
+    expect(allText).toContain("PAP-42");
+  });
+
+  it("StuckRunRow issueIdentifier is styled as clickable link", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        runsStuck: [
+          { id: "run-stuck", agentId: "agent-1", issueId: "issue-1", issueIdentifier: "PAP-99", issueTitle: "Stuck task", status: "queued", createdAt: "2026-04-19T08:00:00.000Z", startedAt: null, minutesWaiting: 55 },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    const pap99 = container.querySelector(".text-blue-600");
+    expect(pap99?.textContent).toBe("PAP-99");
   });
 });

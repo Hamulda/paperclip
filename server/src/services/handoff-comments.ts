@@ -5,6 +5,8 @@
 export const HANDOFF_COMMENT_PREFIX = "<!-- SWARM_HANDOFF";
 export const HANDOFF_COMMENT_VERSION = "1.0";
 
+export type VerificationStatus = "ready_for_review" | "needs_verification" | "verified" | "blocked";
+
 export interface StructuredHandoff {
   version: string;
   agentId: string;
@@ -20,6 +22,7 @@ export interface StructuredHandoff {
   recommendedNextStep: string;
   avoidPaths: string[];
   emittedAt: string;
+  verificationStatus: VerificationStatus | null;
 }
 
 function escapeHandoffValue(value: string): string {
@@ -51,6 +54,7 @@ export function buildHandoffComment(input: {
   blockers: string[];
   recommendedNextStep: string;
   avoidPaths?: string[];
+  verificationStatus?: VerificationStatus | null;
 }): string {
   const escaped = {
     summary: escapeHandoffValue(input.summary),
@@ -65,6 +69,7 @@ export function buildHandoffComment(input: {
     `<!-- RUN_ID:${input.runId} -->`,
     `<!-- ISSUE_ID:${input.issueId ?? ""} -->`,
     `<!-- SWARM_ROLE:${input.swarmRole ?? ""} -->`,
+    input.verificationStatus ? `<!-- VERIFICATION_STATUS:${input.verificationStatus} -->` : ``,
     ``,
     `## Summary`,
     `${escaped.summary}`,
@@ -167,6 +172,7 @@ export function parseHandoffComment(body: string): StructuredHandoff | null {
     recommendedNextStep: getRawSection("Recommended next step"),
     avoidPaths: getListSection("Avoid paths"),
     emittedAt: metadata["EMITTED_AT"] ?? "",
+    verificationStatus: (metadata["VERIFICATION_STATUS"] as VerificationStatus) || null,
   };
 }
 

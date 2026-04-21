@@ -6,13 +6,19 @@ export {
   HANDOFF_COMMENT_PREFIX,
   HANDOFF_COMMENT_VERSION,
   type StructuredHandoff,
+  type VerificationStatus,
 } from "./handoff-comments.js";
 
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, executionWorkspaces, workspaceRuntimeServices, issues, fileClaims, issueComments } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, ne, sql, lt, isNotNull, or } from "drizzle-orm";
 import { asString, parseObject } from "../adapters/utils.js";
-import { getActiveClaimsForRun, listConflicts, extractClaimPathsFromIssue } from "./file-claims.js";
+import {
+  getActiveClaimsForRun,
+  listConflicts,
+  extractClaimPathsFromIssue,
+  DEFAULT_PROTECTED_PATTERNS,
+} from "./file-claims.js";
 import { parseHandoffComment, isHandoffComment, HANDOFF_COMMENT_PREFIX } from "./handoff-comments.js";
 import type {
   SwarmDigest,
@@ -29,7 +35,22 @@ import type {
   SwarmDigestRecommendedAvoidPaths,
   SwarmDigestAutoClaimSuggestion,
   SwarmDigestProtectedPaths,
+  VerificationStatus,
 } from "@paperclipai/shared";
+
+// ---------------------------------------------------------------------------
+// Module-level constants (deduped — previously inlined in every call)
+// ---------------------------------------------------------------------------
+const MAX_STALE_CLAIMS = 20;
+const MAX_DEGRADED_SERVICES = 20;
+const MAX_STUCK_RUNS = 20;
+const MAX_HANDOFF_COMMENTS = 20;
+const MAX_ACTIVE_RUNS = 50;
+const MAX_WORKSPACES = 20;
+const MAX_SERVICES = 30;
+const MAX_AUTO_CLAIM_SUGGESTIONS = 20;
+const MAX_AVOID_PATHS = 20;
+const MAX_PATHS_PER_AGENT = 50;
 
 function readNonEmptyString(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -37,24 +58,6 @@ function readNonEmptyString(value: unknown): string {
 }
 
 function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDigest {
-  const commonlyProtectedPatterns = [
-    "package.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    ".git/**",
-    ".github/**",
-    "node_modules/**",
-    "dist/**",
-    "build/**",
-    ".next/**",
-    "tsconfig*.json",
-    "jest.config.*",
-    "vitest.config.*",
-    "*.test.ts",
-    "*.spec.ts",
-    "*.stories.tsx",
-    "*.md",
-  ];
   return {
     companyId,
     projectId,
@@ -72,7 +75,11 @@ function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDig
     claimedPathsSummary: { byAgent: [] },
     recommendedAvoidPaths: { paths: [], reasons: [] },
     autoClaimSuggestions: [],
-    protectedPaths: { paths: commonlyProtectedPatterns, enforcedBy: "server" },
+    protectedPaths: {
+      defaultPatterns: DEFAULT_PROTECTED_PATTERNS,
+      configurablePatterns: [],
+      enforcement: "hard_block",
+    },
   };
 }
 
@@ -91,187 +98,360 @@ export async function buildSwarmDigest(
     return buildEmptyDigest(companyId, projectId);
   }
 
-  // 1. Active (running) agents in the company — kept separate for display purposes
-  const runningAgents = await db
-    .select({
-      id: agents.id,
-      name: agents.name,
-      status: agents.status,
-      role: agents.role,
-    })
-    .from(agents)
-    .where(and(
-      eq(agents.companyId, companyId),
-      eq(agents.status, "running"),
-    ))
-    .then((rows) =>
-      rows.map((row): SwarmDigestAgent => ({
-        id: row.id,
-        name: row.name,
-        status: row.status,
-        role: row.role ?? null,
-      })),
-    );
+  const now = new Date();
+  const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
+  const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+  const thirtyMinutesAgo = new Date(now.getTime() - 30 * 60 * 1000);
 
-  // 1b. All company agents (any status) for name/role lookups used by runs and claimed paths
-  // This ensures queued runs and claims from non-running agents still have valid name/role
-  const allCompanyAgents = await db
-    .select({
-      id: agents.id,
-      name: agents.name,
-      role: agents.role,
-    })
-    .from(agents)
-    .where(eq(agents.companyId, companyId));
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 1 — Agent lookups (parallel)
+  // Two independent queries: running agents + all agents (for name/role maps)
+  // ─────────────────────────────────────────────────────────────────────────────
+  const [runningAgentsResult, allCompanyAgentsResult] = await Promise.all([
+    db
+      .select({ id: agents.id, name: agents.name, status: agents.status, role: agents.role })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), eq(agents.status, "running"))),
+    db
+      .select({ id: agents.id, name: agents.name, role: agents.role })
+      .from(agents)
+      .where(eq(agents.companyId, companyId)),
+  ]);
 
-  const agentNameForLookup = new Map(allCompanyAgents.map((a) => [a.id, a.name]));
-  const agentRoleForLookup = new Map(allCompanyAgents.map((a) => [a.id, a.role ?? null]));
+  const activeAgents: SwarmDigestAgent[] = runningAgentsResult.map(
+    (row): SwarmDigestAgent => ({
+      id: row.id,
+      name: row.name,
+      status: row.status,
+      role: row.role ?? null,
+    }),
+  );
 
-  // activeAgents is running-only for display
-  const activeAgents = runningAgents;
+  const agentNameForLookup = new Map(allCompanyAgentsResult.map((a) => [a.id, a.name]));
+  const agentRoleForLookup = new Map(allCompanyAgentsResult.map((a) => [a.id, a.role ?? null]));
 
-  // 2. Active runs (running or queued) for the company, optionally scoped to project
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 2 — Independent queries that need only companyId + projectId + time
+  // - active runs (with JSON filter on projectId)
+  // - workspaces
+  // - stale claims
+  // - stuck runs
+  // - handoff comments
+  // All fire in parallel; workspaces degraded-services dependency resolved below
+  // ─────────────────────────────────────────────────────────────────────────────
   const activeRunConditions = [
     eq(heartbeatRuns.companyId, companyId),
     inArray(heartbeatRuns.status, ["running", "queued"]),
   ];
-
-  // Filter by projectId from contextSnapshot when provided
   if (projectId) {
     activeRunConditions.push(sql`${heartbeatRuns.contextSnapshot} ->> 'projectId' = ${projectId}`);
   }
-
-  // Filter out the current run itself
   if (currentRunId) {
     activeRunConditions.push(ne(heartbeatRuns.id, currentRunId));
   }
 
-  // Get all runs (running or queued) for the company/project
-  // Not gated on activeAgents so queued runs from idle agents are included
-  let activeRuns: SwarmDigestRun[] = [];
-  const runRows = await db
-    .select({
-      id: heartbeatRuns.id,
-      agentId: heartbeatRuns.agentId,
-      contextSnapshot: heartbeatRuns.contextSnapshot,
-      status: heartbeatRuns.status,
-      startedAt: heartbeatRuns.startedAt,
-    })
-    .from(heartbeatRuns)
-    .where(and(...activeRunConditions))
-    .orderBy(desc(heartbeatRuns.startedAt))
-    .limit(50);
+  const [runRows, workspaceRows, staleClaimRows, stuckRunRows, handoffCommentRows] =
+    await Promise.all([
+      db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(and(...activeRunConditions))
+        .orderBy(desc(heartbeatRuns.startedAt))
+        .limit(MAX_ACTIVE_RUNS),
 
-  // (activeRuns initialized as empty array above, mapped below after issue fetching)
-  if (runRows.length > 0) {
-    // Extract issue info from contextSnapshot
-    const issueIds = new Set<string>();
-    for (const run of runRows) {
-      const context = parseObject(run.contextSnapshot);
-      const issueId = readNonEmptyString(context.issueId);
-      if (issueId) issueIds.add(issueId);
-    }
+      projectId
+        ? db
+            .select({
+              id: executionWorkspaces.id,
+              name: executionWorkspaces.name,
+              branchName: executionWorkspaces.branchName,
+              worktreePath: executionWorkspaces.providerRef,
+              status: executionWorkspaces.status,
+              sourceIssueId: executionWorkspaces.sourceIssueId,
+            })
+            .from(executionWorkspaces)
+            .where(
+              and(
+                eq(executionWorkspaces.companyId, companyId),
+                eq(executionWorkspaces.projectId, projectId),
+                eq(executionWorkspaces.status, "active"),
+              ),
+            )
+            .orderBy(desc(executionWorkspaces.lastUsedAt))
+            .limit(MAX_WORKSPACES)
+        : Promise.resolve([]),
 
-  // Batch fetch ALL issue fields needed for auto-claim extraction (labels, description, identifier, title)
-  const activeRunsIssueRows = issueIds.size > 0
-    ? await db
-        .select({ id: issues.id, identifier: issues.identifier, title: issues.title, description: issues.description, labels: issues.labels })
-        .from(issues)
-        .where(inArray(issues.id, Array.from(issueIds)))
-    : [];
-  const issueMap = new Map(activeRunsIssueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title, description: i.description ?? null, labels: i.labels ?? [] }]));
+      db
+        .select({
+          id: fileClaims.id,
+          claimPath: fileClaims.claimPath,
+          claimType: fileClaims.claimType,
+          agentId: fileClaims.agentId,
+          runId: fileClaims.runId,
+          expiresAt: fileClaims.expiresAt,
+        })
+        .from(fileClaims)
+        .where(
+          and(
+            eq(fileClaims.companyId, companyId),
+            eq(fileClaims.status, "active"),
+            lt(fileClaims.expiresAt, fiveMinutesFromNow),
+            ...(projectId ? [eq(fileClaims.projectId, projectId)] : []),
+          ),
+        )
+        .limit(MAX_STALE_CLAIMS),
 
-  activeRuns = runRows
-    .map((run): SwarmDigestRun => {
-      const context = parseObject(run.contextSnapshot);
-      const issueId = readNonEmptyString(context.issueId) || null;
-      const issueInfo = issueId ? issueMap.get(issueId) : null;
-      const swarmRole = agentRoleForLookup.get(run.agentId) ?? null;
-      return {
-        id: run.id,
-        agentId: run.agentId,
-        issueId,
-        issueIdentifier: issueInfo?.identifier ?? null,
-        issueTitle: issueInfo?.title ?? null,
-        status: run.status,
-        startedAt: run.startedAt?.toISOString() ?? null,
-        swarmRole,
-      };
-    })
-    .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
+      db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          status: heartbeatRuns.status,
+          createdAt: heartbeatRuns.createdAt,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.status, "queued"),
+            lt(heartbeatRuns.createdAt, fiveMinutesAgo),
+            ...(projectId
+              ? [sql`${heartbeatRuns.contextSnapshot} ->> 'projectId' = ${projectId}`]
+              : []),
+          ),
+        )
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(MAX_STUCK_RUNS),
+
+      projectId
+        ? db
+            .select({
+              id: issueComments.id,
+              body: issueComments.body,
+              authorAgentId: issueComments.authorAgentId,
+              createdByRunId: issueComments.createdByRunId,
+              issueId: issueComments.issueId,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .innerJoin(issues, eq(issueComments.issueId, issues.id))
+            .where(
+              and(
+                eq(issueComments.companyId, companyId),
+                eq(issues.projectId, projectId),
+                gte(issueComments.createdAt, thirtyMinutesAgo),
+                isNotNull(issueComments.authorAgentId),
+              ),
+            )
+            .orderBy(desc(issueComments.createdAt))
+            .limit(MAX_HANDOFF_COMMENTS)
+        : db
+            .select({
+              id: issueComments.id,
+              body: issueComments.body,
+              authorAgentId: issueComments.authorAgentId,
+              createdByRunId: issueComments.createdByRunId,
+              issueId: issueComments.issueId,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, companyId),
+                gte(issueComments.createdAt, thirtyMinutesAgo),
+                isNotNull(issueComments.authorAgentId),
+              ),
+            )
+            .orderBy(desc(issueComments.createdAt))
+            .limit(MAX_HANDOFF_COMMENTS),
+    ]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 3 — Derive issue IDs from phase-2 results; fire parallel issue fetch
+  // ─────────────────────────────────────────────────────────────────────────────
+  const activeIssueIds = new Set<string>();
+  const stuckIssueIds = new Set<string>();
+  const allHandoffIssueIds = new Set<string>();
+
+  for (const run of runRows) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) activeIssueIds.add(issueId);
   }
 
-  // 3. Execution workspaces for the project/company
-  let workspaces: SwarmDigestWorkspace[] = [];
-  if (projectId) {
-    const workspaceRows = await db
-      .select({
-        id: executionWorkspaces.id,
-        name: executionWorkspaces.name,
-        branchName: executionWorkspaces.branchName,
-        worktreePath: executionWorkspaces.providerRef,
-        status: executionWorkspaces.status,
-        sourceIssueId: executionWorkspaces.sourceIssueId,
-      })
-      .from(executionWorkspaces)
-      .where(
-        and(
-          eq(executionWorkspaces.companyId, companyId),
-          eq(executionWorkspaces.projectId, projectId),
-          eq(executionWorkspaces.status, "active"),
-        ),
-      )
-      .orderBy(desc(executionWorkspaces.lastUsedAt))
-      .limit(20);
+  for (const run of stuckRunRows) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) stuckIssueIds.add(issueId);
+  }
 
-    workspaces = workspaceRows.map((w): SwarmDigestWorkspace => ({
+  for (const row of handoffCommentRows) {
+    if (!isHandoffComment(row.body)) continue;
+    const parsed = parseHandoffComment(row.body);
+    if (parsed?.issueId) allHandoffIssueIds.add(parsed.issueId);
+  }
+
+  // Fire all issue queries in parallel
+  const [activeRunsIssueRows, stuckIssueRows, handoffIssueRows] = await Promise.all([
+    activeIssueIds.size > 0
+      ? db
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            description: issues.description,
+            labels: issues.labels,
+          })
+          .from(issues)
+          .where(inArray(issues.id, Array.from(activeIssueIds)))
+      : Promise.resolve([]),
+
+    stuckIssueIds.size > 0
+      ? db
+          .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+          .from(issues)
+          .where(inArray(issues.id, Array.from(stuckIssueIds)))
+      : Promise.resolve([]),
+
+    allHandoffIssueIds.size > 0
+      ? db
+          .select({ id: issues.id, identifier: issues.identifier })
+          .from(issues)
+          .where(inArray(issues.id, Array.from(allHandoffIssueIds)))
+      : Promise.resolve([]),
+  ]);
+
+  const issueMap = new Map(
+    activeRunsIssueRows.map((i) => [
+      i.id,
+      { identifier: i.identifier, title: i.title, description: i.description ?? null, labels: i.labels ?? [] },
+    ]),
+  );
+  const stuckIssueMap = new Map(stuckIssueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title }]));
+  const handoffIssueMap = new Map(handoffIssueRows.map((i) => [i.id, i.identifier]));
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 4 — Workspace-dependent queries
+  // - services (needs activeWorkspaceIds from workspaces)
+  // - degraded services (needs activeWorkspaceIds from workspaces)
+  // - file claim conflicts (needs currentRunId context)
+  // - claimed paths (needs projectId, fires after issues)
+  // ─────────────────────────────────────────────────────────────────────────────
+  const workspaces: SwarmDigestWorkspace[] = workspaceRows.map(
+    (w): SwarmDigestWorkspace => ({
       id: w.id,
       name: w.name,
       branchName: w.branchName,
       worktreePath: w.worktreePath,
       status: w.status,
       sourceIssueId: w.sourceIssueId,
-    }));
-  }
+    }),
+  );
 
-  // 4. Runtime services for active execution workspaces
-  let services: SwarmDigestService[] = [];
   const activeWorkspaceIds = workspaces.map((w) => w.id);
-  if (activeWorkspaceIds.length > 0) {
-    const serviceRows = await db
+
+  const [serviceRows, degradedServiceRows, claimedPathsResult] = await Promise.all([
+    activeWorkspaceIds.length > 0
+      ? db
+          .select({
+            id: workspaceRuntimeServices.id,
+            serviceName: workspaceRuntimeServices.serviceName,
+            status: workspaceRuntimeServices.status,
+            url: workspaceRuntimeServices.url,
+            ownerAgentId: workspaceRuntimeServices.ownerAgentId,
+          })
+          .from(workspaceRuntimeServices)
+          .where(
+            and(
+              inArray(workspaceRuntimeServices.executionWorkspaceId, activeWorkspaceIds),
+              inArray(workspaceRuntimeServices.status, ["running", "starting"]),
+            ),
+          )
+          .orderBy(desc(workspaceRuntimeServices.lastUsedAt))
+          .limit(MAX_SERVICES)
+        : Promise.resolve([]),
+
+    db
       .select({
         id: workspaceRuntimeServices.id,
         serviceName: workspaceRuntimeServices.serviceName,
         status: workspaceRuntimeServices.status,
+        healthStatus: workspaceRuntimeServices.healthStatus,
         url: workspaceRuntimeServices.url,
         ownerAgentId: workspaceRuntimeServices.ownerAgentId,
       })
       .from(workspaceRuntimeServices)
       .where(
         and(
-          inArray(workspaceRuntimeServices.executionWorkspaceId, activeWorkspaceIds),
-          inArray(workspaceRuntimeServices.status, ["running", "starting"]),
+          eq(workspaceRuntimeServices.companyId, companyId),
+          or(
+            eq(workspaceRuntimeServices.healthStatus, "degraded"),
+            eq(workspaceRuntimeServices.healthStatus, "unhealthy"),
+            eq(workspaceRuntimeServices.status, "stopped"),
+            eq(workspaceRuntimeServices.status, "failed"),
+          ),
+          // Project scoping via workspace IDs when available, else projectId only
+          ...(projectId && activeWorkspaceIds.length > 0
+            ? [inArray(workspaceRuntimeServices.executionWorkspaceId, activeWorkspaceIds)]
+            : projectId
+              ? [sql`1 = 0`]
+              : []),
         ),
       )
-      .orderBy(desc(workspaceRuntimeServices.lastUsedAt))
-      .limit(30);
+      .limit(MAX_DEGRADED_SERVICES),
 
-    services = serviceRows.map((s): SwarmDigestService => ({
+    projectId
+      ? db
+          .select({
+            claimPath: fileClaims.claimPath,
+            claimType: fileClaims.claimType,
+            agentId: fileClaims.agentId,
+            issueId: fileClaims.issueId,
+          })
+          .from(fileClaims)
+          .where(
+            and(
+              eq(fileClaims.companyId, companyId),
+              eq(fileClaims.projectId, projectId),
+              eq(fileClaims.status, "active"),
+              gte(fileClaims.expiresAt, new Date()),
+            ),
+          )
+      : Promise.resolve([]),
+  ]);
+
+  const services: SwarmDigestService[] = serviceRows.map(
+    (s): SwarmDigestService => ({
       id: s.id,
       serviceName: s.serviceName,
       status: s.status,
       url: s.url,
       ownerAgentId: s.ownerAgentId,
-    }));
-  }
+    }),
+  );
 
-  // 5. File claim conflicts
-  // When currentRunId is provided, find conflicts with the current run's claims.
-  // Otherwise, find all active conflicts in the project (for overview/diagnostics).
+  const servicesDegraded: SwarmDigestServiceDegraded[] = degradedServiceRows.map((s) => ({
+    id: s.id,
+    serviceName: s.serviceName,
+    status: s.status,
+    healthStatus: s.healthStatus,
+    url: s.url,
+    ownerAgentId: s.ownerAgentId,
+  }));
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 5 — File claim conflicts
+  // ─────────────────────────────────────────────────────────────────────────────
   let fileClaimConflicts: SwarmDigestFileClaimConflict[] = [];
 
   if (currentRunId) {
-    // Current run context: get claims for this run and find what they conflict with
     const currentClaims = await getActiveClaimsForRun(db, companyId, currentRunId, projectId);
     const paths = currentClaims.map((c) => c.claimPath);
 
@@ -286,44 +466,22 @@ export async function buildSwarmDigest(
         excludeRunId: currentRunId,
       });
 
-      // Filter out same-run conflicts
-      const crossRunConflicts = conflicts.filter(
-        (c) => !currentRunIds.includes(c.runId),
-      );
+      const crossRunConflicts = conflicts.filter((c) => !currentRunIds.includes(c.runId));
 
-      fileClaimConflicts = crossRunConflicts.map((c): SwarmDigestFileClaimConflict => ({
-        claimPath: c.claimPath,
-        claimType: c.claimType,
-        conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
-        conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
-      }));
+      fileClaimConflicts = crossRunConflicts.map(
+        (c): SwarmDigestFileClaimConflict => ({
+          claimPath: c.claimPath,
+          claimType: c.claimType,
+          conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
+          conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
+        }),
+      );
     }
   } else if (projectId) {
-    // No current run context: show all active conflicts in the project for diagnostics
-    // Get all paths with active claims in this project
-    const allProjectClaims = await db
-      .select({
-        id: fileClaims.id,
-        claimPath: fileClaims.claimPath,
-        claimType: fileClaims.claimType,
-        agentId: fileClaims.agentId,
-        runId: fileClaims.runId,
-      })
-      .from(fileClaims)
-      .where(
-        and(
-          eq(fileClaims.companyId, companyId),
-          eq(fileClaims.projectId, projectId),
-          eq(fileClaims.status, "active"),
-          gte(fileClaims.expiresAt, new Date()),
-        ),
-      );
-
-    // Find all paths that have claims
-    const pathsWithClaims = [...new Set(allProjectClaims.map((c) => c.claimPath))];
+    // Re-use claimedPathsResult from phase 4 (same filter as allProjectClaims query)
+    const pathsWithClaims = [...new Set(claimedPathsResult.map((c) => c.claimPath))];
 
     if (pathsWithClaims.length > 0) {
-      // Get all conflicts for these paths (excluding nothing since no current run)
       const conflicts = await listConflicts(db, {
         companyId,
         projectId,
@@ -332,146 +490,45 @@ export async function buildSwarmDigest(
         excludeRunId: null,
       });
 
-      fileClaimConflicts = conflicts.map((c): SwarmDigestFileClaimConflict => ({
-        claimPath: c.claimPath,
-        claimType: c.claimType,
-        conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
-        conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
-      }));
+      fileClaimConflicts = conflicts.map(
+        (c): SwarmDigestFileClaimConflict => ({
+          claimPath: c.claimPath,
+          claimType: c.claimType,
+          conflictingAgentId: c.conflictingClaims[0]?.agentId ?? "",
+          conflictingRunId: c.conflictingClaims[0]?.runId ?? "",
+        }),
+      );
     }
   }
 
-  // 6. Stale/expiring file claims (expiring within 5 minutes or already expired but still marked active)
-  const now = new Date();
-  const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PHASE 6 — In-memory assembly
+  // ─────────────────────────────────────────────────────────────────────────────
 
-  const staleClaimConditions = [
-    eq(fileClaims.companyId, companyId),
-    eq(fileClaims.status, "active"),
-    lt(fileClaims.expiresAt, fiveMinutesFromNow),
-  ];
-  if (projectId) {
-    staleClaimConditions.push(eq(fileClaims.projectId, projectId));
-  }
-
-  const staleClaimRows = await db
-    .select({
-      id: fileClaims.id,
-      claimPath: fileClaims.claimPath,
-      claimType: fileClaims.claimType,
-      agentId: fileClaims.agentId,
-      runId: fileClaims.runId,
-      expiresAt: fileClaims.expiresAt,
+  // Build activeRuns
+  const activeRuns: SwarmDigestRun[] = runRows
+    .map((run): SwarmDigestRun => {
+      const context = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(context.issueId) || null;
+      const issueInfo = issueId ? issueMap.get(issueId) : null;
+      return {
+        id: run.id,
+        agentId: run.agentId,
+        issueId,
+        issueIdentifier: issueInfo?.identifier ?? null,
+        issueTitle: issueInfo?.title ?? null,
+        status: run.status,
+        startedAt: run.startedAt?.toISOString() ?? null,
+        swarmRole: agentRoleForLookup.get(run.agentId) ?? null,
+      };
     })
-    .from(fileClaims)
-    .where(and(...staleClaimConditions))
-    .limit(20);
+    .filter((run) => run.agentId !== currentAgentId || run.id !== currentRunId);
 
-  const fileClaimStale: SwarmDigestFileClaimStale[] = staleClaimRows.map((c) => {
-    const expiresAt = c.expiresAt;
-    const minutesUntilExpiry = Math.round((expiresAt.getTime() - now.getTime()) / 60000);
-    return {
-      id: c.id,
-      claimPath: c.claimPath,
-      claimType: c.claimType,
-      agentId: c.agentId,
-      runId: c.runId,
-      expiresAt: expiresAt.toISOString(),
-      minutesUntilExpiry,
-    };
-  });
-
-  // 7. Failed or degraded runtime services
-  // Scope to project's workspaces when projectId is provided (via executionWorkspaceId join)
-  const degradedServiceConditions = [
-    eq(workspaceRuntimeServices.companyId, companyId),
-    or(
-      eq(workspaceRuntimeServices.healthStatus, "degraded"),
-      eq(workspaceRuntimeServices.healthStatus, "unhealthy"),
-      eq(workspaceRuntimeServices.status, "stopped"),
-      eq(workspaceRuntimeServices.status, "failed"),
-    ),
-  ];
-  if (projectId && activeWorkspaceIds.length > 0) {
-    degradedServiceConditions.push(inArray(workspaceRuntimeServices.executionWorkspaceId, activeWorkspaceIds));
-  } else if (projectId && activeWorkspaceIds.length === 0) {
-    // No active workspaces in this project — degraded services list will be empty
-    degradedServiceConditions.push(sql`1 = 0`);
-  }
-
-  const degradedServiceRows = await db
-    .select({
-      id: workspaceRuntimeServices.id,
-      serviceName: workspaceRuntimeServices.serviceName,
-      status: workspaceRuntimeServices.status,
-      healthStatus: workspaceRuntimeServices.healthStatus,
-      url: workspaceRuntimeServices.url,
-      ownerAgentId: workspaceRuntimeServices.ownerAgentId,
-    })
-    .from(workspaceRuntimeServices)
-    .where(and(...degradedServiceConditions))
-    .limit(20);
-
-  const servicesDegraded: SwarmDigestServiceDegraded[] = degradedServiceRows.map((s) => ({
-    id: s.id,
-    serviceName: s.serviceName,
-    status: s.status,
-    healthStatus: s.healthStatus,
-    url: s.url,
-    ownerAgentId: s.ownerAgentId,
-  }));
-
-  // 8. Stuck runs (queued for more than 5 minutes)
-  // For queued runs, we use createdAt (when the run was queued) rather than startedAt
-  // (which is only set when a run transitions from queued to running via claimQueuedRun).
-  // A truly stuck queued run will have createdAt set but startedAt = NULL.
-  const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
-
-  // Get all stuck runs scoped to projectId when provided
-  const stuckRunConditions = [
-    eq(heartbeatRuns.companyId, companyId),
-    eq(heartbeatRuns.status, "queued"),
-    lt(heartbeatRuns.createdAt, fiveMinutesAgo),
-  ];
-  if (projectId) {
-    stuckRunConditions.push(sql`${heartbeatRuns.contextSnapshot} ->> 'projectId' = ${projectId}`);
-  }
-
-  const stuckRunRows = await db
-    .select({
-      id: heartbeatRuns.id,
-      agentId: heartbeatRuns.agentId,
-      contextSnapshot: heartbeatRuns.contextSnapshot,
-      status: heartbeatRuns.status,
-      createdAt: heartbeatRuns.createdAt,
-      startedAt: heartbeatRuns.startedAt,
-    })
-    .from(heartbeatRuns)
-    .where(and(...stuckRunConditions))
-    .orderBy(asc(heartbeatRuns.createdAt))
-    .limit(20);
-
-  // Extract issue IDs from stuck runs
-  const stuckIssueIds = new Set<string>();
-  for (const run of stuckRunRows) {
-    const context = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(context.issueId);
-    if (issueId) stuckIssueIds.add(issueId);
-  }
-
-  const stuckIssueRows = stuckIssueIds.size > 0
-    ? await db
-        .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
-        .from(issues)
-        .where(inArray(issues.id, Array.from(stuckIssueIds)))
-    : [];
-  const stuckIssueMap = new Map(stuckIssueRows.map((i) => [i.id, { identifier: i.identifier, title: i.title }]));
-
+  // Build runsStuck
   const runsStuck: SwarmDigestRunStuck[] = stuckRunRows.map((run) => {
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) || null;
     const issueInfo = issueId ? stuckIssueMap.get(issueId) : null;
-    // Use createdAt for minutesWaiting since it represents when the run was queued
     const minutesWaiting = run.createdAt
       ? Math.round((now.getTime() - run.createdAt.getTime()) / 60000)
       : 0;
@@ -488,79 +545,27 @@ export async function buildSwarmDigest(
     };
   });
 
-  // 9. Recent handoff comments (last 30 minutes)
-  // When projectId is provided, scope to that project via the issueComments → issues join.
-  // Backward compatible: without projectId, returns all company-scoped handoffs.
-  const thirtyMinutesAgo = new Date(now.getTime() - 30 * 60 * 1000);
+  // Build stale claims
+  const fileClaimStale: SwarmDigestFileClaimStale[] = staleClaimRows.map((c) => {
+    const expiresAt = c.expiresAt;
+    const minutesUntilExpiry = Math.round((expiresAt.getTime() - now.getTime()) / 60000);
+    return {
+      id: c.id,
+      claimPath: c.claimPath,
+      claimType: c.claimType,
+      agentId: c.agentId,
+      runId: c.runId,
+      expiresAt: expiresAt.toISOString(),
+      minutesUntilExpiry,
+    };
+  });
 
-  const handoffCommentRows = projectId
-    ? await db
-        .select({
-          id: issueComments.id,
-          body: issueComments.body,
-          authorAgentId: issueComments.authorAgentId,
-          createdByRunId: issueComments.createdByRunId,
-          issueId: issueComments.issueId,
-          createdAt: issueComments.createdAt,
-        })
-        .from(issueComments)
-        .innerJoin(issues, eq(issueComments.issueId, issues.id))
-        .where(
-          and(
-            eq(issueComments.companyId, companyId),
-            eq(issues.projectId, projectId),
-            gte(issueComments.createdAt, thirtyMinutesAgo),
-            isNotNull(issueComments.authorAgentId),
-          ),
-        )
-        .orderBy(desc(issueComments.createdAt))
-        .limit(20)
-    : await db
-        .select({
-          id: issueComments.id,
-          body: issueComments.body,
-          authorAgentId: issueComments.authorAgentId,
-          createdByRunId: issueComments.createdByRunId,
-          issueId: issueComments.issueId,
-          createdAt: issueComments.createdAt,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, companyId),
-            gte(issueComments.createdAt, thirtyMinutesAgo),
-            isNotNull(issueComments.authorAgentId),
-          ),
-        )
-        .orderBy(desc(issueComments.createdAt))
-        .limit(20);
-
-  // Filter to only handoff comments and parse them
+  // Build recentHandoffs
   const recentHandoffs: SwarmDigestHandoff[] = [];
-
-  // Batch-fetch all issue identifiers upfront to avoid N+1 queries
-  const allHandoffIssueIds = new Set<string>();
   for (const row of handoffCommentRows) {
     if (!isHandoffComment(row.body)) continue;
-    const parsed = parseHandoffComment(row.body);
-    if (parsed?.issueId) allHandoffIssueIds.add(parsed.issueId);
-  }
-
-  const handoffIssueRows = allHandoffIssueIds.size > 0
-    ? await db
-        .select({ id: issues.id, identifier: issues.identifier })
-        .from(issues)
-        .where(inArray(issues.id, Array.from(allHandoffIssueIds)))
-    : [];
-  const handoffIssueMap = new Map(handoffIssueRows.map((i) => [i.id, i.identifier]));
-
-  for (const row of handoffCommentRows) {
-    if (!isHandoffComment(row.body)) continue;
-
     const parsed = parseHandoffComment(row.body);
     if (!parsed) continue;
-
-    const issueIdentifier = parsed.issueId ? handoffIssueMap.get(parsed.issueId) ?? null : null;
 
     recentHandoffs.push({
       id: row.id,
@@ -569,7 +574,7 @@ export async function buildSwarmDigest(
       swarmRole: parsed.swarmRole,
       runId: parsed.runId,
       issueId: parsed.issueId,
-      issueIdentifier,
+      issueIdentifier: parsed.issueId ? handoffIssueMap.get(parsed.issueId) ?? null : null,
       summary: parsed.summary,
       filesTouched: parsed.filesTouched,
       currentState: parsed.currentState,
@@ -578,36 +583,13 @@ export async function buildSwarmDigest(
       recommendedNextStep: parsed.recommendedNextStep,
       avoidPaths: parsed.avoidPaths,
       emittedAt: parsed.emittedAt,
+      verificationStatus: parsed.verificationStatus,
     });
   }
 
-  // 10. Build claimed paths summary (aggregate active claims by agent)
-  const allActiveClaims = projectId
-    ? await db
-        .select({
-          claimPath: fileClaims.claimPath,
-          claimType: fileClaims.claimType,
-          agentId: fileClaims.agentId,
-          issueId: fileClaims.issueId,
-        })
-        .from(fileClaims)
-        .where(
-          and(
-            eq(fileClaims.companyId, companyId),
-            eq(fileClaims.projectId, projectId),
-            eq(fileClaims.status, "active"),
-            gte(fileClaims.expiresAt, new Date()),
-          ),
-        )
-    : [];
-
-  // Build agent name map from all company agents (not just running)
-  // so claims from non-running agents still show valid name/role
-
-  // Group claims by agent (filter out claims with null agentId)
-  // Also track the most common issueId per agent for richer context
+  // Build claimed paths summary (re-use claimedPathsResult from phase 4)
   const claimsByAgent = new Map<string, { paths: Set<string>; issueIds: Set<string> }>();
-  for (const claim of allActiveClaims) {
+  for (const claim of claimedPathsResult) {
     if (!claim.agentId) continue;
     if (!claimsByAgent.has(claim.agentId)) {
       claimsByAgent.set(claim.agentId, { paths: new Set(), issueIds: new Set() });
@@ -618,148 +600,92 @@ export async function buildSwarmDigest(
     }
   }
 
-  // Get issue identifiers for agents' common issues
-  const allIssueIds = new Set<string>();
+  const claimedPathsIssueIds = new Set<string>();
   for (const agentData of claimsByAgent.values()) {
     for (const issueId of agentData.issueIds) {
-      allIssueIds.add(issueId);
+      claimedPathsIssueIds.add(issueId);
     }
   }
-  const claimedPathsIssueRows = allIssueIds.size > 0
-    ? await db
-        .select({ id: issues.id, identifier: issues.identifier })
-        .from(issues)
-        .where(inArray(issues.id, Array.from(allIssueIds)))
-    : [];
+
+  const claimedPathsIssueRows =
+    claimedPathsIssueIds.size > 0
+      ? await db
+          .select({ id: issues.id, identifier: issues.identifier })
+          .from(issues)
+          .where(inArray(issues.id, Array.from(claimedPathsIssueIds)))
+      : [];
+
   const issueIdToIdentifier = new Map(claimedPathsIssueRows.map((i) => [i.id, i.identifier]));
 
   const claimedPathsSummary: SwarmDigestClaimedPathsSummary = {
     byAgent: Array.from(claimsByAgent.entries()).map(([agentId, data]) => {
-      // Find the most common issue identifier for this agent
       const issueIdentifiers = Array.from(data.issueIds)
         .map((id) => issueIdToIdentifier.get(id))
         .filter((id): id is string => id !== undefined);
-      const commonIssue: string | null = issueIdentifiers.length > 0 ? issueIdentifiers[0] : null;
       return {
         agentId,
         agentName: agentNameForLookup.get(agentId) ?? "Unknown",
         role: agentRoleForLookup.get(agentId) ?? null,
-        paths: [...data.paths].slice(0, 50), // dedupe and limit
+        paths: [...data.paths].slice(0, MAX_PATHS_PER_AGENT),
         pathCount: data.paths.size,
-        issueIdentifier: commonIssue,
+        issueIdentifier: issueIdentifiers[0] ?? null,
       };
     }),
   };
 
-  // 11. Build recommended avoid paths from recent handoffs
+  // Build avoid paths
   const avoidPathSet = new Set<string>();
   const avoidPathReasons = new Map<string, string>();
 
   for (const handoff of recentHandoffs) {
     for (const avoidPath of handoff.avoidPaths) {
       avoidPathSet.add(avoidPath);
-      const reason = `${handoff.agentName} is actively working on this area`;
       if (!avoidPathReasons.has(avoidPath)) {
-        avoidPathReasons.set(avoidPath, reason);
+        avoidPathReasons.set(avoidPath, `${handoff.agentName} is actively working on this area`);
       }
     }
   }
 
   const recommendedAvoidPaths: SwarmDigestRecommendedAvoidPaths = {
-    paths: Array.from(avoidPathSet).slice(0, 20),
-    reasons: Array.from(avoidPathReasons.values()).slice(0, 20),
+    paths: Array.from(avoidPathSet).slice(0, MAX_AVOID_PATHS),
+    reasons: Array.from(avoidPathReasons.values()).slice(0, MAX_AVOID_PATHS),
   };
 
-  // 12. Protected paths (hard-block rules) - commonly protected patterns for display
-  const commonlyProtectedPatterns = [
-    "package.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    ".git/**",
-    ".github/**",
-    "node_modules/**",
-    "dist/**",
-    "build/**",
-    ".next/**",
-    "tsconfig*.json",
-    "jest.config.*",
-    "vitest.config.*",
-    "*.test.ts",
-    "*.spec.ts",
-    "*.stories.tsx",
-    "*.md",
-  ];
-  const protectedPaths: SwarmDigestProtectedPaths = {
-    paths: commonlyProtectedPatterns,
-    enforcedBy: "server",
-  };
-
-  // 13. Auto-claim suggestions — single pass over activeRuns using pre-fetched issue data (no N+1)
+  // Auto-claim suggestions
   const autoClaimSuggestions: SwarmDigestAutoClaimSuggestion[] = [];
   const suggestionSeen = new Set<string>();
 
   for (const run of activeRuns) {
     if (!run.issueId) continue;
-
     const issue = issueMap.get(run.issueId);
     if (!issue) continue;
 
-    // Extract from issue description lines
-    const descriptionClaims = extractClaimPathsFromIssue({ description: issue.description });
-    for (const claim of descriptionClaims) {
-      const key = `${claim.claimType}:${claim.claimPath}`;
-      if (!suggestionSeen.has(key)) {
-        suggestionSeen.add(key);
-        autoClaimSuggestions.push({
-          source: "issue_description",
-          path: claim.claimPath,
-          claimType: claim.claimType,
-          reason: `Suggested by issue ${issue.identifier ?? run.issueId} description`,
-          issueIdentifier: issue.identifier ?? undefined,
-        });
-      }
-    }
-
-    // Extract from issue labels
-    const labelClaims = extractClaimPathsFromIssue({ labels: issue.labels as string[] | undefined });
-    for (const claim of labelClaims) {
-      const key = `${claim.claimType}:${claim.claimPath}`;
-      if (!suggestionSeen.has(key)) {
-        suggestionSeen.add(key);
-        autoClaimSuggestions.push({
-          source: "issue_labels",
-          path: claim.claimPath,
-          claimType: claim.claimType,
-          reason: `Suggested by issue ${issue.identifier ?? run.issueId} label`,
-          issueIdentifier: issue.identifier ?? undefined,
-        });
-      }
-    }
-
-    // Extract from issue title (heuristic — extract potential paths from CamelCase/paths)
-    const titleClaims = extractClaimPathsFromIssue({ description: issue.title });
-    for (const claim of titleClaims) {
-      const key = `${claim.claimType}:${claim.claimPath}`;
-      if (!suggestionSeen.has(key)) {
-        suggestionSeen.add(key);
-        autoClaimSuggestions.push({
-          source: "issue_title",
-          path: claim.claimPath,
-          claimType: claim.claimType,
-          reason: `Suggested by issue ${issue.identifier ?? run.issueId} title`,
-          issueIdentifier: issue.identifier ?? undefined,
-        });
+    for (const [source, field] of [
+      ["issue_description", { description: issue.description }] as const,
+      ["issue_labels", { labels: issue.labels as string[] | undefined }] as const,
+      ["issue_title", { description: issue.title }] as const,
+    ] as const) {
+      const claims = extractClaimPathsFromIssue(field);
+      for (const claim of claims) {
+        const key = `${claim.claimType}:${claim.claimPath}`;
+        if (!suggestionSeen.has(key)) {
+          suggestionSeen.add(key);
+          autoClaimSuggestions.push({
+            source,
+            path: claim.claimPath,
+            claimType: claim.claimType,
+            reason: `Suggested by issue ${issue.identifier ?? run.issueId} ${source.replace("issue_", "")}`,
+            issueIdentifier: issue.identifier ?? undefined,
+          });
+        }
       }
     }
   }
 
-  // Deduplicate and cap to 20 for prompt-friendliness
-  const dedupedSuggestions = autoClaimSuggestions.slice(0, 20);
-
   return {
     companyId,
     projectId,
-    generatedAt: new Date().toISOString(),
+    generatedAt: now.toISOString(),
     activeAgents,
     activeRuns,
     workspaces,
@@ -772,8 +698,12 @@ export async function buildSwarmDigest(
     latestHandoff: recentHandoffs[0] ?? null,
     claimedPathsSummary,
     recommendedAvoidPaths,
-    autoClaimSuggestions: dedupedSuggestions,
-    protectedPaths,
+    autoClaimSuggestions: autoClaimSuggestions.slice(0, MAX_AUTO_CLAIM_SUGGESTIONS),
+    protectedPaths: {
+      defaultPatterns: DEFAULT_PROTECTED_PATTERNS,
+      configurablePatterns: [],
+      enforcement: "hard_block",
+    },
   };
 }
 
@@ -811,13 +741,14 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("");
   }
 
-  // Auto-claim suggestions from issue metadata
+  // Auto-claim suggestions from issue metadata — with practical, actionable reasons
   if (digest.autoClaimSuggestions.length > 0) {
     lines.push("### Auto-Claim Suggestions");
-    lines.push("Based on issue metadata, these paths may be relevant:");
+    lines.push("These paths are explicitly claimed by other issues — consider them if your issue touches related areas:");
     for (const suggestion of digest.autoClaimSuggestions.slice(0, 10)) {
       const issueNote = suggestion.issueIdentifier ? ` [${suggestion.issueIdentifier}]` : "";
-      lines.push(`- ${suggestion.path} (${suggestion.claimType})${issueNote}: ${suggestion.reason}`);
+      const sourceLabel = suggestion.source === "issue_labels" ? "label" : suggestion.source === "issue_title" ? "title" : "description";
+      lines.push(`- ${suggestion.path} (${suggestion.claimType})${issueNote}: explicitly claimed in issue ${sourceLabel}`);
     }
     lines.push("");
   }
@@ -828,6 +759,32 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("Do NOT modify these paths — another agent is actively working on them:");
     for (const path of digest.recommendedAvoidPaths.paths.slice(0, 10)) {
       lines.push(`- ${path}`);
+    }
+    lines.push("");
+  }
+
+  // Role-aware collaboration hints — cross-role coordination signals
+  const roleHints = buildRoleAwarenessHints(digest);
+  if (roleHints.length > 0) {
+    lines.push("### Collaboration Hints");
+    for (const hint of roleHints) {
+      lines.push(`- ${hint}`);
+    }
+    lines.push("");
+  }
+
+  // Latest handoff with verification status
+  if (digest.latestHandoff) {
+    const h = digest.latestHandoff;
+    lines.push("### Latest Handoff");
+    const statusBadge = h.verificationStatus ? ` [${h.verificationStatus.replace("_", " ")}]` : "";
+    const roleNote = h.swarmRole ? ` from ${h.swarmRole}` : "";
+    lines.push(`- **${h.agentName}**${roleNote}${statusBadge}: ${h.summary.slice(0, 120)}${h.summary.length > 120 ? "..." : ""}`);
+    if (h.recommendedNextStep) {
+      lines.push(`  → Next: ${h.recommendedNextStep}`);
+    }
+    if (h.blockers.length > 0) {
+      lines.push(`  ⚠️ Blockers: ${h.blockers.join(", ")}`);
     }
     lines.push("");
   }
@@ -873,15 +830,81 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("");
   }
 
-  // Protected paths (hard-block rules)
-  if (digest.protectedPaths?.paths?.length > 0) {
-    lines.push("### Protected Paths (Hard Blocks)");
-    lines.push("These paths CANNOT be claimed — do not modify them:");
-    for (const path of digest.protectedPaths.paths.slice(0, 15)) {
-      lines.push(`- ${path}`);
+  // Protected paths
+  const allProtectedPaths = [
+    ...(digest.protectedPaths?.defaultPatterns ?? []),
+    ...(digest.protectedPaths?.configurablePatterns ?? []),
+  ];
+  if (allProtectedPaths.length > 0) {
+    lines.push("### Protected Paths");
+    lines.push(`(${digest.protectedPaths?.enforcement === "hard_block" ? "Hard Block" : "Soft Warning"} — do not modify)`);
+    if (digest.protectedPaths?.defaultPatterns?.length) {
+      lines.push("Defaults:");
+      for (const path of digest.protectedPaths.defaultPatterns.slice(0, 10)) {
+        lines.push(`- ${path}`);
+      }
+    }
+    if (digest.protectedPaths?.configurablePatterns?.length) {
+      lines.push("Project Config:");
+      for (const path of digest.protectedPaths.configurablePatterns.slice(0, 10)) {
+        lines.push(`- ${path}`);
+      }
     }
     lines.push("");
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Build practical, role-aware collaboration hints for Claude Code sessions.
+ * Generates cross-role coordination signals that help agents avoid stepping on
+ * each other's toes and find natural collaboration points.
+ */
+function buildRoleAwarenessHints(digest: SwarmDigest): string[] {
+  const hints: string[] = [];
+  const byAgent = digest.claimedPathsSummary.byAgent;
+
+  // Collect agents working on same area by different roles
+  const areaAgents = new Map<string, { name: string; role: string | null; paths: string[] }[]>();
+  for (const entry of byAgent) {
+    const topPath = entry.paths[0] ?? "";
+    if (!topPath) continue;
+    // Use first path segment as area key
+    const areaKey = topPath.split("/")[0] || topPath;
+    if (!areaAgents.has(areaKey)) areaAgents.set(areaKey, []);
+    areaAgents.get(areaKey)!.push({ name: entry.agentName, role: entry.role, paths: entry.paths });
+  }
+
+  // Generate hints for areas with multi-role activity
+  for (const [area, agents] of areaAgents) {
+    const roles = agents.filter((a) => a.role).map((a) => a.role!);
+    const uniqueRoles = [...new Set(roles)];
+    if (uniqueRoles.length > 1) {
+      const agentNames = agents.map((a) => a.name).join(", ");
+      hints.push(
+        `**${area}/**: ${agentNames} are working here (${uniqueRoles.join(", ")}) — coordinate before merging shared changes`,
+      );
+    }
+  }
+
+  // Hint about ready-for-review handoffs
+  const readyForReview = digest.recentHandoffs.filter((h) => h.verificationStatus === "ready_for_review");
+  if (readyForReview.length > 0) {
+    hints.push(
+      `${readyForReview.length} handoff(s) ready for review — consider verifying before starting related work`,
+    );
+  }
+
+  // Hint about blocked handoffs
+  const blocked = digest.recentHandoffs.filter((h) => h.verificationStatus === "blocked");
+  if (blocked.length > 0) {
+    for (const h of blocked) {
+      if (h.blockers.length > 0) {
+        hints.push(`**${h.agentName}** is blocked on: ${h.blockers.slice(0, 2).join(", ")}`);
+      }
+    }
+  }
+
+  return hints.slice(0, 5); // Cap at 5 hints to keep digest manageable
 }
