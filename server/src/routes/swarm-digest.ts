@@ -41,14 +41,16 @@ export function swarmDigestRoutes(db: Db) {
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(and(...queuedConditions));
 
-    res.json({
+    const cockpitDigest: SwarmCockpitDigest = {
       ...digest,
       hotSlotUsage: {
         current: hotSlotCurrent,
         max: hotSlotMax,
       },
       queuedHotRunsCount: Number(queuedCount ?? 0),
-    });
+    };
+
+    res.json(cockpitDigest);
   });
 
   return router;

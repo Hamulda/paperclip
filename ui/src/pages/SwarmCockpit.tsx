@@ -26,48 +26,52 @@ import {
   Ban,
   Lightbulb,
   Star,
+  ClipboardCheck,
+  MessageSquare,
 } from "lucide-react";
 
-function SummaryStrip({ data }: { data: SwarmCockpitDigest }) {
-  const navigate = useNavigate();
+function SummaryStrip({ data, isFetching }: { data: SwarmCockpitDigest; isFetching: boolean }) {
+  const reviewNeededCount = data.reviewQueue?.readyForReview?.length ?? 0;
   const alerts = [
-    { count: data.fileClaimConflicts.length, label: "conflicts", urgent: true },
-    { count: data.runsStuck.length, label: "stuck", urgent: true },
-    { count: data.servicesDegraded.length, label: "degraded", urgent: true },
-    { count: data.fileClaimStale.filter(c => c.minutesUntilExpiry <= 1).length, label: "expiring", urgent: true },
-    { count: data.activeRuns.length, label: "active runs", urgent: false },
-    { count: data.activeAgents.length, label: "agents", urgent: false },
+    { count: data.fileClaimConflicts.length, label: "conflicts", urgent: true, href: "#conflicts" },
+    { count: data.runsStuck.length, label: "stuck", urgent: true, href: "#stuck-runs" },
+    { count: data.servicesDegraded.length, label: "degraded", urgent: true, href: "#degraded-services" },
+    { count: data.fileClaimStale.filter(c => c.minutesUntilExpiry <= 0).length, label: "expired", urgent: true, href: "#stale-claims" },
+    { count: reviewNeededCount, label: "review needed", urgent: true, href: "#review-queue" },
+    { count: data.fileClaimStale.filter(c => c.minutesUntilExpiry === 1).length, label: "expiring soon", urgent: false, href: "#stale-claims" },
+    { count: data.activeRuns.length, label: "active runs", urgent: false, href: "#active-runs" },
+    { count: data.activeAgents.length, label: "agents", urgent: false, href: "#active-agents" },
   ].filter(a => a.count > 0);
 
   return (
-    <div className="flex items-center gap-3 px-1 py-2 rounded-lg bg-muted/30 border border-border/50 text-xs">
-      <span className="text-muted-foreground font-medium shrink-0">Swarm</span>
-      <div className="flex items-center gap-1.5 flex-wrap">
-        {alerts.map(alert => (
-          <button
-            key={alert.label}
-            onClick={() => {
-              if (alert.label === "stuck") navigate("/issues/backlog");
-              else if (alert.label === "active runs") navigate("/issues/active");
-            }}
-            className={cn(
-              "inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium transition-colors",
-              alert.urgent
-                ? "bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20 cursor-pointer"
-                : "bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20 cursor-pointer"
-            )}
-          >
-            <span className="font-mono">{alert.count}</span>
-            <span> </span>
-            <span>{alert.label}</span>
-          </button>
-        ))}
-        {alerts.length === 0 && (
-          <span className="text-green-600 dark:text-green-400 font-medium">All clear</span>
-        )}
-      </div>
-      <div className="ml-auto shrink-0 text-muted-foreground">
-        {data.activeAgents.length} agents · {data.activeRuns.length} runs
+    <div className="sticky top-0 z-10 bg-background/80 backdrop-blur-md border-b border-border/50 px-1 py-2">
+      <div className="flex items-center gap-3">
+        <span className="text-muted-foreground font-medium shrink-0 text-sm">Swarm</span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {alerts.map(alert => (
+            <a
+              key={alert.label}
+              href={alert.href}
+              className={cn(
+                "inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium transition-colors text-xs no-underline hover:underline",
+                alert.urgent
+                  ? "bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/20"
+                  : "bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
+              )}
+            >
+              <span className="font-mono">{alert.count}</span>
+              <span> </span>
+              <span>{alert.label}</span>
+            </a>
+          ))}
+          {alerts.length === 0 && (
+            <span className="text-green-600 dark:text-green-400 font-medium text-sm">All clear</span>
+          )}
+        </div>
+        <div className="ml-auto shrink-0 text-xs text-muted-foreground flex items-center gap-2">
+          {isFetching && <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />}
+          <span>{data.activeAgents.length} agents · {data.activeRuns.length} runs</span>
+        </div>
       </div>
     </div>
   );
@@ -79,15 +83,17 @@ function SectionCard({
   children,
   className,
   alertCount,
+  id,
 }: {
   title: string;
   icon: React.ComponentType<{ className?: string }>;
   children: React.ReactNode;
   className?: string;
   alertCount?: number;
+  id?: string;
 }) {
   return (
-    <div className={cn("rounded-lg border bg-card p-4 shadow-sm", className)}>
+    <div id={id} className={cn("rounded-lg border bg-card p-4 shadow-sm", className)}>
       <div className="mb-3 flex items-center gap-2">
         <Icon className="h-4 w-4 text-muted-foreground" />
         <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
@@ -432,30 +438,92 @@ function LatestHandoffSummaryRow({ handoff }: { handoff: { agentName: string; sw
 }
 
 function FairnessSignal({ stuckRuns, activeRuns }: { stuckRuns: number; activeRuns: number }) {
-  const isHealthy = stuckRuns === 0 || activeRuns === 0;
-  const starvationRatio = activeRuns > 0 ? stuckRuns / activeRuns : 0;
+  const total = stuckRuns + activeRuns;
+  const starvationRatio = total > 0 ? stuckRuns / total : 0;
   const isStarving = starvationRatio >= 0.3 && stuckRuns > 0;
+  const isWarning = stuckRuns > 0 && !isStarving;
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
-          <Scale className={cn("h-4 w-4", isStarving ? "text-red-500" : "text-green-500")} />
+          <Scale className={cn("h-4 w-4", isStarving ? "text-red-500" : isWarning ? "text-amber-500" : "text-green-500")} />
           <span className="text-xs font-medium">Queue Health</span>
         </div>
         <span className={cn(
           "text-xs font-mono",
-          isStarving ? "text-red-500" : "text-green-500"
+          isStarving ? "text-red-500" : isWarning ? "text-amber-500" : "text-green-500"
         )}>
-          {isHealthy ? "Healthy" : `${stuckRuns}/${activeRuns + stuckRuns} queued`}
+          {stuckRuns === 0 ? "Healthy" : isStarving ? `High pressure` : `${stuckRuns}/${total} queued`}
         </span>
       </div>
       {isStarving && (
         <p className="text-xs text-red-500/80">
-          High queue pressure: {stuckRuns} run{stuckRuns !== 1 ? "s" : ""} waiting {" "}
-          {Math.round(starvationRatio * 100)}% of active capacity
+          {stuckRuns} run{stuckRuns !== 1 ? "s" : ""} waiting — {Math.round(starvationRatio * 100)}% of active capacity
         </p>
       )}
+      {isWarning && (
+        <p className="text-xs text-amber-500/80">
+          {stuckRuns} queued run{stuckRuns !== 1 ? "s" : ""} — monitor queue pressure
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ReviewQueueItem({ handoff }: { handoff: { agentName: string; swarmRole: string | null; issueIdentifier: string | null; summary: string; recommendedNextStep: string; emittedAt: string } }) {
+  return (
+    <div className="flex items-start gap-2 py-2 text-sm">
+      <ClipboardCheck className="h-4 w-4 shrink-0 text-blue-500 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className="font-medium text-xs">{handoff.agentName}</span>
+          {handoff.swarmRole && (
+            <span className="text-xs text-muted-foreground bg-muted px-1 py-0.5 rounded">
+              {handoff.swarmRole}
+            </span>
+          )}
+          {handoff.issueIdentifier && (
+            <span className="text-xs text-blue-500">[{handoff.issueIdentifier}]</span>
+          )}
+          <span className="text-xs text-muted-foreground ml-auto">
+            {new Date(handoff.emittedAt).toLocaleTimeString()}
+          </span>
+        </div>
+        <p className="text-xs truncate mt-0.5">{handoff.summary}</p>
+        <p className="text-xs text-blue-500 truncate mt-0.5">
+          Next: {handoff.recommendedNextStep}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function CollaborationHintRow({ hint }: { hint: { type: string; message: string; urgency: string; relatedIssue: string | null } }) {
+  const urgencyColors: Record<string, string> = {
+    high: "text-red-500 bg-red-500/10",
+    medium: "text-amber-500 bg-amber-500/10",
+    low: "text-green-500 bg-green-500/10",
+  };
+  const colorClass = urgencyColors[hint.urgency] ?? "text-muted bg-muted/50";
+  const typeIcons: Record<string, string> = {
+    role_coordination: "→",
+    review_needed: "✓",
+    blocked: "⚠️",
+    conflict_risk: "⚠️",
+  };
+  return (
+    <div className="flex items-start gap-2 py-1.5 text-sm">
+      <span className="text-xs shrink-0">{typeIcons[hint.type] ?? "•"}</span>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs">{hint.message}</p>
+        {hint.relatedIssue && (
+          <span className="text-xs text-blue-500 ml-1">[{hint.relatedIssue}]</span>
+        )}
+      </div>
+      <span className={cn("inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium shrink-0", colorClass)}>
+        {hint.urgency}
+      </span>
     </div>
   );
 }
@@ -473,7 +541,7 @@ export function SwarmCockpit() {
     setBreadcrumbs(crumbs);
   }, [setBreadcrumbs, projectId]);
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error } = useQuery({
     queryKey: queryKeys.swarmDigest(selectedCompanyId!, projectId),
     queryFn: () => swarmDigestApi.getCockpitDigest(selectedCompanyId!, projectId),
     enabled: !!selectedCompanyId,
@@ -508,12 +576,13 @@ export function SwarmCockpit() {
           <span>Project-scoped view</span>
         </div>
       )}
-      <SummaryStrip data={data} />
+      <SummaryStrip data={data} isFetching={isFetching} />
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {/* Critical — alerts first */}
         <SectionCard
           title="File Claim Conflicts"
           icon={AlertTriangle}
+          id="conflicts"
           className="md:col-span-2 lg:col-span-1"
           alertCount={data.fileClaimConflicts.length}
         >
@@ -531,6 +600,7 @@ export function SwarmCockpit() {
         <SectionCard
           title="Stuck Runs"
           icon={Clock}
+          id="stuck-runs"
           className="md:col-span-2 lg:col-span-1"
           alertCount={data.runsStuck.length}
         >
@@ -548,6 +618,7 @@ export function SwarmCockpit() {
         <SectionCard
           title="Failed/Degraded Services"
           icon={AlertCircle}
+          id="degraded-services"
           className="md:col-span-2 lg:col-span-1"
           alertCount={data.servicesDegraded.length}
         >
@@ -565,6 +636,7 @@ export function SwarmCockpit() {
         <SectionCard
           title="Stale Claims"
           icon={Clock}
+          id="stale-claims"
           className="md:col-span-2 lg:col-span-1"
           alertCount={data.fileClaimStale.filter(c => c.minutesUntilExpiry <= 1).length}
         >
@@ -589,7 +661,7 @@ export function SwarmCockpit() {
           )}
         </SectionCard>
 
-        <SectionCard title="Active Runs" icon={CircleDot} className="md:col-span-2 lg:col-span-1">
+        <SectionCard title="Active Runs" icon={CircleDot} id="active-runs" className="md:col-span-2 lg:col-span-1">
           {data.activeRuns.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 text-center">No active runs</p>
           ) : (
@@ -601,7 +673,7 @@ export function SwarmCockpit() {
           )}
         </SectionCard>
 
-        <SectionCard title="Active Agents" icon={Bot} className="md:col-span-2 lg:col-span-1">
+        <SectionCard title="Active Agents" icon={Bot} id="active-agents" className="md:col-span-2 lg:col-span-1">
           {data.activeAgents.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 text-center">No active agents</p>
           ) : (
@@ -644,6 +716,45 @@ export function SwarmCockpit() {
 
         <SectionCard title="Queue Fairness" icon={Scale} className="md:col-span-2 lg:col-span-1">
           <FairnessSignal stuckRuns={data.runsStuck.length} activeRuns={data.activeRuns.length} />
+        </SectionCard>
+
+        {/* Collaboration & Review */}
+        <SectionCard
+          title="Review Queue"
+          icon={ClipboardCheck}
+          id="review-queue"
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={(data.reviewQueue?.readyForReview?.length ?? 0) + (data.reviewQueue?.blocked?.length ?? 0)}
+        >
+          {!data.reviewQueue || (data.reviewQueue.readyForReview.length === 0 && data.reviewQueue.blocked.length === 0) ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No items need review</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.reviewQueue.blocked.slice(0, 5).map((handoff) => (
+                <ReviewQueueItem key={`blocked-${handoff.id}`} handoff={handoff} />
+              ))}
+              {data.reviewQueue.readyForReview.slice(0, 5).map((handoff) => (
+                <ReviewQueueItem key={`ready-${handoff.id}`} handoff={handoff} />
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Collaboration Hints"
+          icon={MessageSquare}
+          className="md:col-span-2 lg:col-span-1"
+          alertCount={data.collaborationHints?.filter(h => h.urgency === "high").length ?? 0}
+        >
+          {!data.collaborationHints || data.collaborationHints.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4 text-center">No active hints</p>
+          ) : (
+            <div className="divide-y divide-border max-h-64 overflow-y-auto">
+              {data.collaborationHints.slice(0, 8).map((hint, i) => (
+                <CollaborationHintRow key={i} hint={hint} />
+              ))}
+            </div>
+          )}
         </SectionCard>
 
         {/* Informational */}

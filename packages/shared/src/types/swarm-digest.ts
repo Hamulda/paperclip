@@ -155,10 +155,25 @@ export interface SwarmDigest {
   protectedPaths: SwarmDigestProtectedPaths;
 }
 
+export interface SwarmDigestReviewQueue {
+  readyForReview: SwarmDigestHandoff[];
+  needsVerification: SwarmDigestHandoff[];
+  blocked: SwarmDigestHandoff[];
+}
+
+export interface SwarmDigestCollaborationHint {
+  type: "role_coordination" | "review_needed" | "blocked" | "conflict_risk";
+  message: string;
+  urgency: "high" | "medium" | "low";
+  relatedIssue?: string | null;
+}
+
 export interface SwarmCockpitDigest extends SwarmDigest {
   hotSlotUsage: {
     current: number;
     max: number;
   };
   queuedHotRunsCount: number;
+  reviewQueue: SwarmDigestReviewQueue;
+  collaborationHints: SwarmDigestCollaborationHint[];
 }

@@ -6,9 +6,12 @@ import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
-import { parseSessionCompactionPolicy } from "./heartbeat.js";
+import {
+  hasSessionCompactionThresholds,
+  resolveSessionCompactionPolicy,
+  type SessionCompactionPolicy,
+} from "@paperclipai/adapter-utils";
 import { readRawUsageTotals, deriveNormalizedUsageDelta, type UsageTotals } from "./run-usage.js";
-import { hasSessionCompactionThresholds } from "@paperclipai/adapter-utils";
 import { formatCount } from "./run-usage.js";
 
 export type SessionCompactionDecision = {
@@ -126,6 +129,14 @@ export async function resolveNormalizedUsageForSession(
 }
 
 // ---------------------------------------------------------------------------
+// Session compaction policy parsing
+// ---------------------------------------------------------------------------
+
+export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
+  return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
+}
+
+// ---------------------------------------------------------------------------
 // Session compaction evaluation
 // ---------------------------------------------------------------------------
 
@@ -154,7 +165,7 @@ export async function evaluateSessionCompaction(
     };
   }
 
-  const policy = parseSessionCompactionPolicy(agent);
+  const policy = resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
   if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
     return {
       rotate: false,

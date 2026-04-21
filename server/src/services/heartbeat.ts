@@ -33,7 +33,8 @@ import { acquireClaims, refreshClaims, releaseClaims, listConflicts } from "./fi
 import { enrichRunContextWithSwarmState } from "./enrich-run-context.js";
 import { persistExecutionWorkspaceForRun } from "./persist-execution-workspace.js";
 import { finalizeIssueCommentPolicy as _finalizeIssueCommentPolicy, enqueueMissingIssueCommentRetry as _enqueueMissingIssueCommentRetry, patchRunIssueCommentStatus as _patchRunIssueCommentStatus, findRunIssueComment as _findRunIssueComment } from "./issue-comment-policy.js";
-import { evaluateSessionCompaction, resolveNormalizedUsageForSession, summarizeHeartbeatRunListResultJson, type SessionCompactionDecision } from "./session-compaction.js";
+import { evaluateSessionCompaction, parseSessionCompactionPolicy, resolveNormalizedUsageForSession, summarizeHeartbeatRunListResultJson, type SessionCompactionDecision } from "./session-compaction.js";
+import { getRuntimeState as _getRuntimeState, getTaskSession as _getTaskSession, resolveExplicitResumeSessionOverride as _resolveExplicitResumeSessionOverride, resolveSessionBeforeForWakeup as _resolveSessionBeforeForWakeup } from "./session-resolver.js";
 import {
   resolveExecutionRunAdapterConfig,
   extractMentionedSkillIdsFromSources,
@@ -133,7 +134,11 @@ import {
   SESSIONED_LOCAL_ADAPTERS,
   tryPromoteNextHotCodingRun as tryPromoteNextHotCodingRunShared,
 } from "./hot-run-governor.js";
-import { normalizeMaxConcurrentRuns } from "./run-claim-lifecycle.js";
+import {
+  normalizeMaxConcurrentRuns,
+  parseHeartbeatPolicy,
+  withAgentStartLock,
+} from "./run-claim-lifecycle.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -146,7 +151,6 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import {
   hasSessionCompactionThresholds,
-  resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 
@@ -154,7 +158,6 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const execFile = promisify(execFileCallback);
@@ -311,23 +314,6 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
 }
 
-async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
-  const previous = startLocksByAgent.get(agentId) ?? Promise.resolve();
-  const run = previous.then(fn);
-  const marker = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  startLocksByAgent.set(agentId, marker);
-  try {
-    return await run;
-  } finally {
-    if (startLocksByAgent.get(agentId) === marker) {
-      startLocksByAgent.delete(agentId);
-    }
-  }
-}
-
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -367,7 +353,7 @@ export function summarizeHeartbeatRunContextSnapshot(
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-export { summarizeHeartbeatRunListResultJson } from "./session-compaction.js";
+export { parseSessionCompactionPolicy, summarizeHeartbeatRunListResultJson } from "./session-compaction.js";
 
 function summarizeRunFailureForIssueComment(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined,
@@ -452,10 +438,6 @@ async function resolveLedgerScopeForRun(
     issueId: issue?.id ?? null,
     projectId: issue?.projectId ?? contextProjectId,
   };
-}
-
-export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
-  return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
 function parseIssueAssigneeAdapterOverrides(
@@ -559,34 +541,6 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
-      .select()
-      .from(agentRuntimeState)
-      .where(eq(agentRuntimeState.agentId, agentId))
-      .then((rows) => rows[0] ?? null);
-  }
-
-  async function getTaskSession(
-    companyId: string,
-    agentId: string,
-    adapterType: string,
-    taskKey: string,
-  ) {
-    return db
-      .select()
-      .from(agentTaskSessions)
-      .where(
-        and(
-          eq(agentTaskSessions.companyId, companyId),
-          eq(agentTaskSessions.agentId, agentId),
-          eq(agentTaskSessions.adapterType, adapterType),
-          eq(agentTaskSessions.taskKey, taskKey),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-  }
-
   async function getLatestRunForSession(
     agentId: string,
     sessionId: string,
@@ -622,83 +576,6 @@ export function heartbeatService(db: Db) {
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function resolveSessionBeforeForWakeup(
-    agent: typeof agents.$inferSelect,
-    taskKey: string | null,
-  ) {
-    if (taskKey) {
-      const codec = getAdapterSessionCodec(agent.adapterType);
-      const existingTaskSession = await getTaskSession(
-        agent.companyId,
-        agent.id,
-        agent.adapterType,
-        taskKey,
-      );
-      const parsedParams = normalizeSessionParams(
-        codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
-      );
-      return truncateDisplayId(
-        existingTaskSession?.sessionDisplayId ??
-          (codec.getDisplayId ? codec.getDisplayId(parsedParams) : null) ??
-          readNonEmptyString(parsedParams?.sessionId),
-      );
-    }
-
-    const runtimeForRun = await getRuntimeState(agent.id);
-    return runtimeForRun?.sessionId ?? null;
-  }
-
-  async function resolveExplicitResumeSessionOverride(
-    agent: typeof agents.$inferSelect,
-    payload: Record<string, unknown> | null,
-    taskKey: string | null,
-  ) {
-    const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
-    if (!resumeFromRunId) return null;
-
-    const resumeRun = await db
-      .select({
-        id: heartbeatRuns.id,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        sessionIdBefore: heartbeatRuns.sessionIdBefore,
-        sessionIdAfter: heartbeatRuns.sessionIdAfter,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.id, resumeFromRunId),
-          eq(heartbeatRuns.companyId, agent.companyId),
-          eq(heartbeatRuns.agentId, agent.id),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-    if (!resumeRun) return null;
-
-    const resumeContext = parseObject(resumeRun.contextSnapshot);
-    const resumeTaskKey = deriveTaskKey(resumeContext, null) ?? taskKey;
-    const resumeTaskSession = resumeTaskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
-      : null;
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
-    const sessionOverride = buildExplicitResumeSessionOverride({
-      resumeFromRunId,
-      resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
-      resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
-      taskSession: resumeTaskSession,
-      sessionCodec,
-    });
-    if (!sessionOverride) return null;
-
-    return {
-      resumeFromRunId,
-      taskKey: resumeTaskKey,
-      issueId: readNonEmptyString(resumeContext.issueId),
-      taskId: readNonEmptyString(resumeContext.taskId) ?? readNonEmptyString(resumeContext.issueId),
-      sessionDisplayId: sessionOverride.sessionDisplayId,
-      sessionParams: sessionOverride.sessionParams,
-    };
   }
 
   async function resolveWorkspaceForRun(
@@ -914,7 +791,8 @@ export function heartbeatService(db: Db) {
     lastRunId: string | null;
     lastError: string | null;
   }) {
-    const existing = await getTaskSession(
+    const existing = await _getTaskSession(
+      db,
       input.companyId,
       input.agentId,
       input.adapterType,
@@ -975,7 +853,7 @@ export function heartbeatService(db: Db) {
   }
 
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
-    const existing = await getRuntimeState(agent.id);
+    const existing = await _getRuntimeState(db, agent.id);
     if (existing) return existing;
 
     return db
@@ -1150,7 +1028,7 @@ export function heartbeatService(db: Db) {
     issueId: string,
   ) {
     const taskKey = deriveTaskKeyWithHeartbeatFallback(parseObject(run.contextSnapshot), null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const sessionBefore = await _resolveSessionBeforeForWakeup(db, agent, taskKey);
     return _enqueueMissingIssueCommentRetry(db, run, agent, issueId, sessionBefore);
   }
 
@@ -1159,7 +1037,7 @@ export function heartbeatService(db: Db) {
     agent: typeof agents.$inferSelect,
   ) {
     const taskKey = deriveTaskKeyWithHeartbeatFallback(parseObject(run.contextSnapshot), null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const sessionBefore = await _resolveSessionBeforeForWakeup(db, agent, taskKey);
     return _finalizeIssueCommentPolicy(db, run, agent, sessionBefore, {
       appendRunEvent: async (input) => appendRunEvent(input.run, input.seq, input.event),
       nextRunEventSeq,
@@ -1174,7 +1052,7 @@ export function heartbeatService(db: Db) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const sessionBefore = await _resolveSessionBeforeForWakeup(db, agent, taskKey);
     const retryContextSnapshot = {
       ...contextSnapshot,
       retryOfRunId: run.id,
@@ -1267,19 +1145,6 @@ export function heartbeatService(db: Db) {
     });
 
     return queued;
-  }
-
-  function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
-    const runtimeConfig = parseObject(agent.runtimeConfig);
-    const heartbeat = parseObject(runtimeConfig.heartbeat);
-
-    return {
-      enabled: asBoolean(heartbeat.enabled, false),
-      intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
-      wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
-      maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
-      maxHotCodingRuns: normalizeMaxConcurrentHotCodingRuns(heartbeat.maxHotCodingRuns),
-    };
   }
 
   async function countRunningRunsForAgent(agentId: string) {
@@ -2068,7 +1933,7 @@ export function heartbeatService(db: Db) {
       isolatedWorkspacesEnabled,
     );
     const taskSession = taskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+      ? await _getTaskSession(db, agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
@@ -2997,7 +2862,7 @@ export function heartbeatService(db: Db) {
 
         const sessionBefore =
           readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??
-          await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
+          await _resolveSessionBeforeForWakeup(db, deferredAgent, promotedTaskKey);
         const now = new Date();
         const newRun = await tx
           .insert(heartbeatRuns)
@@ -3088,7 +2953,7 @@ export function heartbeatService(db: Db) {
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
-    const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
+    const explicitResumeSession = await _resolveExplicitResumeSessionOverride(db, agent, payload, taskKey);
     if (explicitResumeSession) {
       enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
       enrichedContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
@@ -3107,7 +2972,7 @@ export function heartbeatService(db: Db) {
     const effectiveTaskKey = readNonEmptyString(enrichedContextSnapshot.taskKey) ?? taskKey;
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
-      await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
+      await _resolveSessionBeforeForWakeup(db, agent, effectiveTaskKey);
 
     const writeSkippedRequest = async (skipReason: string) => {
       await db.insert(agentWakeupRequests).values({
@@ -3832,7 +3697,7 @@ export function heartbeatService(db: Db) {
     getRunLogAccess,
 
     getRuntimeState: async (agentId: string) => {
-      const state = await getRuntimeState(agentId);
+      const state = await _getRuntimeState(db, agentId);
       const agent = await getAgent(agentId);
       if (!agent) return null;
       const ensured = state ?? (await ensureRuntimeState(agent));

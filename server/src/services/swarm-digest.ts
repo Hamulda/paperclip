@@ -35,6 +35,8 @@ import type {
   SwarmDigestRecommendedAvoidPaths,
   SwarmDigestAutoClaimSuggestion,
   SwarmDigestProtectedPaths,
+  SwarmDigestReviewQueue,
+  SwarmDigestCollaborationHint,
   VerificationStatus,
 } from "@paperclipai/shared";
 
@@ -80,7 +82,82 @@ function buildEmptyDigest(companyId: string, projectId: string | null): SwarmDig
       configurablePatterns: [],
       enforcement: "hard_block",
     },
+    reviewQueue: { readyForReview: [], needsVerification: [], blocked: [] },
+    collaborationHints: [],
+  } as SwarmDigest & { reviewQueue: SwarmDigestReviewQueue; collaborationHints: SwarmDigestCollaborationHint[] };
+}
+
+function buildReviewQueue(recentHandoffs: SwarmDigestHandoff[]): SwarmDigestReviewQueue {
+  return {
+    readyForReview: recentHandoffs.filter((h) => h.verificationStatus === "ready_for_review"),
+    needsVerification: recentHandoffs.filter((h) => h.verificationStatus === "needs_verification"),
+    blocked: recentHandoffs.filter((h) => h.verificationStatus === "blocked"),
   };
+}
+
+function buildCollaborationHints(digest: SwarmDigest): SwarmDigestCollaborationHint[] {
+  const hints: SwarmDigestCollaborationHint[] = [];
+
+  // Role coordination hints
+  const byAgent = digest.claimedPathsSummary.byAgent;
+  const areaAgents = new Map<string, { name: string; role: string | null; paths: string[] }[]>();
+  for (const entry of byAgent) {
+    const topPath = entry.paths[0] ?? "";
+    if (!topPath) continue;
+    const areaKey = topPath.split("/")[0] || topPath;
+    if (!areaAgents.has(areaKey)) areaAgents.set(areaKey, []);
+    areaAgents.get(areaKey)!.push({ name: entry.agentName, role: entry.role, paths: entry.paths });
+  }
+
+  for (const [area, agents] of areaAgents) {
+    const roles = agents.filter((a) => a.role).map((a) => a.role!);
+    const uniqueRoles = [...new Set(roles)];
+    if (uniqueRoles.length > 1) {
+      const agentNames = agents.map((a) => a.name).join(", ");
+      hints.push({
+        type: "role_coordination",
+        message: `${agentNames} are working on ${area}/ (${uniqueRoles.join(", ")}) — coordinate before merging shared changes`,
+        urgency: "medium",
+        relatedIssue: agents[0]?.paths[0] ?? null,
+      });
+    }
+  }
+
+  // Review-needed hints
+  const readyForReview = digest.recentHandoffs.filter((h) => h.verificationStatus === "ready_for_review");
+  for (const h of readyForReview) {
+    hints.push({
+      type: "review_needed",
+      message: `${h.agentName} is ready for review — verify before starting related work`,
+      urgency: "high",
+      relatedIssue: h.issueIdentifier ?? null,
+    });
+  }
+
+  // Blocked hints
+  const blocked = digest.recentHandoffs.filter((h) => h.verificationStatus === "blocked");
+  for (const h of blocked) {
+    if (h.blockers.length > 0) {
+      hints.push({
+        type: "blocked",
+        message: `${h.agentName} is blocked on: ${h.blockers.slice(0, 2).join(", ")}`,
+        urgency: "high",
+        relatedIssue: h.issueIdentifier ?? null,
+      });
+    }
+  }
+
+  // Conflict risk hints
+  for (const conflict of digest.fileClaimConflicts.slice(0, 3)) {
+    hints.push({
+      type: "conflict_risk",
+      message: `Path ${conflict.claimPath} has overlapping claims — resolve before merging`,
+      urgency: "high",
+      relatedIssue: null,
+    });
+  }
+
+  return hints.slice(0, 8);
 }
 
 export async function buildSwarmDigest(
@@ -91,7 +168,7 @@ export async function buildSwarmDigest(
     currentRunId?: string | null;
     currentAgentId?: string | null;
   },
-): Promise<SwarmDigest> {
+): Promise<SwarmDigest & { reviewQueue: SwarmDigestReviewQueue; collaborationHints: SwarmDigestCollaborationHint[] }> {
   const { companyId, projectId, currentRunId = null, currentAgentId = null } = input;
 
   if (!companyId) {
@@ -716,10 +793,16 @@ export async function buildSwarmDigest(
       configurablePatterns: [],
       enforcement: "hard_block",
     },
+    reviewQueue: buildReviewQueue(recentHandoffs),
+    collaborationHints: buildCollaborationHints({
+      claimedPathsSummary,
+      recentHandoffs,
+      fileClaimConflicts,
+    } as SwarmDigest),
   };
 }
 
-export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
+export function formatSwarmDigestForPrompt(digest: SwarmDigest & { collaborationHints?: SwarmDigestCollaborationHint[] }): string {
   const lines: string[] = [];
 
   lines.push("## Coding Swarm Status");
@@ -775,12 +858,12 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
     lines.push("");
   }
 
-  // Role-aware collaboration hints — cross-role coordination signals
-  const roleHints = buildRoleAwarenessHints(digest);
-  if (roleHints.length > 0) {
+  // Collaboration hints — actionable, urgency-tagged
+  if (digest.collaborationHints && digest.collaborationHints.length > 0) {
     lines.push("### Collaboration Hints");
-    for (const hint of roleHints) {
-      lines.push(`- ${hint}`);
+    for (const hint of digest.collaborationHints) {
+      const urgencyMarker = hint.urgency === "high" ? "⚠️ " : hint.urgency === "medium" ? "→ " : "  ";
+      lines.push(`${urgencyMarker}${hint.message}`);
     }
     lines.push("");
   }
@@ -866,57 +949,4 @@ export function formatSwarmDigestForPrompt(digest: SwarmDigest): string {
   }
 
   return lines.join("\n");
-}
-
-/**
- * Build practical, role-aware collaboration hints for Claude Code sessions.
- * Generates cross-role coordination signals that help agents avoid stepping on
- * each other's toes and find natural collaboration points.
- */
-function buildRoleAwarenessHints(digest: SwarmDigest): string[] {
-  const hints: string[] = [];
-  const byAgent = digest.claimedPathsSummary.byAgent;
-
-  // Collect agents working on same area by different roles
-  const areaAgents = new Map<string, { name: string; role: string | null; paths: string[] }[]>();
-  for (const entry of byAgent) {
-    const topPath = entry.paths[0] ?? "";
-    if (!topPath) continue;
-    // Use first path segment as area key
-    const areaKey = topPath.split("/")[0] || topPath;
-    if (!areaAgents.has(areaKey)) areaAgents.set(areaKey, []);
-    areaAgents.get(areaKey)!.push({ name: entry.agentName, role: entry.role, paths: entry.paths });
-  }
-
-  // Generate hints for areas with multi-role activity
-  for (const [area, agents] of areaAgents) {
-    const roles = agents.filter((a) => a.role).map((a) => a.role!);
-    const uniqueRoles = [...new Set(roles)];
-    if (uniqueRoles.length > 1) {
-      const agentNames = agents.map((a) => a.name).join(", ");
-      hints.push(
-        `**${area}/**: ${agentNames} are working here (${uniqueRoles.join(", ")}) — coordinate before merging shared changes`,
-      );
-    }
-  }
-
-  // Hint about ready-for-review handoffs
-  const readyForReview = digest.recentHandoffs.filter((h) => h.verificationStatus === "ready_for_review");
-  if (readyForReview.length > 0) {
-    hints.push(
-      `${readyForReview.length} handoff(s) ready for review — consider verifying before starting related work`,
-    );
-  }
-
-  // Hint about blocked handoffs
-  const blocked = digest.recentHandoffs.filter((h) => h.verificationStatus === "blocked");
-  if (blocked.length > 0) {
-    for (const h of blocked) {
-      if (h.blockers.length > 0) {
-        hints.push(`**${h.agentName}** is blocked on: ${h.blockers.slice(0, 2).join(", ")}`);
-      }
-    }
-  }
-
-  return hints.slice(0, 5); // Cap at 5 hints to keep digest manageable
 }

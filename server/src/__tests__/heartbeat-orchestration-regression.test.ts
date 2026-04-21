@@ -18,15 +18,19 @@ import {
 import { normalizeMaxConcurrentRuns } from "../services/run-claim-lifecycle.ts";
 
 // =============================================================================
-// Regression test 1: session-compaction module works after parseSessionCompactionPolicy
-// import fix. Previously session-compaction.ts line 9 had:
-//   import { parseSessionCompactionPolicy } from "./runtime-config-builder.js";
-// which would cause TS2305 at runtime because the function is exported from
-// heartbeat.ts, not runtime-config-builder.ts.
+// Regression test 1: session-compaction module has no backward dependency on
+// heartbeat.ts. Previously session-compaction.ts line 9 had:
+//   import { parseSessionCompactionPolicy } from "./heartbeat.js";
+// creating a backward dependency cycle.
+//
+// Fix: parseSessionCompactionPolicy is now defined locally in session-compaction.ts
+// (calling adapter-utils directly). heartbeat.ts re-exports it from session-compaction.ts
+// for backward compatibility with external callers.
 //
 // We verify the fix works by:
 // 1. Testing evaluateSessionCompaction() returns correct shape with a mock
-// 2. Verifying source code has correct import
+// 2. Verifying session-compaction.ts has no import from heartbeat.ts
+// 3. Verifying heartbeat.ts re-exports parseSessionCompactionPolicy from session-compaction.ts
 // =============================================================================
 describe("session-compaction module import fix verification", () => {
   it("evaluateSessionCompaction returns rotate=false when sessionId is null (verifies import fix)", async () => {
@@ -52,20 +56,34 @@ describe("session-compaction module import fix verification", () => {
     expect(result.handoffMarkdown).toBeNull();
   });
 
-  it("session-compaction.ts imports parseSessionCompactionPolicy from heartbeat.ts (source check)", () => {
-    // Verify the import was fixed from runtime-config-builder to heartbeat
+  it("session-compaction.ts does NOT import parseSessionCompactionPolicy from heartbeat.ts (source check)", () => {
+    // The backward dependency was: session-compaction.ts -> heartbeat.ts
+    // Fix: parseSessionCompactionPolicy is now defined locally in session-compaction.ts
+    // and heartbeat.ts re-exports it from session-compaction.ts.
+    // session-compaction.ts should NOT import from heartbeat.ts anymore.
     const fs = require("fs");
     const source = fs.readFileSync(
       "/Users/vojtechhamada/paperclip/server/src/services/session-compaction.ts",
       "utf8",
     );
 
-    // The broken import was:
-    //   import { parseSessionCompactionPolicy } from "./runtime-config-builder.js";
-    // The fixed import should be:
-    //   import { parseSessionCompactionPolicy } from "./heartbeat.js";
-    expect(source).toContain('from "./heartbeat.js"');
-    expect(source).not.toContain('from "./runtime-config-builder.js"');
+    // session-compaction.ts should NOT import anything from heartbeat.js
+    expect(source).not.toContain('from "./heartbeat.js"');
+    // session-compaction.ts should have its own parseSessionCompactionPolicy
+    expect(source).toMatch(/export function parseSessionCompactionPolicy/);
+  });
+
+  it("heartbeat.ts re-exports parseSessionCompactionPolicy from session-compaction.ts (source check)", () => {
+    // heartbeat.ts now re-exports parseSessionCompactionPolicy from session-compaction.ts
+    // to maintain backward compatibility for external callers (tests, etc.)
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // heartbeat.ts imports parseSessionCompactionPolicy from session-compaction.ts
+    expect(source).toMatch(/import\s*\{[^}]*parseSessionCompactionPolicy[^}]*\}\s*from\s*"\.\/session-compaction\.js"/);
   });
 });
 
@@ -294,19 +312,216 @@ describe("normalizeMaxConcurrentRuns canonical source verification", () => {
 });
 
 // =============================================================================
-// Regression test 6: HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT/MAX constants are
-// now consumed from run-claim-lifecycle.ts. heartbeat.ts should NOT redeclare them.
+// Regression test 7: withAgentStartLock and startLocksByAgent are a single
+// canonical copy in run-claim-lifecycle.ts. heartbeat.ts previously had its own
+// private copy at lines ~314-329, creating a split-brain lock namespace where
+// startNextQueuedRunForAgent used a different Map than callers importing from
+// run-claim-lifecycle.
+//
+// The fix: heartbeat.ts now imports withAgentStartLock from run-claim-lifecycle.
+// We verify:
+// 1. heartbeat.ts does NOT have a private startLocksByAgent Map
+// 2. heartbeat.ts does NOT have a private withAgentStartLock function
+// 3. heartbeat.ts imports withAgentStartLock from run-claim-lifecycle.js
 // =============================================================================
-describe("HEARTBEAT_MAX_CONCURRENT_RUNS constants canonical source", () => {
-  it("heartbeat.ts does NOT redeclare HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT/MAX constants", () => {
+describe("withAgentStartLock canonical source verification", () => {
+  it("heartbeat.ts does NOT have a private startLocksByAgent Map", () => {
     const fs = require("fs");
     const source = fs.readFileSync(
       "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
       "utf8",
     );
 
-    // These constants should only exist in run-claim-lifecycle.ts
-    expect(source).not.toContain("HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT");
-    expect(source).not.toContain("HEARTBEAT_MAX_CONCURRENT_RUNS_MAX");
+    // The old private copy pattern was:
+    //   const startLocksByAgent = new Map<string, Promise<void>>();
+    const privateMapRe = /^const startLocksByAgent\s*=\s*new\s+Map/m;
+    expect(source).not.toMatch(privateMapRe);
+  });
+
+  it("heartbeat.ts does NOT have a private withAgentStartLock function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // The old private copy was an async function:
+    //   async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
+    const privateFnRe = /^async function withAgentStartLock/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts imports withAgentStartLock from run-claim-lifecycle.js", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    expect(source).toMatch(
+      /import\s*\{[^}]*withAgentStartLock[^}]*\}\s*from\s*"\.\/run-claim-lifecycle\.js"/,
+    );
+  });
+});
+
+// =============================================================================
+// Regression test 8: parseHeartbeatPolicy is a single canonical copy in
+// run-claim-lifecycle.ts. heartbeat.ts previously had its own private copy at
+// line ~1258, creating a split-brain risk where the two implementations could
+// drift.
+//
+// The fix: parseHeartbeatPolicy is now only in run-claim-lifecycle.ts.
+// heartbeat.ts imports it from there and has no private copy.
+// We verify:
+// 1. heartbeat.ts does NOT have a private parseHeartbeatPolicy function
+// 2. heartbeat.ts imports parseHeartbeatPolicy from run-claim-lifecycle.js
+// 3. run-claim-lifecycle.ts does NOT use dynamic require()
+// =============================================================================
+describe("parseHeartbeatPolicy canonical source verification", () => {
+  it("heartbeat.ts does NOT have a private parseHeartbeatPolicy function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    const privateFnRe = /^  function parseHeartbeatPolicy/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts imports parseHeartbeatPolicy from run-claim-lifecycle.js", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    expect(source).toMatch(
+      /import\s*\{[^}]*parseHeartbeatPolicy[^}]*\}\s*from\s*"\.\/run-claim-lifecycle\.js"/,
+    );
+  });
+
+  it("run-claim-lifecycle.ts parseHeartbeatPolicy does NOT use dynamic require", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/run-claim-lifecycle.ts",
+      "utf8",
+    );
+
+    // The old pattern was: const { parseObject, asBoolean } = require("../adapters/utils.js");
+    expect(source).not.toMatch(/require\s*\(\s*["']\.\.\/adapters\/utils\.js["']\s*\)/);
+  });
+});
+
+// =============================================================================
+// Regression test 9: session-resolver.ts is the canonical source for session
+// resolution functions. heartbeat.ts previously had private copies of:
+// - getTaskSession
+// - getRuntimeState
+// - resolveSessionBeforeForWakeup
+// - resolveExplicitResumeSessionOverride
+// causing split-brain behavior when external callers used run-claim-lifecycle
+// which imported from session-state-manager but heartbeat had its own copies.
+//
+// The fix: all four functions are now in session-resolver.ts with db as explicit
+// first parameter. heartbeat.ts imports from session-resolver.ts.
+// We verify:
+// 1. heartbeat.ts does NOT have private getTaskSession or getRuntimeState
+// 2. heartbeat.ts imports the four functions from session-resolver.ts
+// 3. session-resolver.ts exports all four functions
+// 4. session-compaction.ts does NOT import anything from heartbeat.ts
+// =============================================================================
+describe("session-resolver canonical source verification", () => {
+  it("heartbeat.ts does NOT have a private getTaskSession function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // The old private copy pattern was:
+    //   async function getTaskSession(
+    const privateFnRe = /^  async function getTaskSession/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts does NOT have a private getRuntimeState function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    // The old private copy pattern was:
+    //   async function getRuntimeState(
+    const privateFnRe = /^  async function getRuntimeState/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts does NOT have a private resolveSessionBeforeForWakeup function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    const privateFnRe = /^  async function resolveSessionBeforeForWakeup/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts does NOT have a private resolveExplicitResumeSessionOverride function", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    const privateFnRe = /^  async function resolveExplicitResumeSessionOverride/m;
+    expect(source).not.toMatch(privateFnRe);
+  });
+
+  it("heartbeat.ts imports session resolution functions from session-resolver.js", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/heartbeat.ts",
+      "utf8",
+    );
+
+    expect(source).toMatch(
+      /import\s*\{[^}]*getTaskSession[^}]*\}\s*from\s*"\.\/session-resolver\.js"/,
+    );
+    expect(source).toMatch(
+      /import\s*\{[^}]*getRuntimeState[^}]*\}\s*from\s*"\.\/session-resolver\.js"/,
+    );
+    expect(source).toMatch(
+      /import\s*\{[^}]*resolveSessionBeforeForWakeup[^}]*\}\s*from\s*"\.\/session-resolver\.js"/,
+    );
+    expect(source).toMatch(
+      /import\s*\{[^}]*resolveExplicitResumeSessionOverride[^}]*\}\s*from\s*"\.\/session-resolver\.js"/,
+    );
+  });
+
+  it("session-resolver.ts exports all four session resolution functions", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/session-resolver.ts",
+      "utf8",
+    );
+
+    expect(source).toMatch(/export async function getTaskSession/);
+    expect(source).toMatch(/export async function getRuntimeState/);
+    expect(source).toMatch(/export async function resolveSessionBeforeForWakeup/);
+    expect(source).toMatch(/export async function resolveExplicitResumeSessionOverride/);
+  });
+
+  it("session-resolver.ts does NOT import from heartbeat.ts (no reverse dependency)", () => {
+    const fs = require("fs");
+    const source = fs.readFileSync(
+      "/Users/vojtechhamada/paperclip/server/src/services/session-resolver.ts",
+      "utf8",
+    );
+
+    expect(source).not.toContain('from "./heartbeat.js"');
+    expect(source).not.toContain('from "../services/heartbeat.js"');
   });
 });

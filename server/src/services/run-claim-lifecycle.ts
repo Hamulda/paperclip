@@ -2,7 +2,7 @@
 // Run Claim Lifecycle — Run claiming, concurrency limits, per-agent locking
 // =============================================================================
 
-import { asNumber } from "../adapters/utils.js";
+import { asNumber, asBoolean, parseObject } from "../adapters/utils.js";
 import type { agents } from "@paperclipai/db";
 import { normalizeMaxConcurrentHotCodingRuns } from "./hot-run-governor.js";
 
@@ -51,9 +51,6 @@ export async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T
 // ---------------------------------------------------------------------------
 
 export function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
-  // Dynamic import to avoid circular dependency at module load time
-  const { parseObject, asBoolean } = require("../adapters/utils.js");
-
   const runtimeConfig = parseObject(agent.runtimeConfig);
   const heartbeat = parseObject(runtimeConfig.heartbeat);
 
