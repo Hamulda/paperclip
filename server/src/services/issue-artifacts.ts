@@ -277,10 +277,11 @@ export function issueArtifactService(db: Db) {
 
     /**
      * Atomically supersedes all published artifacts of the same type for an issue
-     * and records the supersession chain.
+     * and records the supersession chain bidirectionally.
      *
-     * supersededBy is set by the REPLACER (new artifact) when it inserts —
-     * this function only marks them as superseded.
+     * supersededBy is set on each old artifact pointing to the NEXT artifact in the chain.
+     * When called standalone (not from replace()), no single "next artifact" exists —
+     * in that case supersededBy is left null and only the status is updated.
      *
      * Returns the newly superseded artifacts' ids.
      */
@@ -395,8 +396,9 @@ export type { IssueArtifactRow };
  * Uses dynamic import to avoid circular dependency between
  * issue-artifacts.ts and swarm-orchestrator.ts.
  *
- * Fail-closed: orchestration failures are surfaced so the caller can retry.
- * Only circular-import not-yet-resolvable cases are skipped silently.
+ * Fail-closed: orchestration errors propagate to the caller so the
+ * artifact publication can be retried atomically. Only module-not-resolvable
+ * cases (fresh process before swarm-orchestrator is initialised) are skipped silently.
  */
 async function triggerOrchestration(
   db: Db,

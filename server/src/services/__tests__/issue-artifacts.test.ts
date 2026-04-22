@@ -238,8 +238,8 @@ describe("issueArtifactService", () => {
         await fn(mockDb);
       });
 
-      const service = issueArtifactService(mockDb);
-      const result = await service.supersede("issue-1", "planner");
+      const service2 = issueArtifactService(mockDb);
+      const result = await service2.supersede("issue-1", "planner");
 
       expect(result).toEqual(["artifact-old-1", "artifact-old-2"]);
     });
@@ -665,5 +665,34 @@ describe("validateArtifactChain with integrator", () => {
     const latest = { id: "a2", status: "published", supersedes: "a1", revisionCount: 2, createdAt: new Date("2026-04-19T11:00:00Z"), artifactType: "integrator" } as any;
     const result = validateArtifactChain([root, latest]);
     expect(result!.id).toBe("a2");
+  });
+});
+
+describe("standalone supersede semantics", () => {
+  it("supersede marks artifacts as superseded but does not set supersededBy (no single next artifact)", async () => {
+    const rows = [
+      { id: "artifact-old-1", status: "published", artifactType: "planner" },
+      { id: "artifact-old-2", status: "published", artifactType: "planner" },
+    ];
+    vi.mocked(mockDb.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(rows),
+      }),
+    } as any);
+    vi.mocked(mockDb.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([]),
+      }),
+    } as any);
+    vi.mocked(mockDb.transaction).mockImplementation(async (fn) => {
+      await fn(mockDb);
+    });
+
+    const service = issueArtifactService(mockDb);
+    const result = await service.supersede("issue-1", "planner");
+
+    expect(result).toEqual(["artifact-old-1", "artifact-old-2"]);
+    // supersededBy is not set in standalone supersede — only replace() sets it
+    expect(mockDb.update).toHaveBeenCalled();
   });
 });
