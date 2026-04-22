@@ -65,6 +65,7 @@ interface IssueTracking {
   bounces: number; // consecutive bounce transitions
   reworksByPhase: Partial<Record<IssuePhase, number>>;
   lastWasBounce: boolean; // true if the previous recordTransition call was a bounce
+  prevFromPhase: IssuePhase | null; // the fromPhase of the previous transition
 }
 
 // Module-level tracking store — resets on process restart (intentional: short-lived env)
@@ -76,7 +77,7 @@ export function clearTracking(issueId: string): void {
 
 export function getTracking(issueId: string): IssueTracking {
   if (!tracking.has(issueId)) {
-    tracking.set(issueId, { phaseHistory: [], bounces: 0, reworksByPhase: {}, lastWasBounce: false });
+    tracking.set(issueId, { phaseHistory: [], bounces: 0, reworksByPhase: {}, lastWasBounce: false, prevFromPhase: null });
   }
   return tracking.get(issueId)!;
 }
@@ -134,14 +135,18 @@ function recordTransition(
   // But for the first backward move from a cold state, t.prevFromPhase is null
   // so we must fall back to phase-order comparison: plan_review(2) → planning(1)
   // IS a bounce (order decreases) even though prevFromPhase is null.
-  const isBounce = (!isForward && t.lastWasBounce)
-    || (!isForward && t.phaseHistory.length <= 1);
+  const isBounce = !isForward && (
+    t.lastWasBounce ||
+    toPhase === t.prevFromPhase ||
+    (t.prevFromPhase === null && toPhaseOrder(toPhase) <= toPhaseOrder(fromPhase))
+  );
   t.phaseHistory.push(toPhase);
   if (isBounce) {
     t.bounces += 1; // consecutive bounces accumulate
   } else {
     t.bounces = 0; // any non-bounce resets the counter
   }
+  t.prevFromPhase = fromPhase;
   t.lastWasBounce = isBounce;
   return t.bounces;
 }
