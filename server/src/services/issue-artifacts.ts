@@ -10,7 +10,8 @@ import type {
 } from "@paperclipai/shared";
 import type { CreateIssueArtifact } from "@paperclipai/shared";
 import { createIssueArtifactSchema } from "@paperclipai/shared";
-import { PHASE_FOR_ARTIFACT_TYPE } from "@paperclipai/db";
+import { PHASE_FOR_ARTIFACT_TYPE, ARTIFACT_TYPE_FOR_PHASE } from "@paperclipai/db";
+import type { OrchestrationDecision } from "./swarm-orchestrator.js";
 
 type IssueArtifactRow = typeof issueArtifacts.$inferSelect;
 
@@ -45,6 +46,59 @@ export function assertArtifactTypeForPhase(
       `Artifact type '${artifactType}' is not valid in phase '${phase}' — expected '${expected}'`,
     );
   }
+}
+
+/**
+ * Returns the artifact type required to advance from a given phase.
+ * Throws if the phase has no defined artifact type (e.g., terminal phases).
+ */
+export function getArtifactTypeForPhase(phase: IssuePhase): ArtifactType {
+  const type = ARTIFACT_TYPE_FOR_PHASE[phase];
+  if (!type) {
+    throw new Error(
+      `No artifact type defined for phase '${phase}' — phase may be terminal or not workflow-driven`,
+    );
+  }
+  return type as ArtifactType;
+}
+
+/**
+ * Canonical publish contract for a role publishing a workflow artifact.
+ *
+ * Each role MUST call this (or equivalent replace()) with the correct phase
+ * and artifact type to advance the workflow. The function:
+ *   1. Validates phase ↔ artifact type compatibility
+ *   2. Atomically supersedes any previous published artifact of the same type
+ *   3. Creates the new published artifact
+ *   4. Triggers orchestration to drive the next phase transition
+ *
+ * @param db           - Database instance
+ * @param companyId    - Company context
+ * @param phase        - The issue's current phase (MUST match the role's phase)
+ * @param artifactType - One of: planner | plan_reviewer | executor | reviewer | integrator
+ * @param metadata     - The structured artifact metadata for this role (must include issueId)
+ * @param actorAgentId - Agent publishing the artifact (optional)
+ * @param summary      - Human-readable summary (optional)
+ */
+export async function publishArtifactForPhase(
+  db: Db,
+  companyId: string,
+  phase: IssuePhase,
+  artifactType: ArtifactType,
+  metadata: Record<string, unknown>,
+  actorAgentId?: string | null,
+  summary?: string | null,
+): Promise<IssueArtifact | null> {
+  assertArtifactTypeForPhase(artifactType, phase);
+  return issueArtifactService(db).replace(
+    companyId,
+    phase,
+    (metadata["issueId"] as string) ?? "",
+    artifactType,
+    metadata,
+    actorAgentId,
+    summary,
+  );
 }
 
 /**
@@ -195,6 +249,12 @@ export function issueArtifactService(db: Db) {
         })
         .returning()
         .then((rows) => rows[0]!);
+
+      // Trigger orchestration after artifact is published
+      if (row.status === "published") {
+        await triggerOrchestration(db, parsed.issueId);
+      }
+
       return toIssueArtifact(row);
     },
 
@@ -301,6 +361,9 @@ export function issueArtifactService(db: Db) {
           .where(eq(issueArtifacts.id, current.id));
       }
 
+      // Trigger orchestration after artifact is published
+      await triggerOrchestration(db, issueId);
+
       return toIssueArtifact(newRow);
     },
   };
@@ -308,3 +371,23 @@ export function issueArtifactService(db: Db) {
 
 export { toIssueArtifact };
 export type { IssueArtifactRow };
+
+/**
+ * Lazy-呼び出し: orchestrateIssue after artifact creation.
+ * Uses dynamic import to avoid circular dependency between
+ * issue-artifacts.ts and swarm-orchestrator.ts.
+ */
+async function triggerOrchestration(
+  db: Db,
+  issueId: string,
+): Promise<OrchestrationDecision | null> {
+  try {
+    const { orchestrateIssue } = await import("./swarm-orchestrator.js");
+    return await orchestrateIssue(db, issueId);
+  } catch {
+    // If orchestration fails (e.g., circular import not yet resolvable),
+    // fail silently — artifact is already saved, orchestration can be
+    // retried by a subsequent artifact publish or manual trigger.
+    return null;
+  }
+}

@@ -147,6 +147,15 @@ export const ISSUE_PHASE_LABELS: Record<IssuePhase, string> = {
   blocked: "Blocked",
 };
 
+/** Reverse mapping: phase → artifact type required to advance from that phase */
+export const ARTIFACT_TYPE_FOR_PHASE: Record<IssuePhase, string> = {
+  planning: "planner",
+  plan_review: "plan_reviewer",
+  executing: "executor",
+  code_review: "reviewer",
+  integration: "integrator",
+};
+
 export const INBOX_MINE_ISSUE_STATUSES = [
   "backlog",
   "todo",

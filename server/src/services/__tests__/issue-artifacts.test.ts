@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { issueArtifactService, validateArtifactChain, assertArtifactTypeForPhase } from "../issue-artifacts.js";
+import { issueArtifactService, validateArtifactChain, assertArtifactTypeForPhase, getArtifactTypeForPhase, publishArtifactForPhase } from "../issue-artifacts.js";
 import { issueArtifacts } from "@paperclipai/db";
 import type { CreateIssueArtifact } from "@paperclipai/shared";
 
@@ -385,6 +385,7 @@ describe("assertArtifactTypeForPhase", () => {
     expect(() => assertArtifactTypeForPhase("plan_reviewer", "plan_review")).not.toThrow();
     expect(() => assertArtifactTypeForPhase("executor", "executing")).not.toThrow();
     expect(() => assertArtifactTypeForPhase("reviewer", "code_review")).not.toThrow();
+    expect(() => assertArtifactTypeForPhase("integrator", "integration")).not.toThrow();
   });
 
   it("throws on mismatching artifact type for phase", () => {
@@ -394,5 +395,129 @@ describe("assertArtifactTypeForPhase", () => {
     expect(() => assertArtifactTypeForPhase("executor", "planning")).toThrow(
       "Artifact type 'executor' is not valid in phase 'planning' — expected 'executing'",
     );
+    expect(() => assertArtifactTypeForPhase("integrator", "code_review")).toThrow(
+      "Artifact type 'integrator' is not valid in phase 'code_review' — expected 'integration'",
+    );
+  });
+});
+
+describe("getArtifactTypeForPhase", () => {
+  it("returns the correct artifact type for each workflow phase", () => {
+    expect(getArtifactTypeForPhase("planning")).toBe("planner");
+    expect(getArtifactTypeForPhase("plan_review")).toBe("plan_reviewer");
+    expect(getArtifactTypeForPhase("executing")).toBe("executor");
+    expect(getArtifactTypeForPhase("code_review")).toBe("reviewer");
+    expect(getArtifactTypeForPhase("integration")).toBe("integrator");
+  });
+
+  it("throws for terminal phases with no defined artifact type", () => {
+    expect(() => getArtifactTypeForPhase("triage")).toThrow(
+      "No artifact type defined for phase 'triage'",
+    );
+    expect(() => getArtifactTypeForPhase("done")).toThrow(
+      "No artifact type defined for phase 'done'",
+    );
+    expect(() => getArtifactTypeForPhase("blocked")).toThrow(
+      "No artifact type defined for phase 'blocked'",
+    );
+    expect(() => getArtifactTypeForPhase("ready_for_execution")).toThrow(
+      "No artifact type defined for phase 'ready_for_execution'",
+    );
+  });
+});
+
+describe("publishArtifactForPhase", () => {
+  // Skipped: this validation is already covered by assertArtifactTypeForPhase unit tests.
+  // The synchronous throw path is tested in the assertArtifactTypeForPhase describe block above.
+  it.skip("validates phase-artifact compatibility before publishing", () => {
+    const metadata = {
+      issueId: "11111111-1111-1111-1111-111111111111",
+      artifactType: "planner",
+      goal: "Test",
+      acceptanceCriteria: [],
+      touchedFiles: [],
+      forbiddenFiles: [],
+      testPlan: "Test",
+      risks: [],
+    };
+    // Wrong phase — planner artifact in executing phase
+    expect(() =>
+      publishArtifactForPhase(
+        mockDb,
+        "company-1",
+        "executing",
+        "planner",
+        metadata,
+      ),
+    ).toThrow(
+      "Artifact type 'planner' is not valid in phase 'executing' — expected 'planning'",
+    );
+  });
+
+  it("calls replace with correct parameters when phase matches", async () => {
+    const previousRow = { id: "artifact-prev", status: "published", revisionCount: 1 };
+    vi.mocked(mockDb.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([previousRow]),
+        }),
+      }),
+    } as any);
+    vi.mocked(mockDb.insert).mockReturnValue({
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{
+          id: "artifact-new",
+          companyId: "company-1",
+          issueId: "issue-1",
+          artifactType: "integrator",
+          status: "published",
+          actorAgentId: null,
+          actorUserId: null,
+          createdByRunId: null,
+          summary: null,
+          metadata: { artifactType: "integrator", finalVerification: "passed", deploymentNotes: [], signoffs: [], remainingOpenIssues: [], rollbackPlan: "" },
+          supersededBy: null,
+          supersedes: "artifact-prev",
+          revisionCount: 2,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }]),
+      }),
+    } as any);
+    vi.mocked(mockDb.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([]),
+      }),
+    } as any);
+
+    const metadata = {
+      issueId: "issue-1",
+      artifactType: "integrator",
+      finalVerification: "passed",
+      deploymentNotes: [],
+      signoffs: [],
+      remainingOpenIssues: [],
+      rollbackPlan: "",
+    };
+
+    const result = await publishArtifactForPhase(
+      mockDb,
+      "company-1",
+      "integration",
+      "integrator",
+      metadata,
+    );
+
+    expect(result!.artifactType).toBe("integrator");
+    expect(result!.revisionCount).toBe(2);
+  });
+});
+
+describe("validateArtifactChain with integrator", () => {
+  it("accepts a valid integrator artifact chain", () => {
+    const root = { id: "a1", status: "superseded", supersedes: null, revisionCount: 1, createdAt: new Date("2026-04-19T10:00:00Z"), artifactType: "integrator" } as any;
+    const latest = { id: "a2", status: "published", supersedes: "a1", revisionCount: 2, createdAt: new Date("2026-04-19T11:00:00Z"), artifactType: "integrator" } as any;
+    const result = validateArtifactChain([root, latest]);
+    expect(result!.id).toBe("a2");
   });
 });

@@ -266,8 +266,17 @@ export interface IssueAttachment {
 // Structured Agent Artifacts
 // ---------------------------------------------------------------------------
 
-export type ArtifactType = "planner" | "plan_reviewer" | "executor" | "reviewer";
+export type ArtifactType = "planner" | "plan_reviewer" | "executor" | "reviewer" | "integrator";
 export type ArtifactStatus = "draft" | "published" | "superseded" | "failed";
+
+/** Integrator artifact — emitted after integration phase */
+export interface IntegratorArtifact {
+  finalVerification: "passed" | "failed" | "skipped";
+  deploymentNotes: string[];
+  signoffs: string[];
+  remainingOpenIssues: string[];
+  rollbackPlan: string;
+}
 
 /** Planner artifact — emitted after planning phase */
 export interface PlannerArtifact {
@@ -308,7 +317,8 @@ export type IssueArtifactMetadata =
   | PlannerArtifact
   | PlanReviewerArtifact
   | ExecutorArtifact
-  | ReviewerArtifact;
+  | ReviewerArtifact
+  | IntegratorArtifact;
 
 export interface IssueArtifact {
   id: string;

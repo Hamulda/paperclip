@@ -35,18 +35,28 @@ const reviewerArtifactSchema = z.object({
   mergeReadiness: z.enum(["ready", "blocked", "conditional"]),
 });
 
+const integratorArtifactSchema = z.object({
+  artifactType: z.literal("integrator"),
+  finalVerification: z.enum(["passed", "failed", "skipped"]),
+  deploymentNotes: z.array(z.string()).default([]),
+  signoffs: z.array(z.string()).default([]),
+  remainingOpenIssues: z.array(z.string()).default([]),
+  rollbackPlan: z.string(),
+});
+
 export const artifactMetadataSchema = z.discriminatedUnion("artifactType", [
   plannerArtifactSchema,
   planReviewerArtifactSchema,
   executorArtifactSchema,
   reviewerArtifactSchema,
+  integratorArtifactSchema,
 ]);
 
 export type ArtifactMetadata = z.infer<typeof artifactMetadataSchema>;
 
 export const createIssueArtifactSchema = z.object({
   issueId: z.string().uuid(),
-  artifactType: z.enum(["planner", "plan_reviewer", "executor", "reviewer"]),
+  artifactType: z.enum(["planner", "plan_reviewer", "executor", "reviewer", "integrator"]),
   status: z.enum(["draft", "published", "superseded", "failed"]).optional().default("published"),
   actorAgentId: z.string().uuid().optional().nullable(),
   actorUserId: z.string().optional().nullable(),

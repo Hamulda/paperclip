@@ -656,11 +656,119 @@ function ArtifactChainPips({ chain }: { chain: string[] }) {
   );
 }
 
+function ActionNeededItem({
+  issueId,
+  issueIdentifier,
+  message,
+  type,
+}: {
+  issueId: string;
+  issueIdentifier: string | null;
+  message: string;
+  type: "blocked" | "review" | "rework" | "hint";
+}) {
+  const navigate = useNavigate();
+  const typeConfig = {
+    blocked: { color: "text-red-500 bg-red-500/10", icon: "⚠", label: "Blocked" },
+    review: { color: "text-blue-500 bg-blue-500/10", icon: "✓", label: "Review" },
+    rework: { color: "text-amber-500 bg-amber-500/10", icon: "~", label: "Rework" },
+    hint: { color: "text-yellow-500 bg-yellow-500/10", icon: "→", label: "Hint" },
+  };
+  const cfg = typeConfig[type];
+  return (
+    <div
+      className="flex items-start gap-2 py-1.5 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors"
+      onClick={() => issueIdentifier && navigate(`/issues/${issueIdentifier}`)}
+      role={issueIdentifier ? "button" : undefined}
+      tabIndex={issueIdentifier ? 0 : undefined}
+      onKeyDown={(e) => { if (issueIdentifier && e.key === "Enter") navigate(`/issues/${issueIdentifier}`); }}
+    >
+      <span className={cn("inline-flex items-center justify-center w-5 h-5 rounded-full text-xs font-mono shrink-0", cfg.color)}>
+        {cfg.icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {issueIdentifier ? (
+            <span className="text-blue-600 dark:text-blue-400 font-medium hover:underline text-xs">{issueIdentifier}</span>
+          ) : (
+            <span className="text-muted-foreground text-xs">No issue</span>
+          )}
+          <span className={cn("inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium shrink-0", cfg.color)}>
+            {cfg.label}
+          </span>
+        </div>
+        <p className="text-xs text-muted-foreground truncate mt-0.5">{message}</p>
+      </div>
+    </div>
+  );
+}
+
+function ActionNeededSection({
+  issueWorkflowSummary,
+  reviewQueue,
+  collaborationHints,
+}: {
+  issueWorkflowSummary: { issueId: string; issueIdentifier: string | null; blockedReason: string | null; isRework: boolean; reworkCount: number; phase: string | null }[];
+  reviewQueue: { readyForReview: { id: string; issueIdentifier: string | null; agentName: string; summary: string }[]; needsVerification: { id: string; issueIdentifier: string | null; agentName: string; summary: string }[]; blocked: { id: string; issueIdentifier: string | null; agentName: string; summary: string }[] };
+  collaborationHints: { type: string; message: string; urgency: string; relatedIssue?: string | null }[];
+}) {
+  const items: { issueId: string; issueIdentifier: string | null; message: string; type: "blocked" | "review" | "rework" | "hint" }[] = [];
+
+  // Blocked issues
+  for (const issue of issueWorkflowSummary) {
+    if (issue.blockedReason) {
+      items.push({ issueId: issue.issueId, issueIdentifier: issue.issueIdentifier, message: issue.blockedReason, type: "blocked" });
+    }
+  }
+
+  // Review queue items
+  for (const h of reviewQueue.readyForReview) {
+    items.push({ issueId: h.id, issueIdentifier: h.issueIdentifier, message: `${h.agentName}: ${h.summary}`, type: "review" });
+  }
+
+  // Rework issues (reworkCount >= 2 means significant rework)
+  for (const issue of issueWorkflowSummary) {
+    if (issue.isRework && issue.reworkCount >= 2 && !issue.blockedReason) {
+      items.push({ issueId: issue.issueId, issueIdentifier: issue.issueIdentifier, message: `Rework cycle ${issue.reworkCount} — needs attention`, type: "rework" });
+    }
+  }
+
+  // High-urgency collaboration hints
+  for (const hint of collaborationHints) {
+    if (hint.urgency === "high" && hint.relatedIssue) {
+      items.push({ issueId: hint.relatedIssue, issueIdentifier: hint.relatedIssue, message: hint.message, type: "hint" });
+    }
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="flex items-center gap-2 py-3 text-sm text-green-600 dark:text-green-400">
+        <CheckCircle2 className="h-4 w-4" />
+        <span className="font-medium">No urgent action needed</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="divide-y divide-border max-h-48 overflow-y-auto">
+      {items.slice(0, 8).map((item, i) => (
+        <ActionNeededItem key={i} issueId={item.issueId} issueIdentifier={item.issueIdentifier} message={item.message} type={item.type} />
+      ))}
+      {items.length > 8 && (
+        <p className="text-xs text-muted-foreground py-2 text-center">+{items.length - 8} more — see details below</p>
+      )}
+    </div>
+  );
+}
+
 function IssueWorkflowRow({ summary }: { summary: { issueIdentifier: string | null; issueTitle: string | null; phase: string | null; assigneeAgentName: string | null; isRework: boolean; reworkCount: number; blockedReason: string | null; expectedNextRole: string | null; expectedNextPhase: string | null; artifactChain: string[] } }) {
   const navigate = useNavigate();
   return (
     <div
-      className="flex items-start gap-2 py-2 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors"
+      className={cn(
+        "flex items-start gap-2 py-2 text-sm cursor-pointer hover:bg-muted/50 -mx-2 px-2 rounded transition-colors",
+        summary.blockedReason ? "border-l-2 border-red-400" : summary.isRework ? "border-l-2 border-amber-400" : ""
+      )}
       onClick={() => summary.issueIdentifier && navigate(`/issues/${summary.issueIdentifier}`)}
       role={summary.issueIdentifier ? "button" : undefined}
       tabIndex={summary.issueIdentifier ? 0 : undefined}
@@ -676,27 +784,35 @@ function IssueWorkflowRow({ summary }: { summary: { issueIdentifier: string | nu
           )}
           {summary.phase && <PhaseBadge phase={summary.phase} />}
           {summary.assigneeAgentName && (
-            <span className="text-xs text-muted-foreground shrink-0">{summary.assigneeAgentName}</span>
-          )}
-          {summary.isRework && (
-            <span className="inline-flex items-center gap-0.5 text-xs text-amber-500 shrink-0" title={`${summary.reworkCount} rework(s)`}>
-              <Repeat className="h-3 w-3" />
-              {summary.reworkCount}
-            </span>
+            <span className="text-xs text-muted-foreground shrink-0" title="Current owner">{summary.assigneeAgentName}</span>
           )}
           {summary.blockedReason && (
-            <span className="text-xs text-red-500 shrink-0" title={summary.blockedReason}>⚠ {summary.blockedReason}</span>
+            <span className="inline-flex items-center gap-0.5 text-xs text-red-500 font-medium shrink-0" title={`Blocked: ${summary.blockedReason}`}>
+              <AlertTriangle className="h-3 w-3" />
+              {summary.blockedReason.length > 30 ? summary.blockedReason.slice(0, 30) + "…" : summary.blockedReason}
+            </span>
           )}
-          {summary.expectedNextRole && (
-            <span className="inline-flex items-center gap-0.5 text-xs text-blue-500 shrink-0" title={`Next: ${summary.expectedNextRole} → ${summary.expectedNextPhase}`}>
-              <ChevronRight className="h-3 w-3" />
-              {summary.expectedNextRole}
+          {summary.isRework && !summary.blockedReason && (
+            <span className="inline-flex items-center gap-0.5 text-xs text-amber-500 shrink-0" title={`${summary.reworkCount} rework(s)`}>
+              <Repeat className="h-3 w-3" />
+              <span className="font-mono">{summary.reworkCount}×</span>
             </span>
           )}
         </div>
-        {summary.issueTitle && (
-          <p className="text-xs text-muted-foreground truncate">{summary.issueTitle}</p>
-        )}
+        <div className="flex items-center gap-2 mt-0.5">
+          {summary.expectedNextRole && (
+            <span className="inline-flex items-center gap-1 text-xs text-blue-500 shrink-0">
+              <span className="opacity-60">→</span>
+              <span className="font-medium">{summary.expectedNextRole}</span>
+              {summary.expectedNextPhase && (
+                <span className="opacity-60">({summary.expectedNextPhase})</span>
+              )}
+            </span>
+          )}
+          {summary.issueTitle && (
+            <p className="text-xs text-muted-foreground truncate">{summary.issueTitle}</p>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -823,6 +939,26 @@ export function SwarmCockpit() {
               ))}
             </div>
           )}
+        </SectionCard>
+
+        {/* Action Needed — workflow priority view */}
+        <SectionCard
+          title="Action Needed"
+          icon={AlertCircle}
+          id="action-needed"
+          className="md:col-span-2 lg:col-span-2"
+          alertCount={
+            (data.issueWorkflowSummary?.filter(i => i.blockedReason).length ?? 0) +
+            (data.reviewQueue?.readyForReview?.length ?? 0) +
+            (data.reviewQueue?.blocked?.length ?? 0) +
+            (data.collaborationHints?.filter(h => h.urgency === "high").length ?? 0)
+          }
+        >
+          <ActionNeededSection
+            issueWorkflowSummary={data.issueWorkflowSummary ?? []}
+            reviewQueue={data.reviewQueue ?? { readyForReview: [], needsVerification: [], blocked: [] }}
+            collaborationHints={data.collaborationHints ?? []}
+          />
         </SectionCard>
 
         {/* Operational */}

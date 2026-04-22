@@ -30,7 +30,7 @@ export { issues } from "./issues.js";
 export { issueRelations } from "./issue_relations.js";
 export { routines, routineTriggers, routineRuns } from "./routines.js";
 export { issueWorkProducts } from "./issue_work_products.js";
-export { issueArtifacts, PHASE_FOR_ARTIFACT_TYPE } from "./issue_artifacts.js";
+export { issueArtifacts, PHASE_FOR_ARTIFACT_TYPE, ARTIFACT_TYPE_FOR_PHASE } from "./issue_artifacts.js";
 export { labels } from "./labels.js";
 export { issueLabels } from "./issue_labels.js";
 export { issueApprovals } from "./issue_approvals.js";

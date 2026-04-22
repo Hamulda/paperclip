@@ -7,6 +7,7 @@ import type {
   PlanReviewerArtifact,
   ExecutorArtifact,
   ReviewerArtifact,
+  IntegratorArtifact,
   ArtifactType,
   VerificationStatus,
   IssueArtifact,
@@ -39,6 +40,7 @@ const PHASE_BY_ARTIFACT: Record<ArtifactType, IssuePhase> = {
   plan_reviewer: "plan_review",
   executor: "executing",
   reviewer: "code_review",
+  integrator: "integration",
 };
 
 // In-memory per-issue tracking for loop/rework detection.
@@ -166,7 +168,7 @@ export function checkReworkLimit(issueId: string, phase: IssuePhase): boolean {
  * Returns an action or marks blocked when guards fire.
  */
 export function decideFromArtifact(
-  artifact: PlannerArtifact | PlanReviewerArtifact | ExecutorArtifact | ReviewerArtifact,
+  artifact: PlannerArtifact | PlanReviewerArtifact | ExecutorArtifact | ReviewerArtifact | IntegratorArtifact,
   artifactType: ArtifactType,
   phase: IssuePhase,
   issueId: string,
@@ -260,6 +262,15 @@ export function decideFromArtifact(
         type: "phase_transition",
         to: "planning",
         reason: `review rejected: ${art.issuesFound.join("; ")}`,
+      };
+    }
+
+    case "integrator": {
+      recordRework(issueId, phase);
+      return {
+        type: "phase_transition",
+        to: "done",
+        reason: "integration complete",
       };
     }
   }

@@ -1471,4 +1471,253 @@ describe("SwarmCockpit", () => {
     expect(container.textContent).toContain("Diana");
     expect(container.textContent).toContain("reviewer");
   });
+
+  it("renders Action Needed section with blocked issues", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-blocked",
+            issueIdentifier: "PAP-100",
+            issueTitle: "Blocked issue",
+            phase: "blocked",
+            assigneeAgentName: "Alice",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: "Waiting for API spec",
+            expectedNextRole: null,
+            expectedNextPhase: null,
+            artifactChain: ["planner"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Action Needed");
+    expect(container.textContent).toContain("PAP-100");
+    expect(container.textContent).toContain("Waiting for API spec");
+  });
+
+  it("renders Action Needed section with review queue items", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        reviewQueue: {
+          readyForReview: [
+            {
+              id: "hc-review",
+              agentId: "agent-1",
+              agentName: "Bob",
+              swarmRole: "reviewer",
+              runId: "run-1",
+              issueId: "issue-1",
+              issueIdentifier: "PAP-50",
+              summary: "Ready for review — please verify",
+              filesTouched: [],
+              currentState: "Done",
+              remainingWork: [],
+              blockers: [],
+              recommendedNextStep: "Approve",
+              avoidPaths: [],
+              emittedAt: "2026-04-19T09:00:00.000Z",
+              verificationStatus: "ready_for_review",
+            },
+          ],
+          needsVerification: [],
+          blocked: [],
+        },
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Action Needed");
+    expect(container.textContent).toContain("PAP-50");
+    expect(container.textContent).toContain("Bob");
+  });
+
+  it("renders Action Needed section shows no urgent action when all clear", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-clear",
+            issueIdentifier: "PAP-10",
+            issueTitle: "Clear issue",
+            phase: "executing",
+            assigneeAgentName: "Charlie",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: null,
+            expectedNextRole: "reviewer",
+            expectedNextPhase: "code_review",
+            artifactChain: ["planner", "executor", "reviewer"],
+          },
+        ],
+        reviewQueue: { readyForReview: [], needsVerification: [], blocked: [] },
+        collaborationHints: [],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Action Needed");
+    expect(container.textContent).toContain("No urgent action needed");
+  });
+
+  it("renders Action Needed section with rework items (reworkCount >= 2)", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-rework",
+            issueIdentifier: "PAP-25",
+            issueTitle: "Rework issue",
+            phase: "code_review",
+            assigneeAgentName: "Diana",
+            isRework: true,
+            reworkCount: 3,
+            blockedReason: null,
+            expectedNextRole: "integrator",
+            expectedNextPhase: "integration",
+            artifactChain: ["planner", "executor", "reviewer"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Action Needed");
+    expect(container.textContent).toContain("PAP-25");
+    expect(container.textContent).toContain("Rework cycle 3");
+  });
+
+  it("renders Action Needed section with high-urgency collaboration hints", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        collaborationHints: [
+          { type: "blocked", message: "Bob is blocked on: API spec not finalized", urgency: "high", relatedIssue: "PAP-88" },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("Action Needed");
+    expect(container.textContent).toContain("PAP-88");
+    expect(container.textContent).toContain("API spec not finalized");
+  });
+
+  it("renders Action Needed section alert count badge when items present", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          { issueId: "issue-1", issueIdentifier: "PAP-1", issueTitle: "Blocked", phase: "blocked", assigneeAgentName: "Alice", isRework: false, reworkCount: 0, blockedReason: "Waiting", expectedNextRole: null, expectedNextPhase: null, artifactChain: [] },
+          { issueId: "issue-2", issueIdentifier: "PAP-2", issueTitle: "Blocked2", phase: "blocked", assigneeAgentName: "Bob", isRework: false, reworkCount: 0, blockedReason: "Waiting more", expectedNextRole: null, expectedNextPhase: null, artifactChain: [] },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    // Action Needed alert badge should show count > 0
+    const alertBadges = container.querySelectorAll(".bg-red-500\\/10");
+    expect(alertBadges.length).toBeGreaterThan(0);
+  });
+
+  it("renders IssueWorkflowRow with expectedNextRole and expectedNextPhase in readable format", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-next",
+            issueIdentifier: "PAP-60",
+            issueTitle: "Next phase test",
+            phase: "executing",
+            assigneeAgentName: "Eve",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: null,
+            expectedNextRole: "reviewer",
+            expectedNextPhase: "code_review",
+            artifactChain: ["planner", "executor"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-60");
+    expect(container.textContent).toContain("Eve");
+    expect(container.textContent).toContain("→reviewer");
+    expect(container.textContent).toContain("code_review");
+  });
+
+  it("renders IssueWorkflowRow with rework signal and border indicator", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-rework-row",
+            issueIdentifier: "PAP-70",
+            issueTitle: "Rework row test",
+            phase: "plan_review",
+            assigneeAgentName: "Frank",
+            isRework: true,
+            reworkCount: 2,
+            blockedReason: null,
+            expectedNextRole: "executor",
+            expectedNextPhase: "ready_for_execution",
+            artifactChain: ["planner"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-70");
+    expect(container.textContent).toContain("Frank");
+    expect(container.textContent).toContain("2×");
+  });
+
+  it("renders IssueWorkflowRow with blocked reason and border indicator", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-blocked-row",
+            issueIdentifier: "PAP-80",
+            issueTitle: "Blocked row test",
+            phase: "blocked",
+            assigneeAgentName: "Grace",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: "Waiting for design review",
+            expectedNextRole: null,
+            expectedNextPhase: null,
+            artifactChain: ["planner", "executor"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-80");
+    expect(container.textContent).toContain("Grace");
+    expect(container.textContent).toContain("Waiting for design review");
+  });
 });

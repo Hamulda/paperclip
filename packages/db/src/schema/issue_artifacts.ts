@@ -4,7 +4,7 @@ import { issues } from "./issues.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 
-export const ARTIFACT_TYPES = ["planner", "plan_reviewer", "executor", "reviewer"] as const;
+export const ARTIFACT_TYPES = ["planner", "plan_reviewer", "executor", "reviewer", "integrator"] as const;
 export type ArtifactType = (typeof ARTIFACT_TYPES)[number];
 
 export const ARTIFACT_STATUSES = ["draft", "published", "superseded", "failed"] as const;
@@ -16,6 +16,16 @@ export const PHASE_FOR_ARTIFACT_TYPE: Record<ArtifactType, string> = {
   plan_reviewer: "plan_review",
   executor: "executing",
   reviewer: "code_review",
+  integrator: "integration",
+};
+
+/** Reverse mapping: phase → artifact type required to advance from that phase */
+export const ARTIFACT_TYPE_FOR_PHASE: Record<string, ArtifactType> = {
+  planning: "planner",
+  plan_review: "plan_reviewer",
+  executing: "executor",
+  code_review: "reviewer",
+  integration: "integrator",
 };
 
 export const issueArtifacts = pgTable(
