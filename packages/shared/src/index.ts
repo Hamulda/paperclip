@@ -286,6 +286,7 @@ export type {
   PlanReviewerArtifact,
   ExecutorArtifact,
   ReviewerArtifact,
+  IntegratorArtifact,
   ArtifactType,
   ArtifactStatus,
   Goal,

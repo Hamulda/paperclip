@@ -126,6 +126,7 @@ export type {
   PlanReviewerArtifact,
   ExecutorArtifact,
   ReviewerArtifact,
+  IntegratorArtifact,
   ArtifactType,
   ArtifactStatus,
 } from "./issue.js";

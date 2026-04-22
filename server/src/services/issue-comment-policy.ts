@@ -257,11 +257,15 @@ export async function finalizeIssueCommentPolicy(
       issueCommentStatus: "retry_exhausted",
       issueCommentSatisfiedByCommentId: null,
     });
-    await opts.appendRunEvent(run, await opts.nextRunEventSeq(run.id), {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "warn",
-      message: "Run ended without an issue comment after one retry; no further comment wake will be queued",
+    await opts.appendRunEvent({
+      run,
+      seq: await opts.nextRunEventSeq(run.id),
+      event: {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Run ended without an issue comment after one retry; no further comment wake will be queued",
+      },
     });
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
@@ -279,11 +283,15 @@ export async function finalizeIssueCommentPolicy(
 
   const queuedRun = await enqueueMissingIssueCommentRetry(db, run, agent, issueId, sessionBefore);
   if (queuedRun) {
-    await opts.appendRunEvent(run, await opts.nextRunEventSeq(run.id), {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "warn",
-      message: "Run ended without an issue comment; queued one follow-up wake to require a comment",
+    await opts.appendRunEvent({
+      run,
+      seq: await opts.nextRunEventSeq(run.id),
+      event: {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Run ended without an issue comment; queued one follow-up wake to require a comment",
+      },
     });
     return { outcome: "retry_queued" as const, queuedRun };
   }

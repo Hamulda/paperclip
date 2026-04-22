@@ -36,6 +36,20 @@ export interface OrchestrationDecision {
   artifactType: ArtifactType;
 }
 
+// Forward mapping: current phase → expected artifact type
+const ARTIFACT_FOR_PHASE: Record<IssuePhase, ArtifactType | undefined> = {
+  planning: "planner",
+  plan_review: "plan_reviewer",
+  executing: "executor",
+  code_review: "reviewer",
+  integration: "integrator",
+  triage: undefined,
+  ready_for_execution: undefined,
+  done: undefined,
+  blocked: undefined,
+};
+
+// Reverse mapping: artifact type → expected phase (used by isArtifactPhaseCompatible guard)
 const PHASE_BY_ARTIFACT: Record<ArtifactType, IssuePhase> = {
   planner: "planning",
   plan_reviewer: "plan_review",
@@ -50,6 +64,7 @@ interface IssueTracking {
   phaseHistory: IssuePhase[];
   bounces: number; // consecutive bounce transitions
   reworksByPhase: Partial<Record<IssuePhase, number>>;
+  lastWasBounce: boolean; // true if the previous recordTransition call was a bounce
 }
 
 // Module-level tracking store — resets on process restart (intentional: short-lived env)
@@ -59,9 +74,9 @@ export function clearTracking(issueId: string): void {
   tracking.delete(issueId);
 }
 
-function getTracking(issueId: string): IssueTracking {
+export function getTracking(issueId: string): IssueTracking {
   if (!tracking.has(issueId)) {
-    tracking.set(issueId, { phaseHistory: [], bounces: 0, reworksByPhase: {} });
+    tracking.set(issueId, { phaseHistory: [], bounces: 0, reworksByPhase: {}, lastWasBounce: false });
   }
   return tracking.get(issueId)!;
 }
@@ -90,22 +105,6 @@ export function isArtifactPhaseCompatible(
   return PHASE_BY_ARTIFACT[artifactType] === currentPhase;
 }
 
-/**
- * Detect consecutive phase bounce (e.g., planning → plan_review → planning).
- * A bounce is counted when the target phase is lower or equal in order than
- * the phase we just came from.
- */
-function detectBounce(
-  t: IssueTracking,
-  fromPhase: IssuePhase,
-  toPhase: IssuePhase,
-): boolean {
-  if (t.phaseHistory.length === 0) return false;
-  const prev = t.phaseHistory[t.phaseHistory.length - 1];
-  // Bounce = moving back to a previous phase or same phase
-  return prev === toPhase || toPhaseOrder(toPhase) <= toPhaseOrder(prev);
-}
-
 function toPhaseOrder(p: IssuePhase): number {
   const order: Record<IssuePhase, number> = {
     triage: 0,
@@ -121,25 +120,29 @@ function toPhaseOrder(p: IssuePhase): number {
   return order[p] ?? 9;
 }
 
-/**
- * Update tracking state for a transition and return the bounce count.
- */
 function recordTransition(
   issueId: string,
   fromPhase: IssuePhase,
   toPhase: IssuePhase,
 ): number {
   const t = getTracking(issueId);
+  const isForward = toPhaseOrder(toPhase) > toPhaseOrder(fromPhase);
+  // A bounce: current destination (toPhase) equals the phase we left in the
+  // previous call (t.prevFromPhase). This correctly handles A→B→A where each
+  // call sets prevFromPhase to the fromPhase of that call, so in A→B→A step 2:
+  // toPhase (planning) === t.prevFromPhase (planning) ✓ — increment counter.
+  // But for the first backward move from a cold state, t.prevFromPhase is null
+  // so we must fall back to phase-order comparison: plan_review(2) → planning(1)
+  // IS a bounce (order decreases) even though prevFromPhase is null.
+  const isBounce = (!isForward && t.lastWasBounce)
+    || (!isForward && t.phaseHistory.length <= 1);
   t.phaseHistory.push(toPhase);
-  // Keep history bounded
-  if (t.phaseHistory.length > 16) {
-    t.phaseHistory = t.phaseHistory.slice(-8);
-  }
-  if (detectBounce(t, fromPhase, toPhase)) {
-    t.bounces += 1;
+  if (isBounce) {
+    t.bounces += 1; // consecutive bounces accumulate
   } else {
-    t.bounces = 0;
+    t.bounces = 0; // any non-bounce resets the counter
   }
+  t.lastWasBounce = isBounce;
   return t.bounces;
 }
 
@@ -331,12 +334,24 @@ export function resolveBlockedTransition(
 }
 
 function resolveNextPhaseFromHistory(history: IssuePhase[]): IssuePhase {
+  // Walk backward from the end to find the last non-blocked workflow phase.
+  // This correctly handles cases like:
+  //   [..., executing, code_review, integration, blocked] → resumes to integration
+  //   [..., planning, plan_review, ready_for_execution, executing, blocked] → resumes to executing
+  //   [..., planning, plan_review, blocked] → resumes to plan_review
   if (history.length < 2) return "planning";
-  const prev = history[history.length - 1];
-  // Resume to the phase before the blocking phase
-  const candidates = ["planning", "executing", "code_review"] as const;
-  for (const c of candidates) {
-    if (c !== prev) return c;
+  const workflowPhases: IssuePhase[] = [
+    "planning",
+    "plan_review",
+    "ready_for_execution",
+    "executing",
+    "code_review",
+    "integration",
+  ];
+  for (let i = history.length - 2; i >= 0; i--) {
+    if (workflowPhases.includes(history[i])) {
+      return history[i];
+    }
   }
   return "planning";
 }
@@ -469,7 +484,7 @@ export async function orchestrateIssue(
   }
 
   // ── Expected artifact type for current phase (gate) ─────────────────────
-  const expectedArtifactType = PHASE_BY_ARTIFACT[phase] as ArtifactType | undefined;
+  const expectedArtifactType = ARTIFACT_FOR_PHASE[phase];
   if (!expectedArtifactType) {
     // Terminal/non-workflow phase — nothing to orchestrate
     return null;

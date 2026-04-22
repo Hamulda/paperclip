@@ -148,7 +148,7 @@ export const ISSUE_PHASE_LABELS: Record<IssuePhase, string> = {
 };
 
 /** Reverse mapping: phase → artifact type required to advance from that phase */
-export const ARTIFACT_TYPE_FOR_PHASE: Record<IssuePhase, string> = {
+export const ARTIFACT_TYPE_FOR_PHASE: Partial<Record<IssuePhase, string>> = {
   planning: "planner",
   plan_review: "plan_reviewer",
   executing: "executor",

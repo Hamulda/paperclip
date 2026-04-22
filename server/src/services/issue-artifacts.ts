@@ -1,6 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueArtifacts } from "@paperclipai/db";
+import { issueService } from "./index.js";
 import type {
   IssueArtifact,
   ArtifactMetadata,
@@ -112,8 +113,12 @@ export async function publishArtifactForPhase(
  * Validates the published artifact chain for an issue.
  * Returns the latest valid published artifact chain head, or null if no published artifacts exist.
  *
- * Invariant: the chain must not have gaps (each artifact supersedes exactly one predecessor,
- * revisionCount increments by 1 per link).
+ * Invariants enforced (checked in priority order):
+ *   1. Unique published head — exactly one published artifact exists.
+ *   2. Root revisionCount === 1, even for singleton chains (length 1).
+ *   3. Consecutive revision counts along the chain.
+ *   4. All predecessors in the chain are superseded.
+ *   5. All published artifacts are part of a single chain (no forks).
  */
 export function validateArtifactChain(
   artifacts: IssueArtifact[],
@@ -124,10 +129,36 @@ export function validateArtifactChain(
 
   if (published.length === 0) return null;
 
+  // Invariant 2 (priority): exactly one published head
+  if (published.length > 1) {
+    throw new Error(
+      `Multiple published heads detected: [${published.map((a) => a.id).join(", ")}] — exactly one published artifact is allowed per issue`,
+    );
+  }
+
   const [latest] = published;
 
+  // Invariant 1: verify the head's chain covers all published artifacts (only 1 here, so this
+  // checks that the single published artifact is reachable from itself — always true).
+  // We also use this pass to build chainIds for superseded member inclusion in the walk below.
+  const chainIds = new Set<string>();
+  let cursor: IssueArtifact | null = latest;
+  while (cursor) {
+    chainIds.add(cursor.id);
+    cursor = cursor.supersedes
+      ? (artifacts.find((a) => a.id === cursor!.supersedes) ?? null)
+      : null;
+  }
+
+  // Invariant 3: singleton root revisionCount === 1
+  if (!latest.supersedes && latest.revisionCount !== 1) {
+    throw new Error(
+      `Artifact chain singleton root revision mismatch: artifact '${latest.id}' has revisionCount ${latest.revisionCount}, expected 1`,
+    );
+  }
+
   // Walk the supersedes chain backwards, verifying revision increments
-  let current = latest;
+  let current: IssueArtifact = latest;
   let prev: IssueArtifact | null = null;
 
   while (current.supersedes) {
@@ -153,7 +184,7 @@ export function validateArtifactChain(
     current = predecessor;
   }
 
-  // The oldest artifact in the chain should have revisionCount === 1
+  // Invariant 3 (chain length > 1): root artifact must have revisionCount === 1
   if (prev && prev.revisionCount !== 1) {
     throw new Error(
       `Artifact chain root revision mismatch: oldest artifact '${prev.id}' has revisionCount ${prev.revisionCount}, expected 1`,
@@ -353,7 +384,7 @@ export function issueArtifactService(db: Db) {
         ? current.revisionCount + 1
         : 1;
 
-      let newRow: IssueArtifactRow;
+      let newRow!: IssueArtifactRow;
 
       await db.transaction(async (tx) => {
         [newRow] = await tx
@@ -390,6 +421,248 @@ export function issueArtifactService(db: Db) {
 
 export { toIssueArtifact };
 export type { IssueArtifactRow };
+
+/**
+ * Bidirectional mapping: role → phase (derived from ARTIFACT_TYPE_FOR_PHASE).
+ * Used by publishForCurrentPhase to derive the phase from the role when the
+ * issue phase is not yet set.
+ */
+export const WORKFLOW_ROLE_PHASES: Record<WorkflowRole, IssuePhase> = {
+  planner: "planning",
+  plan_reviewer: "plan_review",
+  executor: "executing",
+  reviewer: "code_review",
+  integrator: "integration",
+} as const;
+
+/**
+ * Returns the phase associated with a workflow role.
+ * Throws if the role is not a valid WorkflowRole.
+ */
+export function getPhaseForRole(role: WorkflowRole): IssuePhase {
+  return WORKFLOW_ROLE_PHASES[role];
+}
+
+/**
+ * Canonical usage patterns for each Claude Code workflow role.
+ * Each pattern shows the minimal required metadata fields.
+ *
+ * Import:  import { CLAUDE_CODE_USAGE } from "../services/issue-artifacts.js";
+ * Usage:   CLAUDE_CODE_USAGE.planner   // → JSDoc-style pattern object
+ */
+export const CLAUDE_CODE_USAGE = {
+  planner: {
+    role: "planner",
+    phase: "planning",
+    requiredMetadata: [
+      "issueId",      // string — the issue being planned
+      "goal",         // string — what the plan aims to achieve
+      "acceptanceCriteria", // string[] — conditions for completion
+      "touchedFiles", // string[] — files expected to be modified
+      "forbiddenFiles", // string[] — files that must NOT be modified
+      "testPlan",     // string — how to verify the plan works
+      "risks",        // string[] — identified risks or unknowns
+    ],
+    example: `\
+await publishForCurrentPhase(db, companyId, "planner", {
+  issueId: issue.id,
+  goal: "Add user authentication via OAuth",
+  acceptanceCriteria: [
+    "Users can log in with Google and GitHub",
+    "Session persists across browser refreshes",
+    "Logout invalidates session",
+  ],
+  touchedFiles: ["src/auth/login.ts", "src/middleware/session.ts"],
+  forbiddenFiles: ["src/db/users.ts"],
+  testPlan: "Run integration tests with mock OAuth provider",
+  risks: ["OAuth provider rate limits may cause flakiness"],
+});`,
+  },
+
+  plan_reviewer: {
+    role: "plan_reviewer",
+    phase: "plan_review",
+    requiredMetadata: [
+      "issueId",
+      "verdict",       // "approved" | "rejected"
+      "scopeChanges",  // string[] — changes to the plan's scope
+      "notes",         // string[] — reviewer notes
+    ],
+    example: `\
+await publishForCurrentPhase(db, companyId, "plan_reviewer", {
+  issueId: issue.id,
+  verdict: "approved",
+  scopeChanges: [],
+  notes: ["Consider adding an integration test for the OAuth callback"],
+});`,
+  },
+
+  executor: {
+    role: "executor",
+    phase: "executing",
+    requiredMetadata: [
+      "issueId",
+      "filesChanged",        // string[] — files modified
+      "changesSummary",     // string — summary of changes
+      "deviationsFromPlan", // string[] — where actual differed from plan
+      "testsRun",           // string[] — tests executed
+      "remainingWork",      // string[] — unfinished items
+    ],
+    example: `\
+await publishForCurrentPhase(db, companyId, "executor", {
+  issueId: issue.id,
+  filesChanged: ["src/auth/login.ts", "src/middleware/session.ts"],
+  changesSummary: "Added OAuth login with Google and GitHub providers",
+  deviationsFromPlan: [],
+  testsRun: ["npm test -- --grep auth", "npm run integration"],
+  remainingWork: [],
+});`,
+  },
+
+  reviewer: {
+    role: "reviewer",
+    phase: "code_review",
+    requiredMetadata: [
+      "issueId",
+      "verdict",            // "approved" | "changes_requested" | "rejected"
+      "issuesFound",       // string[] — issues identified
+      "fixesMade",         // string[] — fixes applied
+      "verificationStatus", // "verified" | "needs_verification" | "blocked"
+      "mergeReadiness",    // "ready" | "blocked" | "conditional"
+    ],
+    example: `\
+await publishForCurrentPhase(db, companyId, "reviewer", {
+  issueId: issue.id,
+  verdict: "approved",
+  issuesFound: [],
+  fixesMade: ["Refactored session middleware to use async/await"],
+  verificationStatus: "verified",
+  mergeReadiness: "ready",
+});`,
+  },
+
+  integrator: {
+    role: "integrator",
+    phase: "integration",
+    requiredMetadata: [
+      "issueId",
+      "finalVerification", // "passed" | "failed" | "skipped"
+      "deploymentNotes",   // string[] — deployment instructions
+      "signoffs",          // string[] — required signoffs obtained
+      "remainingOpenIssues", // string[] — still-open non-blocking issues
+      "rollbackPlan",      // string — how to roll back if needed
+    ],
+    example: `\
+await publishForCurrentPhase(db, companyId, "integrator", {
+  issueId: issue.id,
+  finalVerification: "passed",
+  deploymentNotes: ["Deploy to staging first; monitor error rates for 10 min"],
+  signoffs: ["security-review", "data-team"],
+  remainingOpenIssues: [],
+  rollbackPlan: "Revert commit abc1234; re-run migration 0042",
+});`,
+  },
+} as const;
+
+/**
+ * Workflow role labels — the canonical set of roles that drive issue orchestration.
+ * Each role maps to exactly one artifact type and one phase.
+ *
+ * Usage (Claude Code):
+ *   import { WORKFLOW_ROLES, publishForCurrentPhase } from "./services/issue-artifacts.js";
+ *
+ *   // Planner publishes a plan
+ *   await publishForCurrentPhase(db, companyId, "planner", {
+ *     issueId: "...",
+ *     goal: "...",
+ *     acceptanceCriteria: ["..."],
+ *     touchedFiles: ["..."],
+ *     forbiddenFiles: [],
+ *     testPlan: "...",
+ *     risks: [],
+ *   });
+ *
+ *   // Plan reviewer approves
+ *   await publishForCurrentPhase(db, companyId, "plan_reviewer", {
+ *     issueId: "...",
+ *     verdict: "approved",
+ *     scopeChanges: [],
+ *     notes: ["..."],
+ *   });
+ *
+ *   // Executor completes work
+ *   await publishForCurrentPhase(db, companyId, "executor", {
+ *     issueId: "...",
+ *     filesChanged: ["..."],
+ *     changesSummary: "...",
+ *     deviationsFromPlan: [],
+ *     testsRun: ["..."],
+ *     remainingWork: [],
+ *   });
+ *
+ *   // Reviewer approves code
+ *   await publishForCurrentPhase(db, companyId, "reviewer", {
+ *     issueId: "...",
+ *     verdict: "approved",
+ *     issuesFound: [],
+ *     fixesMade: ["..."],
+ *     verificationStatus: "verified",
+ *     mergeReadiness: "ready",
+ *   });
+ *
+ *   // Integrator marks done
+ *   await publishForCurrentPhase(db, companyId, "integrator", {
+ *     issueId: "...",
+ *     finalVerification: "passed",
+ *     deploymentNotes: [],
+ *     signoffs: ["..."],
+ *     remainingOpenIssues: [],
+ *     rollbackPlan: "...",
+ *   });
+ */
+export const WORKFLOW_ROLES = ["planner", "plan_reviewer", "executor", "reviewer", "integrator"] as const;
+export type WorkflowRole = (typeof WORKFLOW_ROLES)[number];
+
+/**
+ * Canonical publish entrypoint for Claude Code workflow roles.
+ *
+ * Derives the current phase from the issue, validates that the given role's
+ * artifact type is compatible with that phase, then atomically publishes the
+ * artifact and triggers orchestration — all in one call.
+ *
+ * This is the ONLY entrypoint a Claude Code role agent should use to publish
+ * a workflow artifact. Do NOT call replace() or create() directly.
+ *
+ * @param db           - Database instance
+ * @param companyId    - Company context
+ * @param role         - One of: planner | plan_reviewer | executor | reviewer | integrator
+ * @param metadata     - Structured artifact metadata (MUST include issueId)
+ * @param actorAgentId - Agent publishing the artifact (optional)
+ * @param summary      - Human-readable summary (optional)
+ */
+export async function publishForCurrentPhase(
+  db: Db,
+  companyId: string,
+  role: WorkflowRole,
+  metadata: Record<string, unknown>,
+  actorAgentId?: string | null,
+  summary?: string | null,
+): Promise<IssueArtifact | null> {
+  const artifactType = role as ArtifactType;
+
+  const issueId = metadata["issueId"];
+  if (!issueId || typeof issueId !== "string" || issueId.length === 0) {
+    throw new Error("publishForCurrentPhase requires metadata.issueId to be a non-empty string");
+  }
+
+  const issue = await issueService(db).getById(issueId);
+  if (!issue) {
+    throw new Error(`publishForCurrentPhase: issue '${issueId}' not found`);
+  }
+
+  const phase = (issue.phase as IssuePhase | null) ?? "triage";
+  return publishArtifactForPhase(db, companyId, phase, artifactType, metadata, actorAgentId, summary);
+}
 
 /**
  * Triggers orchestration after artifact creation.

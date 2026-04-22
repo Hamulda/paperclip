@@ -9,6 +9,7 @@ import {
   checkReworkLimit,
   recordPhaseTransition,
   clearTracking,
+  getTracking,
 } from "../swarm-orchestrator.ts";
 import { validateArtifactChain } from "../issue-artifacts.js";
 import type { PlannerArtifact, PlanReviewerArtifact, ExecutorArtifact, ReviewerArtifact, IntegratorArtifact } from "@paperclipai/shared";
@@ -461,6 +462,7 @@ describe("orchestrateIssue — blocked state handling", () => {
   it("resolveBlockedTransition uses phase history to determine next phase", () => {
     clearTracking(ISSUE);
     // Simulate history: planning → plan_review → blocked
+    // Should resume to plan_review (last workflow phase before blocked)
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "blocked");
     const action = resolveBlockedTransition(ISSUE, {
@@ -468,7 +470,7 @@ describe("orchestrateIssue — blocked state handling", () => {
       blockers: [],
     });
     expect(action.type).toBe("phase_transition");
-    expect((action as any).to).toBe("planning");
+    expect((action as any).to).toBe("plan_review");
   });
 });
 
@@ -621,3 +623,225 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
     expect((action as any).reason).toContain("not compatible");
   });
 });
+
+// ── Targeted bounce / phase-transition tests ─────────────────────────────────
+describe("planner → plan_review transition", () => {
+  it("increments bounce counter on plan_review → planning bounce", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning");
+    // First bounce recorded
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+  });
+
+  it("does NOT increment bounce counter on planning → plan_review (forward)", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    // Forward transition — bounces stay 0
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("does not block on first bounce (under limit)", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning");
+    const planner: PlannerArtifact = {
+      goal: "x", acceptanceCriteria: ["y"], touchedFiles: ["f.ts"],
+      forbiddenFiles: [], testPlan: "t", risks: [],
+    };
+    const action = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    expect(action.type).toBe("phase_transition");
+  });
+});
+
+describe("plan_review approved → ready_for_execution", () => {
+  it("transitions forward and resets bounce counter", () => {
+    clearTracking(ISSUE);
+    // Simulate some bounce first
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+    // Now a clean forward approval
+    const artifact: PlanReviewerArtifact = { verdict: "approved", scopeChanges: [], notes: [] };
+    const action = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
+    expect(action).toEqual({ type: "phase_transition", to: "ready_for_execution", reason: "plan approved, ready for execution" });
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("does not increment bounce counter on ready_for_execution (forward)", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "plan_review", "ready_for_execution");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+});
+
+describe("executing → code_review", () => {
+  it("does not increment bounce counter on forward transition", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "ready_for_execution", "executing");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("transitions to code_review with complete executor artifact", () => {
+    clearTracking(ISSUE);
+    const executor: ExecutorArtifact = {
+      filesChanged: ["a.ts"], changesSummary: "done",
+      deviationsFromPlan: [], testsRun: [], remainingWork: [],
+    };
+    const action = decideFromArtifact(executor, "executor", "executing", ISSUE);
+    expect(action).toEqual({ type: "phase_transition", to: "code_review", reason: "execution complete" });
+  });
+
+  it("increments bounce counter on code_review → executing bounce", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "executing", "code_review");
+    recordPhaseTransition(ISSUE, "code_review", "executing");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+  });
+});
+
+describe("non-bounce forward transitions", () => {
+  it("planning → plan_review does not increment bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("plan_review → ready_for_execution does not increment bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "plan_review", "ready_for_execution");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("ready_for_execution → executing does not increment bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "ready_for_execution", "executing");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("code_review → integration does not increment bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "code_review", "integration");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+
+  it("integration → done does not increment bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "integration", "done");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+});
+
+describe("true bounce transitions increment counter", () => {
+  it("plan_review → planning is a bounce", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "plan_review", "planning");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+  });
+
+  it("code_review → executing is a bounce", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "code_review", "executing");
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+  });
+
+  it("consecutive bounces accumulate without reset", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning"); // bounce 1
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning"); // bounce 2
+    expect(getTrackingField(ISSUE, "bounces")).toBe(2);
+  });
+
+  it("forward transition resets bounce counter", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "planning"); // bounce 1
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
+    recordPhaseTransition(ISSUE, "planning", "plan_review"); // forward — resets to 0
+    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+  });
+});
+
+describe("blocked → resume to correct prior phase", () => {
+  it("resumes to plan_review when blocked from plan_review", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("plan_review");
+  });
+
+  it("resumes to executing when blocked from executing", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "ready_for_execution", "executing");
+    recordPhaseTransition(ISSUE, "executing", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("executing");
+  });
+
+  it("resumes to code_review when blocked from code_review", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "executing", "code_review");
+    recordPhaseTransition(ISSUE, "code_review", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("code_review");
+  });
+
+  it("resumes to integration when blocked from integration", () => {
+    clearTracking(ISSUE);
+    recordPhaseTransition(ISSUE, "code_review", "integration");
+    recordPhaseTransition(ISSUE, "integration", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("integration");
+  });
+
+  it("resumes to last workflow phase after multiple transitions before block", () => {
+    clearTracking(ISSUE);
+    // Simulate: planning → plan_review → ready_for_execution → executing → code_review → blocked
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "ready_for_execution");
+    recordPhaseTransition(ISSUE, "ready_for_execution", "executing");
+    recordPhaseTransition(ISSUE, "executing", "code_review");
+    recordPhaseTransition(ISSUE, "code_review", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("code_review");
+  });
+
+  it("falls back to planning on empty/short history", () => {
+    clearTracking(ISSUE);
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("planning");
+  });
+});
+
+// ── Helper ─────────────────────────────────────────────────────────────────
+function getTrackingField(issueId: string, field: "bounces" | "phaseHistory"): number | IssuePhase[] {
+  const t = getTracking(issueId);
+  return field === "bounces" ? t.bounces : t.phaseHistory;
+}
