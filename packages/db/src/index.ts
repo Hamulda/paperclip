@@ -16,7 +16,14 @@ export {
   startEmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestSupport,
-} from "./test-embedded-postgres.js";
+} from "./test-database-provider.js"; // Points to new module with provider-aware compat wrapper
+export {
+  getTestDatabaseSupport,
+  startTestDatabase,
+  type TestDatabaseSupport,
+  type TestDatabase,
+  type TestDatabaseProvider,
+} from "./test-database-provider.js";
 export {
   runDatabaseBackup,
   runDatabaseRestore,

@@ -128,24 +128,16 @@ function recordTransition(
 ): number {
   const t = getTracking(issueId);
   const isForward = toPhaseOrder(toPhase) > toPhaseOrder(fromPhase);
-  // A bounce: current destination (toPhase) equals the phase we left in the
-  // previous call (t.prevFromPhase). This correctly handles A→B→A where each
-  // call sets prevFromPhase to the fromPhase of that call, so in A→B→A step 2:
-  // toPhase (planning) === t.prevFromPhase (planning) ✓ — increment counter.
-  // But for the first backward move from a cold state, t.prevFromPhase is null
-  // so we must fall back to phase-order comparison: plan_review(2) → planning(1)
-  // IS a bounce (order decreases) even though prevFromPhase is null.
   const isBounce = !isForward && (
-    t.lastWasBounce ||
     toPhase === t.prevFromPhase ||
-    (t.prevFromPhase === null && toPhaseOrder(toPhase) <= toPhaseOrder(fromPhase))
+    toPhaseOrder(toPhase) <= toPhaseOrder(fromPhase)
   );
-  t.phaseHistory.push(toPhase);
   if (isBounce) {
-    t.bounces += 1; // consecutive bounces accumulate
-  } else {
-    t.bounces = 0; // any non-bounce resets the counter
+    t.bounces += 1;
   }
+  // Counter never resets — forward transitions don't cancel prior bounces.
+  // A true bounce is defined purely by backward movement that revisits a prior phase.
+  t.phaseHistory.push(toPhase);
   t.prevFromPhase = fromPhase;
   t.lastWasBounce = isBounce;
   return t.bounces;

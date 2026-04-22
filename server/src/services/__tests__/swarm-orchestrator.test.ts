@@ -655,17 +655,17 @@ describe("planner → plan_review transition", () => {
 });
 
 describe("plan_review approved → ready_for_execution", () => {
-  it("transitions forward and resets bounce counter", () => {
+  it("transitions forward and does not reset bounce counter (bounces accumulate)", () => {
     clearTracking(ISSUE);
     // Simulate some bounce first
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "planning");
     expect(getTrackingField(ISSUE, "bounces")).toBe(1);
-    // Now a clean forward approval
+    // Now a clean forward approval — counter does NOT reset
     const artifact: PlanReviewerArtifact = { verdict: "approved", scopeChanges: [], notes: [] };
     const action = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
     expect(action).toEqual({ type: "phase_transition", to: "ready_for_execution", reason: "plan approved, ready for execution" });
-    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1);
   });
 
   it("does not increment bounce counter on ready_for_execution (forward)", () => {
@@ -754,13 +754,13 @@ describe("true bounce transitions increment counter", () => {
     expect(getTrackingField(ISSUE, "bounces")).toBe(2);
   });
 
-  it("forward transition resets bounce counter", () => {
+  it("forward transition does not reset bounce counter (bounces accumulate)", () => {
     clearTracking(ISSUE);
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "planning"); // bounce 1
     expect(getTrackingField(ISSUE, "bounces")).toBe(1);
-    recordPhaseTransition(ISSUE, "planning", "plan_review"); // forward — resets to 0
-    expect(getTrackingField(ISSUE, "bounces")).toBe(0);
+    recordPhaseTransition(ISSUE, "planning", "plan_review"); // forward
+    expect(getTrackingField(ISSUE, "bounces")).toBe(1); // counter persists
   });
 });
 

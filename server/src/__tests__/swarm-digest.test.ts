@@ -1838,10 +1838,19 @@ describe("role-aware collaboration hints", () => {
         configurablePatterns: [],
         enforcement: "hard_block",
       },
-      collaborationHints: [],
     };
 
-    const formatted = formatSwarmDigestForPrompt(digest);
+    const formatted = formatSwarmDigestForPrompt({
+      ...digest,
+      collaborationHints: [
+        {
+          type: "role_coordination",
+          message: `Alice, Bob are working on src/auth/ (planner, implementer) — coordinate before merging shared changes`,
+          urgency: "medium",
+          relatedIssue: null,
+        },
+      ],
+    });
 
     expect(formatted).toContain("### Collaboration Hints");
     expect(formatted).toContain("src/auth");
@@ -1896,7 +1905,17 @@ describe("role-aware collaboration hints", () => {
       collaborationHints: [],
     };
 
-    const formatted = formatSwarmDigestForPrompt(digest);
+    const formatted = formatSwarmDigestForPrompt({
+      ...digest,
+      collaborationHints: [
+        {
+          type: "review_needed",
+          message: "Alice is ready for review — verify before starting related work",
+          urgency: "high",
+          relatedIssue: "PAP-1",
+        },
+      ],
+    });
 
     expect(formatted).toContain("Collaboration Hints");
     expect(formatted).toContain("ready for review");
@@ -1947,7 +1966,17 @@ describe("role-aware collaboration hints", () => {
       collaborationHints: [],
     };
 
-    const formatted = formatSwarmDigestForPrompt(digest);
+    const formatted = formatSwarmDigestForPrompt({
+      ...digest,
+      collaborationHints: [
+        {
+          type: "blocked",
+          message: "Bob is blocked on: Waiting on API spec from backend team",
+          urgency: "high",
+          relatedIssue: "PAP-1",
+        },
+      ],
+    });
 
     expect(formatted).toContain("Collaboration Hints");
     expect(formatted).toContain("blocked");

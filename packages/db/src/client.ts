@@ -662,13 +662,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   if (initialState.status === "upToDate") return;
 
   if (initialState.reason === "no-migration-journal-empty-db") {
-    const sql = createUtilitySql(url);
-    try {
-      const db = drizzlePg(sql);
-      await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-    } finally {
-      await sql.end();
-    }
+    await applyPendingMigrationsManually(url, initialState.availableMigrations);
 
     let bootstrappedState = await inspectMigrations(url);
     if (bootstrappedState.status === "upToDate") return;
@@ -745,8 +739,8 @@ export async function migratePostgresIfEmpty(url: string): Promise<MigrationBoot
       return { migrated: false, reason: "not-empty-no-migration-journal", tableCount };
     }
 
-    const db = drizzlePg(sql);
-    await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
+    const availableMigrations = await listMigrationFiles();
+    await applyPendingMigrationsManually(url, availableMigrations);
 
     return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
   } finally {
