@@ -1659,8 +1659,88 @@ describe("SwarmCockpit", () => {
 
     expect(container.textContent).toContain("PAP-60");
     expect(container.textContent).toContain("Eve");
-    expect(container.textContent).toContain("→reviewer");
+    expect(container.textContent).toContain("expects:");
+    expect(container.textContent).toContain("reviewer");
     expect(container.textContent).toContain("code_review");
+  });
+
+  it("renders IssueWorkflowRow owner label with @ prefix", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-owner",
+            issueIdentifier: "PAP-61",
+            issueTitle: "Owner test",
+            phase: "executing",
+            assigneeAgentName: "Zara",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: null,
+            expectedNextRole: null,
+            expectedNextPhase: null,
+            artifactChain: ["planner"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("PAP-61");
+    expect(container.textContent).toContain("@Zara");
+  });
+
+  it("renders Action Needed empty state with styled green background", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [],
+        reviewQueue: { readyForReview: [], needsVerification: [], blocked: [] },
+        collaborationHints: [],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    expect(container.textContent).toContain("No urgent action needed");
+  });
+
+  it("renders IssueWorkflowRow with next phase only (no role duplication)", async () => {
+    mockSwarmDigestApi.getCockpitDigest.mockResolvedValueOnce(
+      createMockDigest({
+        issueWorkflowSummary: [
+          {
+            issueId: "issue-phase-next",
+            issueIdentifier: "PAP-62",
+            issueTitle: "Phase test",
+            phase: "executing",
+            assigneeAgentName: "Ben",
+            isRework: false,
+            reworkCount: 0,
+            blockedReason: null,
+            expectedNextRole: "reviewer",
+            expectedNextPhase: "code_review",
+            artifactChain: ["planner", "executor"],
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(<SwarmCockpit />, container);
+    await flush();
+
+    // expects:reviewer should appear once in the header tag row
+    // next phase arrow should show code_review, not reviewer again
+    const text = container.textContent;
+    expect(text).toContain("PAP-62");
+    expect(text).toContain("expects:");
+    expect(text).toContain("reviewer");
+    expect(text).toContain("code_review");
+    // ensure no duplicated reviewer label
+    const reviewerMatches = (text.match(/reviewer/g) || []).length;
+    expect(reviewerMatches).toBeLessThanOrEqual(2);
   });
 
   it("renders IssueWorkflowRow with rework signal and border indicator", async () => {

@@ -9,8 +9,8 @@ import {
   checkReworkLimit,
   recordPhaseTransition,
   clearTracking,
-  orchestrateIssue,
 } from "../swarm-orchestrator.ts";
+import { validateArtifactChain } from "../issue-artifacts.js";
 import type { PlannerArtifact, PlanReviewerArtifact, ExecutorArtifact, ReviewerArtifact, IntegratorArtifact } from "@paperclipai/shared";
 
 const ISSUE = "test-issue-1";
@@ -143,7 +143,7 @@ describe("decideFromArtifact", () => {
   });
 
   describe("integrator", () => {
-    it("transitions to done when integration is complete", () => {
+    it("transitions to done when finalVerification is passed", () => {
       const artifact: IntegratorArtifact = {
         finalVerification: "passed",
         deploymentNotes: ["deployed to production"],
@@ -155,7 +155,33 @@ describe("decideFromArtifact", () => {
       expect(action).toEqual({ type: "phase_transition", to: "done", reason: "integration complete" });
     });
 
-    it("transitions to done even when verification is skipped", () => {
+    it("transitions to blocked when finalVerification is failed", () => {
+      const artifact: IntegratorArtifact = {
+        finalVerification: "failed",
+        deploymentNotes: [],
+        signoffs: [],
+        remainingOpenIssues: ["auth regression", "memory leak in worker"],
+        rollbackPlan: "revert commit",
+      };
+      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      expect(action.type).toBe("phase_transition");
+      expect((action as any).to).toBe("blocked");
+      expect((action as any).reason).toContain("integration verification failed");
+    });
+
+    it("transitions to done when finalVerification is skipped and no remaining open issues", () => {
+      const artifact: IntegratorArtifact = {
+        finalVerification: "skipped",
+        deploymentNotes: [],
+        signoffs: [],
+        remainingOpenIssues: [],
+        rollbackPlan: "",
+      };
+      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      expect(action).toEqual({ type: "phase_transition", to: "done", reason: "integration complete" });
+    });
+
+    it("marks blocked when finalVerification is skipped but remaining open issues exist", () => {
       const artifact: IntegratorArtifact = {
         finalVerification: "skipped",
         deploymentNotes: [],
@@ -164,7 +190,8 @@ describe("decideFromArtifact", () => {
         rollbackPlan: "rollback",
       };
       const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
-      expect(action).toEqual({ type: "phase_transition", to: "done", reason: "integration complete" });
+      expect(action.type).toBe("mark_blocked");
+      expect((action as any).reason).toContain("open issues");
     });
 
     it("records rework for integration phase", () => {
@@ -403,29 +430,108 @@ describe("decideReassignment", () => {
   });
 });
 
-// =============================================================================
-// Integration tests for the artifact→orchestration wiring.
-// These tests verify that the wiring from issueArtifactService.create()/replace()
-// to orchestrateIssue() is correct.
-//
-// Full chain: artifact published → triggerOrchestration → orchestrateIssue →
-// decideFromArtifact → OrchestrationDecision applied → issue phase/assignment updated
-//
-// Since orchestrateIssue() calls module-level singleton services (issueService,
-// issueArtifactService) from ../index.js, we test the pure decision logic
-// (decideFromArtifact) which is what orchestrateIssue delegates to, and verify
-// the wiring via the existing unit tests + TypeScript compilation.
-// =============================================================================
-describe("orchestrateIssue wiring — decision logic coverage", () => {
-  const plannerMeta: PlannerArtifact = {
-    goal: "Test goal",
-    acceptanceCriteria: ["criterion 1"],
-    touchedFiles: ["file.ts"],
-    forbiddenFiles: [],
-    testPlan: "Run tests",
-    risks: [],
-  };
+// ── orchestrateIssue: blocked state ────────────────────────────────────────────
+describe("orchestrateIssue — blocked state handling", () => {
+  it("resolveBlockedTransition unblocks when verification ready and no blockers", () => {
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).reason).toBe("blockers cleared, resuming");
+  });
 
+  it("resolveBlockedTransition stays blocked with remaining blockers", () => {
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: ["external API down"],
+    });
+    expect(action.type).toBe("mark_blocked");
+    expect((action as any).reason).toBe("external API down");
+  });
+
+  it("resolveBlockedTransition stays blocked when verification not ready", () => {
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "blocked",
+      blockers: [],
+    });
+    expect(action.type).toBe("mark_blocked");
+  });
+
+  it("resolveBlockedTransition uses phase history to determine next phase", () => {
+    clearTracking(ISSUE);
+    // Simulate history: planning → plan_review → blocked
+    recordPhaseTransition(ISSUE, "planning", "plan_review");
+    recordPhaseTransition(ISSUE, "plan_review", "blocked");
+    const action = resolveBlockedTransition(ISSUE, {
+      verificationStatus: "ready_for_review",
+      blockers: [],
+    });
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("planning");
+  });
+});
+
+// ── orchestrateIssue: expected artifact type gate ────────────────────────────
+describe("orchestrateIssue — expected artifact type gate", () => {
+  it("isArtifactPhaseCompatible returns false for executor in planning", () => {
+    expect(isArtifactPhaseCompatible("executor", "planning")).toBe(false);
+  });
+
+  it("isArtifactPhaseCompatible returns true for planner in planning", () => {
+    expect(isArtifactPhaseCompatible("planner", "planning")).toBe(true);
+  });
+
+  it("decideFromArtifact returns noop when artifact type does not match phase", () => {
+    const plannerArtifact: PlannerArtifact = {
+      goal: "Test goal", acceptanceCriteria: ["criterion 1"],
+      touchedFiles: ["file.ts"], forbiddenFiles: [],
+      testPlan: "Run tests", risks: [],
+    };
+    // Sending planner artifact during executing phase → noop
+    const action = decideFromArtifact(plannerArtifact, "planner", "executing", ISSUE);
+    expect(action.type).toBe("noop");
+    expect((action as any).reason).toContain("not compatible with current phase");
+  });
+});
+
+// ── orchestrateIssue: valid chain selection ───────────────────────────────────
+describe("orchestrateIssue — valid chain selection", () => {
+  it("validateArtifactChain returns canonical head even when newer non-chain artifacts exist", () => {
+    const artifacts = [
+      { id: "a1", status: "superseded", supersedes: null, revisionCount: 1, createdAt: new Date("2026-04-19T10:00:00Z"), artifactType: "planner" } as any,
+      { id: "a2", status: "published", supersedes: "a1", revisionCount: 2, createdAt: new Date("2026-04-19T11:00:00Z"), artifactType: "planner" } as any,
+    ];
+    const head = validateArtifactChain(artifacts);
+    expect(head).not.toBeNull();
+    expect(head!.id).toBe("a2");
+    expect(head!.revisionCount).toBe(2);
+  });
+
+  it("decideFromArtifact uses the chain head with correct phase", () => {
+    // Chain head is planner in planning phase → should transition to plan_review
+    const plannerArtifact: PlannerArtifact = {
+      goal: "Test goal", acceptanceCriteria: ["criterion 1"],
+      touchedFiles: ["file.ts"], forbiddenFiles: [],
+      testPlan: "Run tests", risks: [],
+    };
+    const action = decideFromArtifact(plannerArtifact, "planner", "planning", ISSUE);
+    expect(action.type).toBe("phase_transition");
+    expect((action as any).to).toBe("plan_review");
+  });
+});
+
+// ── plannerMeta — shared artifact for tests below ──────────────────────────
+const plannerMeta: PlannerArtifact = {
+  goal: "Test goal",
+  acceptanceCriteria: ["criterion 1"],
+  touchedFiles: ["file.ts"],
+  forbiddenFiles: [],
+  testPlan: "Run tests",
+  risks: [],
+};
+
+describe("orchestrateIssue wiring — decision logic coverage", () => {
   it("decides plan_review transition for complete planner artifact", () => {
     const action = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
     expect(action.type).toBe("phase_transition");

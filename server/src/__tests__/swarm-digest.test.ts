@@ -1838,6 +1838,7 @@ describe("role-aware collaboration hints", () => {
         configurablePatterns: [],
         enforcement: "hard_block",
       },
+      collaborationHints: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -1892,6 +1893,7 @@ describe("role-aware collaboration hints", () => {
         configurablePatterns: [],
         enforcement: "hard_block",
       },
+      collaborationHints: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);
@@ -1942,6 +1944,7 @@ describe("role-aware collaboration hints", () => {
         configurablePatterns: [],
         enforcement: "hard_block",
       },
+      collaborationHints: [],
     };
 
     const formatted = formatSwarmDigestForPrompt(digest);

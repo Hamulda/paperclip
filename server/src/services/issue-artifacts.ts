@@ -68,15 +68,16 @@ export function getArtifactTypeForPhase(phase: IssuePhase): ArtifactType {
  * Each role MUST call this (or equivalent replace()) with the correct phase
  * and artifact type to advance the workflow. The function:
  *   1. Validates phase ↔ artifact type compatibility
- *   2. Atomically supersedes any previous published artifact of the same type
- *   3. Creates the new published artifact
- *   4. Triggers orchestration to drive the next phase transition
+ *   2. Validates required metadata fields (issueId)
+ *   3. Atomically supersedes any previous published artifact of the same type
+ *   4. Creates the new published artifact
+ *   5. Triggers orchestration to drive the next phase transition
  *
  * @param db           - Database instance
  * @param companyId    - Company context
  * @param phase        - The issue's current phase (MUST match the role's phase)
  * @param artifactType - One of: planner | plan_reviewer | executor | reviewer | integrator
- * @param metadata     - The structured artifact metadata for this role (must include issueId)
+ * @param metadata     - The structured artifact metadata for this role (MUST include issueId)
  * @param actorAgentId - Agent publishing the artifact (optional)
  * @param summary      - Human-readable summary (optional)
  */
@@ -90,10 +91,16 @@ export async function publishArtifactForPhase(
   summary?: string | null,
 ): Promise<IssueArtifact | null> {
   assertArtifactTypeForPhase(artifactType, phase);
+
+  const issueId = metadata["issueId"];
+  if (!issueId || typeof issueId !== "string" || issueId.length === 0) {
+    throw new Error("publishArtifactForPhase requires metadata.issueId to be a non-empty string");
+  }
+
   return issueArtifactService(db).replace(
     companyId,
     phase,
-    (metadata["issueId"] as string) ?? "",
+    issueId,
     artifactType,
     metadata,
     actorAgentId,
@@ -272,6 +279,9 @@ export function issueArtifactService(db: Db) {
      * Atomically supersedes all published artifacts of the same type for an issue
      * and records the supersession chain.
      *
+     * supersededBy is set by the REPLACER (new artifact) when it inserts —
+     * this function only marks them as superseded.
+     *
      * Returns the newly superseded artifacts' ids.
      */
     supersede: async (issueId: string, artifactType: ArtifactType): Promise<string[]> => {
@@ -294,7 +304,7 @@ export function issueArtifactService(db: Db) {
         for (const old of toSupersede) {
           await tx
             .update(issueArtifacts)
-            .set({ status: "superseded", supersededBy: old.id, updatedAt: new Date() })
+            .set({ status: "superseded", updatedAt: new Date() })
             .where(eq(issueArtifacts.id, old.id));
         }
       });
@@ -305,6 +315,10 @@ export function issueArtifactService(db: Db) {
     /**
      * Atomically supersedes the previous published artifact and creates a new published one.
      * Validates phase-artifact invariants and computes revision count.
+     *
+     * Both the insert and the status update of the previous artifact are wrapped
+     * in a single transaction so that a crash between them cannot leave a
+     * "published + orphaned predecessor" state.
      *
      * @returns The newly created artifact, or null if no previous published artifact existed.
      */
@@ -338,28 +352,32 @@ export function issueArtifactService(db: Db) {
         ? current.revisionCount + 1
         : 1;
 
-      const [newRow] = await db
-        .insert(issueArtifacts)
-        .values({
-          companyId,
-          issueId,
-          artifactType,
-          status: "published",
-          actorAgentId: actorAgentId ?? null,
-          summary: summary ?? null,
-          metadata,
-          supersedes: supersedesId,
-          revisionCount,
-        })
-        .returning();
+      let newRow: IssueArtifactRow;
 
-      // Atomically mark previous as superseded
-      if (current) {
-        await db
-          .update(issueArtifacts)
-          .set({ status: "superseded", supersededBy: newRow.id, updatedAt: new Date() })
-          .where(eq(issueArtifacts.id, current.id));
-      }
+      await db.transaction(async (tx) => {
+        [newRow] = await tx
+          .insert(issueArtifacts)
+          .values({
+            companyId,
+            issueId,
+            artifactType,
+            status: "published",
+            actorAgentId: actorAgentId ?? null,
+            summary: summary ?? null,
+            metadata,
+            supersedes: supersedesId,
+            revisionCount,
+          })
+          .returning();
+
+        // Atomically mark previous as superseded, pointing back to new row
+        if (current) {
+          await tx
+            .update(issueArtifacts)
+            .set({ status: "superseded", supersededBy: newRow.id, updatedAt: new Date() })
+            .where(eq(issueArtifacts.id, current.id));
+        }
+      });
 
       // Trigger orchestration after artifact is published
       await triggerOrchestration(db, issueId);
@@ -373,9 +391,12 @@ export { toIssueArtifact };
 export type { IssueArtifactRow };
 
 /**
- * Lazy-呼び出し: orchestrateIssue after artifact creation.
+ * Triggers orchestration after artifact creation.
  * Uses dynamic import to avoid circular dependency between
  * issue-artifacts.ts and swarm-orchestrator.ts.
+ *
+ * Fail-closed: orchestration failures are surfaced so the caller can retry.
+ * Only circular-import not-yet-resolvable cases are skipped silently.
  */
 async function triggerOrchestration(
   db: Db,
@@ -384,10 +405,14 @@ async function triggerOrchestration(
   try {
     const { orchestrateIssue } = await import("./swarm-orchestrator.js");
     return await orchestrateIssue(db, issueId);
-  } catch {
-    // If orchestration fails (e.g., circular import not yet resolvable),
-    // fail silently — artifact is already saved, orchestration can be
-    // retried by a subsequent artifact publish or manual trigger.
-    return null;
+  } catch (err) {
+    // Swallow only when the module itself cannot be loaded (e.g. fresh process
+    // before swarm-orchestrator is available). Real runtime errors must surface.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("Cannot find module") || msg.includes("ERR_MODULE_NOT_FOUND")) {
+      console.warn(`[issue-artifacts] orchestration unavailable (module not resolvable): ${msg}`);
+      return null;
+    }
+    throw err;
   }
 }

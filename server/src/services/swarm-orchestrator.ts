@@ -15,6 +15,7 @@ import type {
 } from "@paperclipai/shared";
 import { assertPhaseTransition } from "./issue-phase.js";
 import { issueService, issueArtifactService } from "./index.js";
+import { validateArtifactChain } from "./issue-artifacts.js";
 
 // Maximum consecutive phase bounces before blocking (e.g., planning↔plan_review, executing↔code_review)
 const MAX_BOUNCES = 3;
@@ -266,7 +267,26 @@ export function decideFromArtifact(
     }
 
     case "integrator": {
+      const art = artifact as IntegratorArtifact;
       recordRework(issueId, phase);
+
+      if (art.finalVerification === "failed") {
+        return {
+          type: "phase_transition",
+          to: "blocked",
+          reason: `integration verification failed: ${art.remainingOpenIssues.join("; ") || "unresolved issues"}`,
+        };
+      }
+
+      // skipped: only done if no remaining open issues
+      if (art.finalVerification === "skipped" && art.remainingOpenIssues.length > 0) {
+        return {
+          type: "mark_blocked",
+          reason: `integration skipped with open issues: ${art.remainingOpenIssues.join("; ")}`,
+        };
+      }
+
+      // passed or skipped (with no open issues) → done
       return {
         type: "phase_transition",
         to: "done",
@@ -429,16 +449,49 @@ export async function orchestrateIssue(
 
   const phase = (issue.phase as IssuePhase | null) ?? "triage";
 
-  // Get the latest published artifact for this issue
-  const artifacts = await issueArtifactService(db).listForIssue(issueId);
-  const latestPublished = artifacts
-    .filter((a) => a.status === "published")
-    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+  // ── Blocked state: consult review queue for unblock signal ────────────────
+  if (phase === "blocked") {
+    const handoff = {
+      verificationStatus: issue.verificationStatus as VerificationStatus | null,
+      blockers: issue.blockedBy ?? [],
+    };
+    const action = resolveBlockedTransition(issueId, handoff);
+    const decision: OrchestrationDecision = {
+      issueId,
+      phase,
+      action,
+      artifactType: "integrator" as ArtifactType, // placeholder — blocked has no artifact type
+    };
+    if (action.type !== "noop") {
+      await applyOrchestrationDecision(db, decision);
+    }
+    return decision;
+  }
 
-  if (!latestPublished) return null;
+  // ── Expected artifact type for current phase (gate) ─────────────────────
+  const expectedArtifactType = PHASE_BY_ARTIFACT[phase] as ArtifactType | undefined;
+  if (!expectedArtifactType) {
+    // Terminal/non-workflow phase — nothing to orchestrate
+    return null;
+  }
 
-  const artifactType = latestPublished.artifactType as ArtifactType;
-  const meta = latestPublished.metadata;
+  // ── Validate artifact chain to get the canonical head ────────────────────
+  const allArtifacts = await issueArtifactService(db).listForIssue(issueId);
+  const chainHead = validateArtifactChain(allArtifacts);
+
+  if (!chainHead) return null;
+
+  // ── Phase compatibility guard: reject artifacts from other phases ─────────
+  if (!isArtifactPhaseCompatible(chainHead.artifactType as ArtifactType, phase)) {
+    const action: OrchestrationAction = {
+      type: "noop",
+      reason: `artifact type '${chainHead.artifactType}' not compatible with current phase '${phase}'`,
+    };
+    return { issueId, phase, action, artifactType: chainHead.artifactType as ArtifactType };
+  }
+
+  const artifactType = chainHead.artifactType as ArtifactType;
+  const meta = chainHead.metadata;
 
   if (!meta) return null;
 

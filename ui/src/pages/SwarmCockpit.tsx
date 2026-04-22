@@ -742,9 +742,9 @@ function ActionNeededSection({
 
   if (items.length === 0) {
     return (
-      <div className="flex items-center gap-2 py-3 text-sm text-green-600 dark:text-green-400">
-        <CheckCircle2 className="h-4 w-4" />
-        <span className="font-medium">No urgent action needed</span>
+      <div className="flex items-center gap-2 py-3 px-2 rounded-md bg-green-500/5 border border-green-500/20">
+        <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+        <span className="text-sm font-medium text-green-600 dark:text-green-400">No urgent action needed</span>
       </div>
     );
   }
@@ -784,7 +784,14 @@ function IssueWorkflowRow({ summary }: { summary: { issueIdentifier: string | nu
           )}
           {summary.phase && <PhaseBadge phase={summary.phase} />}
           {summary.assigneeAgentName && (
-            <span className="text-xs text-muted-foreground shrink-0" title="Current owner">{summary.assigneeAgentName}</span>
+            <span className="text-xs text-muted-foreground shrink-0" title="Current owner">
+              <span className="opacity-60">@</span>{summary.assigneeAgentName}
+            </span>
+          )}
+          {summary.expectedNextRole && (
+            <span className="text-xs text-blue-500 shrink-0 font-medium" title={`Next: ${summary.expectedNextRole}`}>
+              expects: <span className="font-medium">{summary.expectedNextRole}</span>
+            </span>
           )}
           {summary.blockedReason && (
             <span className="inline-flex items-center gap-0.5 text-xs text-red-500 font-medium shrink-0" title={`Blocked: ${summary.blockedReason}`}>
@@ -800,13 +807,10 @@ function IssueWorkflowRow({ summary }: { summary: { issueIdentifier: string | nu
           )}
         </div>
         <div className="flex items-center gap-2 mt-0.5">
-          {summary.expectedNextRole && (
+          {summary.expectedNextPhase && (
             <span className="inline-flex items-center gap-1 text-xs text-blue-500 shrink-0">
               <span className="opacity-60">→</span>
-              <span className="font-medium">{summary.expectedNextRole}</span>
-              {summary.expectedNextPhase && (
-                <span className="opacity-60">({summary.expectedNextPhase})</span>
-              )}
+              <span className="font-medium">{summary.expectedNextPhase}</span>
             </span>
           )}
           {summary.issueTitle && (

@@ -1,14 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { issueArtifactService, validateArtifactChain, assertArtifactTypeForPhase, getArtifactTypeForPhase, publishArtifactForPhase } from "../issue-artifacts.js";
 import { issueArtifacts } from "@paperclipai/db";
 import type { CreateIssueArtifact } from "@paperclipai/shared";
 
+// Mock swarm-orchestrator so triggerOrchestration doesn't hang the tests
+vi.mock("../swarm-orchestrator.js", () => ({
+  orchestrateIssue: vi.fn().mockResolvedValue(null),
+}));
+
 const mockDb = {
   select: vi.fn(),
   insert: vi.fn(),
   update: vi.fn(),
-  transaction: vi.fn(),
+  transaction: vi.fn().mockImplementation(async (fn) => {
+    await fn(mockDb);
+  }),
 } as unknown as Db;
 
 describe("issueArtifactService", () => {
@@ -85,6 +92,14 @@ describe("issueArtifactService", () => {
         updatedAt: new Date(),
       };
 
+      vi.mocked(mockDb.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([]),
+        }),
+      } as any);
+
       vi.mocked(mockDb.insert).mockReturnValue({
         values: vi.fn().mockReturnValue({
           returning: vi.fn().mockResolvedValue([createdRow]),
@@ -130,7 +145,7 @@ describe("issueArtifactService", () => {
         },
       };
 
-      expect(() => service.create("company-1", "executing", input)).toThrow(
+      await expect(service.create("company-1", "executing", input)).rejects.toThrow(
         "Artifact type 'planner' is not valid in phase 'executing' — expected 'planning'",
       );
     });
@@ -142,11 +157,9 @@ describe("issueArtifactService", () => {
 
       vi.mocked(mockDb.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
-          where: vi.fn().mockReturnValue({
-            orderBy: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([existingRow]),
-            }),
-          }),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([existingRow]),
         }),
       } as any);
 
@@ -155,7 +168,7 @@ describe("issueArtifactService", () => {
           returning: vi.fn().mockResolvedValue([{
             id: "artifact-3",
             companyId: "company-1",
-            issueId: "issue-1",
+            issueId: "11111111-1111-1111-1111-111111111111",
             artifactType: "planner",
             status: "published",
             actorAgentId: null,
@@ -174,7 +187,7 @@ describe("issueArtifactService", () => {
 
       const service = issueArtifactService(mockDb);
       const input: CreateIssueArtifact = {
-        issueId: "issue-1",
+        issueId: "11111111-1111-1111-1111-111111111111",
         artifactType: "planner",
         summary: null,
         metadata: { artifactType: "planner", goal: "Test", acceptanceCriteria: [], touchedFiles: [], forbiddenFiles: [], testPlan: "Test", risks: [] },
@@ -187,7 +200,14 @@ describe("issueArtifactService", () => {
 
   describe("supersede", () => {
     it("updates published artifacts of same type to superseded", async () => {
-      const mockUpdate = vi.fn().mockResolvedValue([]);
+      vi.mocked(mockDb.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([
+            { id: "artifact-old-1", status: "published", artifactType: "planner" },
+            { id: "artifact-old-2", status: "published", artifactType: "planner" },
+          ]),
+        }),
+      } as any);
       vi.mocked(mockDb.update).mockReturnValue({
         set: vi.fn().mockReturnValue({
           where: vi.fn().mockResolvedValue([]),
@@ -226,6 +246,69 @@ describe("issueArtifactService", () => {
   });
 
   describe("replace", () => {
+    it("wraps insert and superseded update in a transaction and links both sides of the chain", async () => {
+      const previousRow = {
+        id: "artifact-prev",
+        status: "published",
+        revisionCount: 1,
+      };
+
+      vi.mocked(mockDb.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([previousRow]),
+        }),
+      } as any);
+
+      vi.mocked(mockDb.transaction).mockImplementation(async (fn) => {
+        const newRow = {
+          id: "artifact-new",
+          companyId: "company-1",
+          issueId: "issue-1",
+          artifactType: "executor",
+          status: "published",
+          actorAgentId: null,
+          actorUserId: null,
+          createdByRunId: null,
+          summary: null,
+          metadata: { artifactType: "executor", filesChanged: ["b.ts"], changesSummary: "Changed B", deviationsFromPlan: [], testsRun: [], remainingWork: [] },
+          supersededBy: null,
+          supersedes: "artifact-prev",
+          revisionCount: 2,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const tx = {
+          insert: vi.fn().mockReturnValue({
+            values: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([newRow]),
+            }),
+          }),
+          update: vi.fn().mockReturnValue({
+            set: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue([]),
+            }),
+          }),
+        } as any;
+
+        return await fn(tx);
+      });
+
+      const service = issueArtifactService(mockDb);
+      const result = await service.replace(
+        "company-1",
+        "executing",
+        "issue-1",
+        "executor",
+        { artifactType: "executor", filesChanged: ["b.ts"], changesSummary: "Changed B", deviationsFromPlan: [], testsRun: [], remainingWork: [] },
+      );
+
+      expect(result!.id).toBe("artifact-new");
+      expect(result!.supersedes).toBe("artifact-prev");
+      expect(mockDb.transaction).toHaveBeenCalled();
+    });
+
     it("atomically supersedes previous and creates new published artifact", async () => {
       const previousRow = {
         id: "artifact-prev",
@@ -235,9 +318,14 @@ describe("issueArtifactService", () => {
 
       vi.mocked(mockDb.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue([previousRow]),
+          where: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([previousRow]),
         }),
       } as any);
+
+      vi.mocked(mockDb.transaction).mockImplementation(async (fn) => {
+        await fn(mockDb);
+      });
 
       vi.mocked(mockDb.insert).mockReturnValue({
         values: vi.fn().mockReturnValue({
@@ -284,16 +372,21 @@ describe("issueArtifactService", () => {
     it("creates revision 1 when no previous artifact exists", async () => {
       vi.mocked(mockDb.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue([]),
+          where: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([]),
         }),
       } as any);
+
+      vi.mocked(mockDb.transaction).mockImplementation(async (fn) => {
+        await fn(mockDb);
+      });
 
       vi.mocked(mockDb.insert).mockReturnValue({
         values: vi.fn().mockReturnValue({
           returning: vi.fn().mockResolvedValue([{
             id: "artifact-first",
             companyId: "company-1",
-            issueId: "issue-1",
+            issueId: "11111111-1111-1111-1111-111111111111",
             artifactType: "planner",
             status: "published",
             actorAgentId: null,
@@ -314,7 +407,7 @@ describe("issueArtifactService", () => {
       const result = await service.replace(
         "company-1",
         "planning",
-        "issue-1",
+        "11111111-1111-1111-1111-111111111111",
         "planner",
         { artifactType: "planner", goal: "Test", acceptanceCriteria: [], touchedFiles: [], forbiddenFiles: [], testPlan: "Test", risks: [] },
       );
@@ -325,7 +418,7 @@ describe("issueArtifactService", () => {
 
     it("rejects artifact type mismatching phase in replace", async () => {
       const service = issueArtifactService(mockDb);
-      expect(() =>
+      await expect(
         service.replace(
           "company-1",
           "code_review",
@@ -333,7 +426,7 @@ describe("issueArtifactService", () => {
           "executor",
           { artifactType: "executor", filesChanged: [], changesSummary: "", deviationsFromPlan: [], testsRun: [], remainingWork: [] },
         ),
-      ).toThrow("Artifact type 'executor' is not valid in phase 'code_review' — expected 'executing'");
+      ).rejects.toThrow("Artifact type 'executor' is not valid in phase 'code_review' — expected 'executing'");
     });
   });
 });
@@ -361,8 +454,8 @@ describe("validateArtifactChain", () => {
   });
 
   it("throws when predecessor is not superseded", () => {
-    const predecessor = { id: "a1", status: "published", supersedes: null, revisionCount: 1, createdAt: new Date() } as any;
-    const latest = { id: "a2", status: "published", supersedes: "a1", revisionCount: 2, createdAt: new Date() } as any;
+    const predecessor = { id: "a1", status: "published", supersedes: null, revisionCount: 1, createdAt: new Date("2026-04-19T10:00:00Z") } as any;
+    const latest = { id: "a2", status: "published", supersedes: "a1", revisionCount: 2, createdAt: new Date("2026-04-19T12:00:00Z") } as any;
     expect(() => validateArtifactChain([predecessor, latest])).toThrow("has status 'published', expected 'superseded'");
   });
 
@@ -427,11 +520,32 @@ describe("getArtifactTypeForPhase", () => {
 });
 
 describe("publishArtifactForPhase", () => {
-  // Skipped: this validation is already covered by assertArtifactTypeForPhase unit tests.
-  // The synchronous throw path is tested in the assertArtifactTypeForPhase describe block above.
-  it.skip("validates phase-artifact compatibility before publishing", () => {
+  it("throws when metadata.issueId is missing", async () => {
     const metadata = {
-      issueId: "11111111-1111-1111-1111-111111111111",
+      artifactType: "planner",
+      goal: "Test",
+      acceptanceCriteria: [],
+      touchedFiles: [],
+      forbiddenFiles: [],
+      testPlan: "Test",
+      risks: [],
+      // issueId intentionally omitted
+    };
+
+    await expect(
+      publishArtifactForPhase(
+        mockDb,
+        "company-1",
+        "planning",
+        "planner",
+        metadata,
+      ),
+    ).rejects.toThrow("metadata.issueId to be a non-empty string");
+  });
+
+  it("throws when metadata.issueId is an empty string", async () => {
+    const metadata = {
+      issueId: "",
       artifactType: "planner",
       goal: "Test",
       acceptanceCriteria: [],
@@ -440,16 +554,45 @@ describe("publishArtifactForPhase", () => {
       testPlan: "Test",
       risks: [],
     };
-    // Wrong phase — planner artifact in executing phase
-    expect(() =>
+
+    await expect(
+      publishArtifactForPhase(
+        mockDb,
+        "company-1",
+        "planning",
+        "planner",
+        metadata,
+      ),
+    ).rejects.toThrow("metadata.issueId to be a non-empty string");
+  });
+
+  it("throws when metadata.issueId is not a string", async () => {
+    const metadata = {
+      issueId: 123,
+      artifactType: "planner",
+    };
+
+    await expect(
+      publishArtifactForPhase(
+        mockDb,
+        "company-1",
+        "planning",
+        "planner",
+        metadata,
+      ),
+    ).rejects.toThrow("metadata.issueId to be a non-empty string");
+  });
+
+  it("rejects artifact type mismatching current phase", async () => {
+    await expect(
       publishArtifactForPhase(
         mockDb,
         "company-1",
         "executing",
         "planner",
-        metadata,
+        { issueId: "issue-1", artifactType: "planner", goal: "Test", acceptanceCriteria: [], touchedFiles: [], forbiddenFiles: [], testPlan: "Test", risks: [] },
       ),
-    ).toThrow(
+    ).rejects.toThrow(
       "Artifact type 'planner' is not valid in phase 'executing' — expected 'planning'",
     );
   });
@@ -463,6 +606,9 @@ describe("publishArtifactForPhase", () => {
         }),
       }),
     } as any);
+    vi.mocked(mockDb.transaction).mockImplementation(async (fn) => {
+      await fn(mockDb);
+    });
     vi.mocked(mockDb.insert).mockReturnValue({
       values: vi.fn().mockReturnValue({
         returning: vi.fn().mockResolvedValue([{

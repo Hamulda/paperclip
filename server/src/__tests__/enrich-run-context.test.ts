@@ -2,14 +2,33 @@ import { describe, expect, it, vi } from "vitest";
 import { enrichRunContextWithSwarmState } from "../services/enrich-run-context.js";
 
 describe("enrichRunContextWithSwarmState", () => {
-  const mockDb = {
-    select: vi.fn().mockReturnThis(),
-    from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue([]),
-    insert: vi.fn().mockReturnThis(),
-    update: vi.fn().mockReturnThis(),
-    delete: vi.fn().mockReturnThis(),
-  } as unknown as Record<string, unknown>;
+  function makeQueryChain(result: unknown): any {
+  const chain: any = {
+    from: () => chain,
+    innerJoin: () => chain,
+    where: () => chain,
+    orderBy: () => chain,
+    limit: () => chain,
+    values: () => chain,
+    set: () => chain,
+    returning: () => chain,
+    then: (resolve: any) => resolve(result),
+  };
+  return chain;
+}
+
+function makeDbFn() {
+  return vi.fn(() => makeQueryChain([]));
+}
+
+const mockDb = {
+  select: makeDbFn(),
+  from: makeDbFn(),
+  insert: makeDbFn(),
+  update: makeDbFn(),
+  delete: makeDbFn(),
+  transaction: vi.fn(),
+} as unknown as Record<string, unknown>;
 
   const mockOnLog = vi.fn().mockResolvedValue(undefined);
 
