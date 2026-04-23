@@ -251,17 +251,128 @@ const hermesLocalAdapter: ServerAdapterModule = {
 // Map of type → lazy loader (used only in claude-only profile)
 const LAZY_LOADER_FNS: Record<string, () => Promise<ServerAdapterModule>> = {};
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyModule = Record<string, any>;
+
 function buildLazyLoaders(): void {
-  // These are only needed in claude-only profile.
-  // We define them as functions so they can be called lazily if needed.
-  // In "all" profile, we use the eagerly-imported adapters above instead.
-  LAZY_LOADER_FNS["codex_local"] = async () => codexLocalAdapter;
-  LAZY_LOADER_FNS["cursor"] = async () => cursorLocalAdapter;
-  LAZY_LOADER_FNS["gemini_local"] = async () => geminiLocalAdapter;
-  LAZY_LOADER_FNS["opencode_local"] = async () => openCodeLocalAdapter;
-  LAZY_LOADER_FNS["pi_local"] = async () => piLocalAdapter;
-  LAZY_LOADER_FNS["openclaw_gateway"] = async () => openclawGatewayAdapter;
-  LAZY_LOADER_FNS["hermes_local"] = async () => hermesLocalAdapter;
+  // TRUE lazy load via dynamic import() — no adapter package is imported/parsed/JITted
+  // until first use in claude-only profile. In "all" profile this block is skipped
+  // and adapters are registered via registerAllAdaptersForAllProfile() instead.
+  if (ADAPTER_PROFILE !== "claude-only") return;
+
+  LAZY_LOADER_FNS["codex_local"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-codex-local/server"),
+      import("@paperclipai/adapter-codex-local"),
+    ]) as [AnyModule, AnyModule];
+    const { listCodexModels } = await import("./codex-models.js") as { listCodexModels: AnyModule };
+    return {
+      type: "codex_local", execute: server.execute, testEnvironment: server.testEnvironment,
+      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      sessionCodec: server.sessionCodec,
+      sessionManagement: getAdapterSessionManagement("codex_local") ?? undefined,
+      models: models.models, listModels: listCodexModels,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: false,
+      agentConfigurationDoc: models.agentConfigurationDoc, getQuotaWindows: server.getQuotaWindows,
+    } as ServerAdapterModule;
+  };
+
+  LAZY_LOADER_FNS["cursor"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-cursor-local/server"),
+      import("@paperclipai/adapter-cursor-local"),
+    ]) as [AnyModule, AnyModule];
+    const { listCursorModels } = await import("./cursor-models.js") as { listCursorModels: AnyModule };
+    return {
+      type: "cursor", execute: server.execute, testEnvironment: server.testEnvironment,
+      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      sessionCodec: server.sessionCodec,
+      sessionManagement: getAdapterSessionManagement("cursor") ?? undefined,
+      models: models.models, listModels: listCursorModels,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
+      agentConfigurationDoc: models.agentConfigurationDoc,
+    } as ServerAdapterModule;
+  };
+
+  LAZY_LOADER_FNS["gemini_local"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-gemini-local/server"),
+      import("@paperclipai/adapter-gemini-local"),
+    ]) as [AnyModule, AnyModule];
+    return {
+      type: "gemini_local", execute: server.execute, testEnvironment: server.testEnvironment,
+      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      sessionCodec: server.sessionCodec,
+      sessionManagement: getAdapterSessionManagement("gemini_local") ?? undefined,
+      models: models.models,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
+      agentConfigurationDoc: models.agentConfigurationDoc,
+    } as ServerAdapterModule;
+  };
+
+  LAZY_LOADER_FNS["opencode_local"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-opencode-local/server"),
+      import("@paperclipai/adapter-opencode-local"),
+    ]) as [AnyModule, AnyModule];
+    return {
+      type: "opencode_local", execute: server.execute, testEnvironment: server.testEnvironment,
+      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      sessionCodec: server.sessionCodec, models: models.models, listModels: server.listModels,
+      sessionManagement: getAdapterSessionManagement("opencode_local") ?? undefined,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
+      agentConfigurationDoc: models.agentConfigurationDoc,
+    } as ServerAdapterModule;
+  };
+
+  LAZY_LOADER_FNS["pi_local"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-pi-local/server"),
+      import("@paperclipai/adapter-pi-local"),
+    ]) as [AnyModule, AnyModule];
+    return {
+      type: "pi_local", execute: server.execute, testEnvironment: server.testEnvironment,
+      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      sessionCodec: server.sessionCodec,
+      sessionManagement: getAdapterSessionManagement("pi_local") ?? undefined,
+      models: [], listModels: server.listModels,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
+      agentConfigurationDoc: models.agentConfigurationDoc,
+    } as ServerAdapterModule;
+  };
+
+  LAZY_LOADER_FNS["openclaw_gateway"] = async () => {
+    const [server, models] = await Promise.all([
+      import("@paperclipai/adapter-openclaw-gateway/server"),
+      import("@paperclipai/adapter-openclaw-gateway"),
+    ]) as [AnyModule, AnyModule];
+    return {
+      type: "openclaw_gateway", execute: server.execute, testEnvironment: server.testEnvironment,
+      models: models.models,
+      supportsLocalAgentJwt: false, supportsInstructionsBundle: false,
+      requiresMaterializedRuntimeSkills: false, agentConfigurationDoc: models.agentConfigurationDoc,
+    };
+  };
+
+  LAZY_LOADER_FNS["hermes_local"] = async () => {
+    const [server, models] = await Promise.all([
+      import("hermes-paperclip-adapter/server"),
+      import("hermes-paperclip-adapter"),
+    ]) as [AnyModule, AnyModule];
+    return {
+      type: "hermes_local", execute: server.execute, testEnvironment: server.testEnvironment,
+      sessionCodec: server.sessionCodec, listSkills: server.listSkills, syncSkills: server.syncSkills,
+      models: models.models,
+      supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+      instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: false,
+      agentConfigurationDoc: models.agentConfigurationDoc, detectModel: server.detectModel,
+    } as ServerAdapterModule;
+  };
 }
 
 buildLazyLoaders();

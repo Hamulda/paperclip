@@ -48,7 +48,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { ensureOpenCodeModelConfiguredAndAvailable } from "@paperclipai/adapter-opencode-local/server";
-import { findServerAdapter } from "../adapters/index.js";
+import { findServerAdapter, findActiveServerAdapter } from "../adapters/index.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
@@ -2754,12 +2754,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
   const secrets = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
-  function assertKnownImportAdapterType(type: string | null | undefined): string {
+  async function assertKnownImportAdapterType(type: string | null | undefined): Promise<string> {
     const adapterType = typeof type === "string" ? type.trim() : "";
     if (!adapterType) {
       throw unprocessable("Adapter type is required");
     }
-    if (!findServerAdapter(adapterType)) {
+    const adapter = await findActiveServerAdapter(adapterType);
+    if (!adapter) {
       throw unprocessable(`Unknown adapter type: ${adapterType}`);
     }
     return adapterType;
@@ -2793,7 +2794,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     desiredSkills: string[],
     mode: ImportMode,
   ) {
-    const effectiveAdapterType = assertKnownImportAdapterType(adapterType);
+    const effectiveAdapterType = await assertKnownImportAdapterType(adapterType);
     if (mode === "agent_safe" && IMPORT_FORBIDDEN_ADAPTER_TYPES.has(effectiveAdapterType)) {
       throw forbidden(`Adapter type "${effectiveAdapterType}" is not allowed in safe imports`);
     }

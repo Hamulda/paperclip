@@ -1,3 +1,8 @@
+/**
+ * @deprecated Import from "@paperclipai/db" instead.
+ * This module exists for backward compatibility only.
+ * Use getTestDatabaseSupport() / startTestDatabase() from "@paperclipai/db".
+ */
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";

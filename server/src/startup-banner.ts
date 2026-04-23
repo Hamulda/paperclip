@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { BindMode, DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 
@@ -66,6 +67,13 @@ function redactConnectionString(raw: string): string {
   }
 }
 
+function expandHome(text: string): string {
+  const home = os.homedir();
+  if (text === home) return "~";
+  if (text.startsWith(home + "/")) return "~/" + text.slice(home.length + 1);
+  return text;
+}
+
 function resolveAgentJwtSecretStatus(
   envFilePath: string,
 ): {
@@ -106,6 +114,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const envFilePath = resolvePaperclipEnvPath();
   const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath);
 
+  const adapterProfile = process.env.PAPERCLIP_ADAPTER_PROFILE?.trim() || "all";
+  const isClaudeOnly = adapterProfile === "claude-only";
+
   const dbMode =
     opts.db.mode === "embedded-postgres"
       ? color("embedded-postgres", "green")
@@ -124,7 +135,7 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
 
   const dbDetails =
     opts.db.mode === "embedded-postgres"
-      ? `${opts.db.dataDir} ${color(`(pg:${opts.db.port})`, "dim")}`
+      ? `${expandHome(opts.db.dataDir)} ${color(`(pg:${opts.db.port})`, "dim")}`
       : redactConnectionString(opts.db.connectionString);
 
   const heartbeat = opts.heartbeatSchedulerEnabled
@@ -133,6 +144,13 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const dbBackup = opts.databaseBackupEnabled
     ? `enabled ${color(`(every ${opts.databaseBackupIntervalMinutes}m, keep ${opts.databaseBackupRetentionDays}d)`, "dim")}`
     : color("disabled", "yellow");
+
+  const adapterProfileRow = isClaudeOnly
+    ? row("Adapter", color("claude-only", "green") + color("  (M1/8GB optimized)", "dim"))
+    : null;
+  const adapterHint = !isClaudeOnly
+    ? color("  hint: PAPERCLIP_ADAPTER_PROFILE=claude-only for M1/8GB", "dim")
+    : null;
 
   const art = [
     color("██████╗  █████╗ ██████╗ ███████╗██████╗  ██████╗██╗     ██╗██████╗ ", "cyan"),
@@ -164,8 +182,10 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
     ),
     row("Heartbeat", heartbeat),
     row("DB Backup", dbBackup),
-    row("Backup Dir", opts.databaseBackupDir),
-    row("Config", configPath),
+    row("Backup Dir", expandHome(opts.databaseBackupDir)),
+    row("Config", expandHome(configPath)),
+    adapterProfileRow,
+    adapterHint,
     agentJwtSecret.status === "warn"
       ? color("  ───────────────────────────────────────────────────────", "yellow")
       : null,

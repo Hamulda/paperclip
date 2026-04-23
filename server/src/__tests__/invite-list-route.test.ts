@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { companies, createDb, invites, joinRequests } from "@paperclipai/db";
-import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { getTestDatabaseSupport, startTestDatabase } from "./helpers/embedded-postgres.js";
 import { accessRoutes } from "../routes/access.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -27,22 +27,22 @@ vi.mock("../services/index.js", () => ({
   notifyHireApproved: vi.fn(),
 }));
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const dbSupport = await getTestDatabaseSupport();
+const describeIfDb = dbSupport.skipReason ? describe.skip : describe;
 
-if (!embeddedPostgresSupport.supported) {
+if (!dbSupport.skipReason) {
   console.warn(
-    `Skipping embedded Postgres invite list route tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+    `Skipping invite list route tests: ${dbSupport.skipReason}`,
   );
 }
 
-describeEmbeddedPostgres("GET /companies/:companyId/invites", () => {
+describeIfDb("GET /companies/:companyId/invites", () => {
   let db!: ReturnType<typeof createDb>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let tempDb: Awaited<ReturnType<typeof startTestDatabase>> | null = null;
   let companyId!: string;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-invite-list-route-");
+    tempDb = await startTestDatabase("paperclip-invite-list-route-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 

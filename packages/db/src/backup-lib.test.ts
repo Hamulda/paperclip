@@ -5,14 +5,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./test-embedded-postgres.js";
+import { getTestDatabaseSupport, startTestDatabase } from "@paperclipai/db";
 
 const cleanups: Array<() => Promise<void> | void> = [];
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const dbSupport = await getTestDatabaseSupport();
+const describeIfDb = dbSupport.skipReason ? describe.skip : describe;
 
 function createTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -23,7 +20,7 @@ function createTempDir(prefix: string): string {
 }
 
 async function createTempDatabase(): Promise<string> {
-  const db = await startEmbeddedPostgresTestDatabase("paperclip-db-backup-");
+  const db = await startTestDatabase("paperclip-db-backup-");
   cleanups.push(db.cleanup);
   return db.connectionString;
 }
@@ -44,9 +41,9 @@ afterEach(async () => {
   }
 });
 
-if (!embeddedPostgresSupport.supported) {
+if (!dbSupport.skipReason) {
   console.warn(
-    `Skipping embedded Postgres backup tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+    `Skipping backup tests: ${dbSupport.skipReason}`,
   );
 }
 
@@ -73,7 +70,7 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
-describeEmbeddedPostgres("runDatabaseBackup", () => {
+describeIfDb("runDatabaseBackup", () => {
   it(
     "backs up and restores large table payloads without materializing one giant string",
     async () => {
