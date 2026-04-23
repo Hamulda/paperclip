@@ -138,6 +138,9 @@ export function validateArtifactChain(
 
   const [latest] = published;
 
+  // Build O(1) lookup map — avoids O(N²) chain walk from repeated Array.find()
+  const byId = new Map(artifacts.map((a) => [a.id, a]));
+
   // Invariant 1: verify the head's chain covers all published artifacts (only 1 here, so this
   // checks that the single published artifact is reachable from itself — always true).
   // We also use this pass to build chainIds for superseded member inclusion in the walk below.
@@ -145,9 +148,7 @@ export function validateArtifactChain(
   let cursor: IssueArtifact | null = latest;
   while (cursor) {
     chainIds.add(cursor.id);
-    cursor = cursor.supersedes
-      ? (artifacts.find((a) => a.id === cursor!.supersedes) ?? null)
-      : null;
+    cursor = cursor.supersedes ? (byId.get(cursor.supersedes) ?? null) : null;
   }
 
   // Invariant 3: singleton root revisionCount === 1
@@ -162,9 +163,7 @@ export function validateArtifactChain(
   let prev: IssueArtifact | null = null;
 
   while (current.supersedes) {
-    const predecessor = artifacts.find(
-      (a) => a.id === current.supersedes,
-    );
+    const predecessor = byId.get(current.supersedes) ?? null;
     if (!predecessor) {
       throw new Error(
         `Artifact chain broken: artifact '${current.id}' supersedes '${current.supersedes}' but it does not exist`,

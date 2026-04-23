@@ -1,22 +1,35 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
   inspectMigrations,
 } from "./client.js";
 import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./test-embedded-postgres.js";
+  getTestDatabaseSupport,
+  startTestDatabase,
+} from "./test-database-provider.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+let embeddedPostgresSupport: Awaited<ReturnType<typeof getTestDatabaseSupport>>;
+
+// Vitest collect tests before running any hooks. We must determine skip BEFORE describe
+// blocks are registered, so inline the decision here rather than deferring to beforeAll.
+let describeEmbeddedPostgres: typeof describe;
+{
+  const support = await getTestDatabaseSupport();
+  embeddedPostgresSupport = support;
+  describeEmbeddedPostgres = support.skipReason ? describe.skip : describe;
+  if (support.skipReason) {
+    console.warn(
+      `Skipping migration tests on this host: ${support.skipReason}`,
+    );
+  }
+}
 
 async function createTempDatabase(): Promise<string> {
-  const db = await startEmbeddedPostgresTestDatabase("paperclip-db-client-");
+  const db = await startTestDatabase("paperclip-db-client-");
   cleanups.push(db.cleanup);
   return db.connectionString;
 }
@@ -32,15 +45,13 @@ async function migrationHash(migrationFile: string): Promise<string> {
 afterEach(async () => {
   while (cleanups.length > 0) {
     const cleanup = cleanups.pop();
-    await cleanup?.();
+    try {
+      await cleanup?.();
+    } catch (err) {
+      console.error("Cleanup failed:", err);
+    }
   }
 });
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping embedded Postgres migration tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
-}
 
 describeEmbeddedPostgres("applyPendingMigrations", () => {
   it(
@@ -63,11 +74,12 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0030_rich_magneto.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0030_rich_magneto.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
+      expect(pendingState.availableMigrations).toContain("0030_rich_magneto.sql");
+      expect(pendingState.appliedMigrations).toContain("0029_plugin_tables.sql");
 
       await applyPendingMigrations(connectionString);
 
@@ -126,11 +138,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0044_illegal_toad.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0044_illegal_toad.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
 
       await applyPendingMigrations(connectionString);
 
@@ -201,11 +212,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0046_smooth_sentinels.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0046_smooth_sentinels.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
 
       await applyPendingMigrations(connectionString);
 
@@ -295,11 +305,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0047_overjoyed_groot.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0047_overjoyed_groot.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
 
       await applyPendingMigrations(connectionString);
 
@@ -366,11 +375,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0048_flashy_marrow.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0048_flashy_marrow.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
 
       await applyPendingMigrations(connectionString);
 
@@ -432,11 +440,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
 
       const pendingState = await inspectMigrations(connectionString);
-      expect(pendingState).toMatchObject({
-        status: "needsMigrations",
-        pendingMigrations: ["0050_stiff_luckman.sql"],
-        reason: "pending-migrations",
-      });
+      expect(pendingState.status).toBe("needsMigrations");
+      expect(pendingState.pendingMigrations).toEqual(["0050_stiff_luckman.sql"]);
+      expect(pendingState.reason).toBe("pending-migrations");
+      expect(pendingState.tableCount).toBeGreaterThan(0);
 
       await applyPendingMigrations(connectionString);
 

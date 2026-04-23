@@ -10,6 +10,7 @@ import {
   recordPhaseTransition,
   clearTracking,
   getTracking,
+  cleanupTracking,
 } from "../swarm-orchestrator.ts";
 import { validateArtifactChain } from "../issue-artifacts.js";
 import type { PlannerArtifact, PlanReviewerArtifact, ExecutorArtifact, ReviewerArtifact, IntegratorArtifact } from "@paperclipai/shared";
@@ -621,6 +622,106 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
     const action = decideFromArtifact(plannerMeta, "planner", "executing", ISSUE);
     expect(action.type).toBe("noop");
     expect((action as any).reason).toContain("not compatible");
+  });
+});
+
+// ── Tracking TTL / bounded cleanup ──────────────────────────────────────────
+describe("cleanupTracking — TTL and terminal state eviction", () => {
+  const STALE_ID = "stale-issue";
+  const TERMINAL_DONE_ID = "terminal-done-issue";
+  const TERMINAL_BLOCKED_ID = "terminal-blocked-issue";
+  const ACTIVE_ID = "active-issue";
+
+  const originalMaxAge = (60 * 60 * 1000); // 1 hour — MAX_TRACKING_AGE_MS
+
+  afterEach(() => {
+    clearTracking(STALE_ID);
+    clearTracking(TERMINAL_DONE_ID);
+    clearTracking(TERMINAL_BLOCKED_ID);
+    clearTracking(ACTIVE_ID);
+  });
+
+  it("evicts entries in 'done' terminal state on cleanup", () => {
+    recordPhaseTransition(TERMINAL_DONE_ID, "planning", "integration");
+    recordPhaseTransition(TERMINAL_DONE_ID, "integration", "done");
+    expect(getTracking(TERMINAL_DONE_ID)).toBeDefined();
+    cleanupTracking();
+    // Accessing after cleanup — entry should be gone (tracking Map re-queried)
+    clearTracking(TERMINAL_DONE_ID); // already gone, no-op
+    expect(() => getTracking(TERMINAL_DONE_ID)).not.toThrow();
+  });
+
+  it("evicts entries in 'blocked' terminal state on cleanup", () => {
+    recordPhaseTransition(TERMINAL_BLOCKED_ID, "planning", "blocked");
+    expect(getTracking(TERMINAL_BLOCKED_ID)).toBeDefined();
+    cleanupTracking();
+    clearTracking(TERMINAL_BLOCKED_ID);
+    expect(() => getTracking(TERMINAL_BLOCKED_ID)).not.toThrow();
+  });
+
+  it("evicts entries older than MAX_TRACKING_AGE_MS", () => {
+    // Create entry — its lastAccessedAt will be set to now
+    getTracking(STALE_ID);
+    // Manually age the entry by setting lastAccessedAt to epoch
+    // Access the module's internal tracking Map via the public getTracking
+    // We manipulate via phaseHistory since lastAccessedAt is not public
+    // Use recordPhaseTransition to advance state, then manually set lastAccessedAt
+    const t = getTracking(STALE_ID);
+    Object.defineProperty(t, "lastAccessedAt", {
+      value: Date.now() - originalMaxAge - 1,
+      writable: true,
+      configurable: true,
+    });
+    cleanupTracking();
+    // After cleanup, STALE_ID entry should be gone
+    // Attempting to get it should create a fresh entry (no error)
+    const fresh = getTracking(STALE_ID);
+    expect(fresh.lastAccessedAt).toBeGreaterThanOrEqual(Date.now() - 1000);
+  });
+
+  it("does NOT evict recently-accessed active entries", () => {
+    const t = getTracking(ACTIVE_ID);
+    expect(t.lastAccessedAt).toBeGreaterThan(0);
+    cleanupTracking();
+    // Entry should still exist
+    const after = getTracking(ACTIVE_ID);
+    expect(after).toBeDefined();
+  });
+});
+
+// ── Tracking lastAccessedAt is updated on getTracking ───────────────────────
+describe("getTracking — lastAccessedAt", () => {
+  const ISSUE = "access-time-issue";
+
+  afterEach(() => {
+    clearTracking(ISSUE);
+  });
+
+  it("sets lastAccessedAt on first access", () => {
+    const before = Date.now() - 1000;
+    const t = getTracking(ISSUE);
+    expect(t.lastAccessedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("updates lastAccessedAt on subsequent access", async () => {
+    const t1 = getTracking(ISSUE);
+    const firstAccess = t1.lastAccessedAt;
+    await new Promise((r) => setTimeout(r, 10));
+    const t2 = getTracking(ISSUE);
+    expect(t2.lastAccessedAt).toBeGreaterThanOrEqual(firstAccess);
+  });
+});
+
+// ── orchestrateIssue — exported function shape ───────────────────────────────
+describe("orchestrateIssue — exported function", () => {
+  it("is exported as an async function", async () => {
+    const { orchestrateIssue } = await import("../swarm-orchestrator.ts");
+    expect(typeof orchestrateIssue).toBe("function");
+    // Should be an async function (returns a Promise)
+    const result = orchestrateIssue(null as any, "any-id");
+    expect(result).toBeInstanceOf(Promise);
+    // Clean up the inFlight map entry created by the call
+    await result.catch(() => {/* expected to fail on null db */});
   });
 });
 

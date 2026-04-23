@@ -1,105 +1,84 @@
-# CLAUDE.md
+# Paperclip — Claude Code Handbook
 
-Quick reference for Claude Code agents working in this repo.
+**Canonical publish: `publishForCurrentPhase()` — jediná cesta pro workflow artifacty.**
+
+## Quick Ref
+
+| Phase | Role | Artifact | Přechází do |
+|-------|------|----------|-------------|
+| planning | planner | `{ plan: { goals, tasks } }` | plan_review |
+| plan_review | plan_reviewer | `{ verdict, feedback }` | executing / planning |
+| executing | executor | `{ changes, completedTasks }` | code_review |
+| code_review | reviewer | `{ verdict, comments }` | integration / executing |
+| integration | integrator | `{ merged, notes }` | — |
+
+Bounce limit: 3 backward transitions. Rework limit: 2 artifacty per phase.
 
 ## Canonical Publish Path
-
-**Use `publishForCurrentPhase()` — the ONLY entrypoint for workflow artifacts.**
 
 ```typescript
 import { publishForCurrentPhase } from "./services/issue-artifacts.js";
 
 const artifact = await publishForCurrentPhase(
-  db,
-  companyId,
-  "planner", // | "plan_reviewer" | "executor" | "reviewer" | "integrator"
+  db, companyId, "planner",
   { issueId: "..." },
-  agentId,   // optional
-  summary,   // optional
+  agentId,  // volitelné
+  summary,  // volitelné
 );
 ```
 
-This atomically: validates phase↔role compatibility → replaces prior artifact of same type → triggers orchestration.
+Atomicky: validuje phase↔role kompatibilitu → nahradí předchozí artifact stejného typu → spustí `orchestrateIssue()`.
 
-**Never call** `replace()`, `create()`, or `publish()` directly on `issueArtifactService`.
+**Nikdy** nevol `replace()`, `create()`, `publish()` přímo na `issueArtifactService`.
 
-## Phase → Role Mapping
+## Role Usage Patterns
 
-| Phase | Role | Artifact Type |
-|-------|------|---------------|
-| planning | planner | planner |
-| plan_review | plan_reviewer | plan_reviewer |
-| executing | executor | executor |
-| code_review | reviewer | reviewer |
-| integration | integrator | integrator |
+```typescript
+// PLANNER — vytvoř plán
+await publishForCurrentPhase(db, companyId, "planner", {
+  issueId, plan: { goals: [...], tasks: [...] },
+});
+
+// PLAN_REVIEWER — schvalení plánu
+await publishForCurrentPhase(db, companyId, "plan_reviewer", {
+  issueId, verdict: "approved" | "rejected", feedback: "...",
+});
+
+// EXECUTOR — proveď změny
+await publishForCurrentPhase(db, companyId, "executor", {
+  issueId, changes: [{ file: "...", diff: "..." }], completedTasks: [...],
+});
+
+// REVIEWER — code review
+await publishForCurrentPhase(db, companyId, "reviewer", {
+  issueId, verdict: "approved" | "changes_requested", comments: [...],
+});
+
+// INTEGRATOR — merge
+await publishForCurrentPhase(db, companyId, "integrator", {
+  issueId, merged: boolean, notes: "...",
+});
+```
+
+## Orchestration Decisions
+
+Po každém `publishForCurrentPhase()` běží `orchestrateIssue()` a vrací:
+
+- `phase_transition` — posun do další fáze
+- `reassign` — přesměrování agenta
+- `mark_blocked` — zastaveno (bounce/rework limit)
+- `mark_ready_for_execution` — vstup do exekuční pipeline
+- `noop` — nic
 
 ## Architecture Hot Spots
 
 | File | Purpose |
 |------|---------|
-| `server/src/services/issue-artifacts.ts` | Artifact lifecycle — use `publishForCurrentPhase()` |
-| `server/src/services/swarm-orchestrator.ts` | Decision layer after every publish — `orchestrateIssue()` |
+| `server/src/services/issue-artifacts.ts` | Artifact lifecycle — pouze `publishForCurrentPhase()` |
+| `server/src/services/swarm-orchestrator.ts` | Rozhodovací vrstva po každém publish — `orchestrateIssue()` |
 | `server/src/services/issue-phase.ts` | Phase transition validation |
-| `server/src/services/heartbeat.ts` | Run heartbeat processing (large, active) |
-| `server/src/services/issues.ts` | Core issue CRUD and workflow (large) |
-
-## Role Usage Patterns
-
-### planner
-```typescript
-await publishForCurrentPhase(db, companyId, "planner", {
-  issueId,
-  plan: { goals: [...], tasks: [...] },
-});
-```
-
-### plan_reviewer
-```typescript
-await publishForCurrentPhase(db, companyId, "plan_reviewer", {
-  issueId,
-  verdict: "approved" | "rejected",
-  feedback: "...",
-});
-```
-
-### executor
-```typescript
-await publishForCurrentPhase(db, companyId, "executor", {
-  issueId,
-  changes: [{ file: "...", diff: "..." }],
-  completedTasks: [...],
-});
-```
-
-### reviewer
-```typescript
-await publishForCurrentPhase(db, companyId, "reviewer", {
-  issueId,
-  verdict: "approved" | "changes_requested",
-  comments: [...],
-});
-```
-
-### integrator
-```typescript
-await publishForCurrentPhase(db, companyId, "integrator", {
-  issueId,
-  merged: boolean,
-  notes: "...",
-});
-```
-
-## Orchestration Decision Types
-
-After every `publishForCurrentPhase()`, `orchestrateIssue()` runs and returns one of:
-
-- `phase_transition` — advance to next phase
-- `reassign` — route to different agent
-- `mark_blocked` — stop due to bounce/rework limit
-- `mark_ready_for_execution` — enter execution pipeline
-- `noop` — no action
-
-Bounce limit: 3 consecutive phase transitions. Rework limit: 2 artifacts per phase.
+| `server/src/services/heartbeat.ts` | Heartbeat processing (velký, aktivní) |
+| `server/src/services/issues.ts` | Core issue CRUD a workflow (velký) |
 
 ## Repo Map
 
@@ -112,10 +91,10 @@ Bounce limit: 3 consecutive phase transitions. Rework limit: 2 artifacts per pha
 ## Dev Commands
 
 ```sh
-pnpm dev          # API + UI on :3100
+pnpm dev          # API + UI na :3100
 pnpm test         # Vitest suite
 pnpm test:e2e     # Browser e2e (opt-in)
-pnpm db:generate  # Generate migration after schema change
+pnpm db:generate  # Generate migration po změně schématu
 ```
 
 ## Key Constraint

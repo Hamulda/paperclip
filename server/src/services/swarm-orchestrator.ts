@@ -1,7 +1,9 @@
 // Swarm Orchestrator — decision layer for phase transitions and issue routing
 // It is NOT a coder: it observes artifacts, reviews queues, and directs work.
 
+import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { issues } from "@paperclipai/db";
 import type {
   PlannerArtifact,
   PlanReviewerArtifact,
@@ -21,6 +23,10 @@ import { validateArtifactChain } from "./issue-artifacts.js";
 const MAX_BOUNCES = 3;
 // Maximum times the same phase can produce a new artifact before blocking (rework budget)
 const MAX_REWORKS_PER_PHASE = 2;
+// Maximum age (ms) of a tracking entry before it is eligible for eviction.
+// Terminal-state entries (done/blocked) are cleaned up immediately after TTL;
+// active entries are cleaned on access if older than this.
+const MAX_TRACKING_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 export type OrchestrationAction =
   | { type: "phase_transition"; to: IssuePhase; reason: string }
@@ -66,10 +72,16 @@ interface IssueTracking {
   reworksByPhase: Partial<Record<IssuePhase, number>>;
   lastWasBounce: boolean; // true if the previous recordTransition call was a bounce
   prevFromPhase: IssuePhase | null; // the fromPhase of the previous transition
+  lastAccessedAt: number; // Date.now() of last getTracking() call for TTL cleanup
 }
 
 // Module-level tracking store — resets on process restart (intentional: short-lived env)
 const tracking = new Map<string, IssueTracking>();
+
+// Per-issue serialisation: in-flight orchestration promises.
+// Ensures concurrent calls for the same issueId are serialised, preventing
+// read→decide→apply races in single-node deployments.
+const inFlight = new Map<string, Promise<OrchestrationDecision | null>>();
 
 export function clearTracking(issueId: string): void {
   tracking.delete(issueId);
@@ -77,9 +89,57 @@ export function clearTracking(issueId: string): void {
 
 export function getTracking(issueId: string): IssueTracking {
   if (!tracking.has(issueId)) {
-    tracking.set(issueId, { phaseHistory: [], bounces: 0, reworksByPhase: {}, lastWasBounce: false, prevFromPhase: null });
+    tracking.set(issueId, {
+      phaseHistory: [],
+      bounces: 0,
+      reworksByPhase: {},
+      lastWasBounce: false,
+      prevFromPhase: null,
+      lastAccessedAt: Date.now(),
+    });
   }
-  return tracking.get(issueId)!;
+  const t = tracking.get(issueId)!;
+  t.lastAccessedAt = Date.now();
+  return t;
+}
+
+/**
+ * Evict tracking entries that are:
+ * - in terminal states (done, blocked), OR
+ * - older than MAX_TRACKING_AGE_MS since last access.
+ * Called opportunistically on each orchestrateIssue entry.
+ */
+export function cleanupTracking(): void {
+  const now = Date.now();
+  for (const [id, t] of tracking.entries()) {
+    const isTerminal = t.phaseHistory.at(-1) === "done" || t.phaseHistory.at(-1) === "blocked";
+    const isStale = now - t.lastAccessedAt > MAX_TRACKING_AGE_MS;
+    if (isTerminal || isStale) {
+      tracking.delete(id);
+    }
+  }
+}
+
+/**
+ * Serialise orchestrateIssue calls per issueId using a promise chain.
+ * Concurrent calls for different issues proceed in parallel (no lock).
+ * Concurrent calls for the same issue are queued and resolved in order.
+ */
+async function withIssueLock<T>(
+  issueId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const current = inFlight.get(issueId);
+  const next = (async () => {
+    if (current) await current;
+    return fn();
+  })();
+  inFlight.set(issueId, next as any);
+  try {
+    return await next;
+  } finally {
+    if (inFlight.get(issueId) === next) inFlight.delete(issueId);
+  }
 }
 
 function plannerReached(artifact: PlannerArtifact): boolean {
@@ -382,30 +442,37 @@ export function decisionToOrchestrationAction(
 export async function applyOrchestrationDecision(
   db: Db,
   decision: OrchestrationDecision,
+  dbOrTx?: any,
 ): Promise<void> {
   const issues = issueService(db);
+  const resolvedDb = dbOrTx ?? db;
   const action = decision.action;
 
   switch (action.type) {
     case "phase_transition": {
       assertPhaseTransition(decision.phase, action.to);
-      recordPhaseTransition(decision.issueId, decision.phase, action.to);
       await issues.update(
         decision.issueId,
         { phase: action.to },
         {},
+        resolvedDb,
       );
+      // Only update in-memory tracking AFTER the DB write succeeds.
+      // If the transaction rolls back, we must NOT update the bounce counter.
+      recordPhaseTransition(decision.issueId, decision.phase, action.to);
       break;
     }
 
     case "mark_blocked": {
       assertPhaseTransition(decision.phase, "blocked");
-      recordPhaseTransition(decision.issueId, decision.phase, "blocked");
       await issues.update(
         decision.issueId,
         { phase: "blocked" },
         {},
+        resolvedDb,
       );
+      // Only update in-memory tracking AFTER the DB write succeeds.
+      recordPhaseTransition(decision.issueId, decision.phase, "blocked");
       break;
     }
 
@@ -418,6 +485,7 @@ export async function applyOrchestrationDecision(
           assigneeAgentId: action.assigneeAgentId,
         },
         {},
+        resolvedDb,
       );
       break;
     }
@@ -430,6 +498,7 @@ export async function applyOrchestrationDecision(
           phase: decision.phase,
         },
         {},
+        resolvedDb,
       );
       break;
     }
@@ -455,27 +524,64 @@ export async function orchestrateIssue(
   db: Db,
   issueId: string,
 ): Promise<OrchestrationDecision | null> {
-  const issues = issueService(db);
-  const issue = await issues.getById(issueId);
-  if (!issue) return null;
+  return withIssueLock(issueId, async () => orchestrateIssueInner(db, issueId));
+}
 
-  const phase = (issue.phase as IssuePhase | null) ?? "triage";
+async function orchestrateIssueInner(
+  db: Db,
+  issueId: string,
+): Promise<OrchestrationDecision | null> {
+  // Opportunistic cleanup of stale/terminal tracking entries before each orchestration run.
+  cleanupTracking();
+
+  const issues = issueService(db);
+
+  // ── Read current issue state WITHIN a transaction and FOR UPDATE lock.
+  // This prevents concurrent orchestrateIssue calls for the same issue from
+  // racing: the second caller blocks on the SELECT FOR UPDATE until the first
+  // commits or rolls back, ensuring decisions are based on committed state.
+  let phase: IssuePhase;
+  let verificationStatus: VerificationStatus | null;
+  let blockedBy: string[];
+
+  await db.transaction(async (tx) => {
+    // Acquire row-level lock on the issue row to serialise concurrent callers.
+    await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+
+    // Read within the same transaction — sees the locked row state.
+    const rows = await tx
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1);
+    const issue = rows[0] ?? null;
+
+    if (!issue) {
+      phase = "triage";
+      verificationStatus = null;
+      blockedBy = [];
+      return;
+    }
+
+    phase = (issue.phase as IssuePhase | null) ?? "triage";
+    verificationStatus = issue.verificationStatus as VerificationStatus | null;
+    blockedBy = issue.blockedBy ?? [];
+  });
 
   // ── Blocked state: consult review queue for unblock signal ────────────────
   if (phase === "blocked") {
-    const handoff = {
-      verificationStatus: issue.verificationStatus as VerificationStatus | null,
-      blockers: issue.blockedBy ?? [],
-    };
+    const handoff = { verificationStatus, blockers: blockedBy };
     const action = resolveBlockedTransition(issueId, handoff);
     const decision: OrchestrationDecision = {
       issueId,
       phase,
       action,
-      artifactType: "integrator" as ArtifactType, // placeholder — blocked has no artifact type
+      artifactType: "integrator" as ArtifactType,
     };
     if (action.type !== "noop") {
-      await applyOrchestrationDecision(db, decision);
+      await db.transaction(async (tx) => {
+        await applyOrchestrationDecision(db, decision, tx);
+      });
     }
     return decision;
   }
@@ -483,7 +589,6 @@ export async function orchestrateIssue(
   // ── Expected artifact type for current phase (gate) ─────────────────────
   const expectedArtifactType = ARTIFACT_FOR_PHASE[phase];
   if (!expectedArtifactType) {
-    // Terminal/non-workflow phase — nothing to orchestrate
     return null;
   }
 
@@ -493,7 +598,7 @@ export async function orchestrateIssue(
 
   if (!chainHead) return null;
 
-  // ── Phase compatibility guard: reject artifacts from other phases ─────────
+  // ── Phase compatibility guard ─────────────────────────────────────────────
   if (!isArtifactPhaseCompatible(chainHead.artifactType as ArtifactType, phase)) {
     const action: OrchestrationAction = {
       type: "noop",
@@ -504,17 +609,18 @@ export async function orchestrateIssue(
 
   const artifactType = chainHead.artifactType as ArtifactType;
   const meta = chainHead.metadata;
-
   if (!meta) return null;
 
   const action = decideFromArtifact(meta as any, artifactType, phase, issueId);
-  const decision: OrchestrationDecision = {
-    issueId,
-    phase,
-    action,
-    artifactType,
-  };
+  const decision: OrchestrationDecision = { issueId, phase, action, artifactType };
 
-  await applyOrchestrationDecision(db, decision);
+  if (action.type !== "noop") {
+    // Apply decision within a transaction so that the write is atomic with
+    // respect to the FOR UPDATE lock acquired at the top of this function.
+    await db.transaction(async (tx) => {
+      await applyOrchestrationDecision(db, decision, tx);
+    });
+  }
+
   return decision;
 }
