@@ -48,8 +48,8 @@ import {
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_ENV = { ...process.env };
 const dbSupport = await getTestDatabaseSupport();
-const itEmbeddedPostgres = dbSupport.provider === "embedded" ? it : it.skip;
-const describeEmbeddedPostgres = dbSupport.provider === "embedded" ? describe : describe.skip;
+const itEmbeddedPostgres = dbSupport.provider === "embedded" && !dbSupport.skipReason ? it : it.skip;
+const describeEmbeddedPostgres = dbSupport.provider === "embedded" && !dbSupport.skipReason ? describe : describe.skip;
 
 if (dbSupport.provider !== "embedded") {
   console.warn(

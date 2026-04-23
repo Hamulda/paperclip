@@ -10,78 +10,8 @@ import {
   getQuotaWindows as claudeGetQuotaWindows,
 } from "@paperclipai/adapter-claude-local/server";
 import { agentConfigurationDoc as claudeAgentConfigurationDoc, models as claudeModels } from "@paperclipai/adapter-claude-local";
-import {
-  execute as codexExecute,
-  listCodexSkills,
-  syncCodexSkills,
-  testEnvironment as codexTestEnvironment,
-  sessionCodec as codexSessionCodec,
-  getQuotaWindows as codexGetQuotaWindows,
-} from "@paperclipai/adapter-codex-local/server";
-import { agentConfigurationDoc as codexAgentConfigurationDoc, models as codexModels } from "@paperclipai/adapter-codex-local";
-import {
-  execute as cursorExecute,
-  listCursorSkills,
-  syncCursorSkills,
-  testEnvironment as cursorTestEnvironment,
-  sessionCodec as cursorSessionCodec,
-} from "@paperclipai/adapter-cursor-local/server";
-import { agentConfigurationDoc as cursorAgentConfigurationDoc, models as cursorModels } from "@paperclipai/adapter-cursor-local";
-import {
-  execute as geminiExecute,
-  listGeminiSkills,
-  syncGeminiSkills,
-  testEnvironment as geminiTestEnvironment,
-  sessionCodec as geminiSessionCodec,
-} from "@paperclipai/adapter-gemini-local/server";
-import { agentConfigurationDoc as geminiAgentConfigurationDoc, models as geminiModels } from "@paperclipai/adapter-gemini-local";
-import {
-  execute as openCodeExecute,
-  listOpenCodeSkills,
-  syncOpenCodeSkills,
-  testEnvironment as openCodeTestEnvironment,
-  sessionCodec as openCodeSessionCodec,
-  listOpenCodeModels,
-} from "@paperclipai/adapter-opencode-local/server";
-import {
-  agentConfigurationDoc as openCodeAgentConfigurationDoc,
-  models as openCodeModels,
-} from "@paperclipai/adapter-opencode-local";
-import {
-  execute as openclawGatewayExecute,
-  testEnvironment as openclawGatewayTestEnvironment,
-} from "@paperclipai/adapter-openclaw-gateway/server";
-import {
-  agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
-  models as openclawGatewayModels,
-} from "@paperclipai/adapter-openclaw-gateway";
-import {
-  execute as piExecute,
-  listPiSkills,
-  syncPiSkills,
-  testEnvironment as piTestEnvironment,
-  sessionCodec as piSessionCodec,
-  listPiModels,
-} from "@paperclipai/adapter-pi-local/server";
-import {
-  agentConfigurationDoc as piAgentConfigurationDoc,
-} from "@paperclipai/adapter-pi-local";
-import {
-  execute as hermesExecute,
-  testEnvironment as hermesTestEnvironment,
-  sessionCodec as hermesSessionCodec,
-  listSkills as hermesListSkills,
-  syncSkills as hermesSyncSkills,
-  detectModel as detectModelFromHermes,
-} from "hermes-paperclip-adapter/server";
-import {
-  agentConfigurationDoc as hermesAgentConfigurationDoc,
-  models as hermesModels,
-} from "hermes-paperclip-adapter";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
-import { listCodexModels } from "./codex-models.js";
-import { listCursorModels } from "./cursor-models.js";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
@@ -90,7 +20,7 @@ import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 // Adapter runtime profile — reduces startup overhead on resource-constrained
 // hardware (e.g. MacBook Air M1 8 GB). In "claude-only" mode only the Claude
 // Code adapter + process/http built-ins are registered eagerly; all other
-// adapters are loaded lazily on first use via dynamic import.
+// adapters are loaded lazily on first use via dynamic import().
 // ---------------------------------------------------------------------------
 
 type AdapterProfile = "all" | "claude-only";
@@ -104,7 +34,9 @@ function getAdapterProfile(): AdapterProfile {
 const ADAPTER_PROFILE = getAdapterProfile();
 
 // ---------------------------------------------------------------------------
-// Lazy adapter loading — for non-eager adapters in claude-only profile
+// Lazy adapter loading — non-claude adapters use dynamic import() so their
+// packages are never parsed/JITted unless actually used (claude-only profile)
+// or until registered at startup (all profile).
 // ---------------------------------------------------------------------------
 
 interface LazyAdapterEntry {
@@ -114,8 +46,11 @@ interface LazyAdapterEntry {
 
 const lazyAdapters = new Map<string, LazyAdapterEntry>();
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyModule = Record<string, any>;
+
 // ---------------------------------------------------------------------------
-// Built-in adapter definitions
+// Built-in adapter definitions — always-on adapters loaded eagerly
 // ---------------------------------------------------------------------------
 
 const claudeLocalAdapter: ServerAdapterModule = {
@@ -136,129 +71,19 @@ const claudeLocalAdapter: ServerAdapterModule = {
   getQuotaWindows: claudeGetQuotaWindows,
 };
 
-const codexLocalAdapter: ServerAdapterModule = {
-  type: "codex_local",
-  execute: codexExecute,
-  testEnvironment: codexTestEnvironment,
-  listSkills: listCodexSkills,
-  syncSkills: syncCodexSkills,
-  sessionCodec: codexSessionCodec,
-  sessionManagement: getAdapterSessionManagement("codex_local") ?? undefined,
-  models: codexModels,
-  listModels: listCodexModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: false,
-  agentConfigurationDoc: codexAgentConfigurationDoc,
-  getQuotaWindows: codexGetQuotaWindows,
-};
+// ---------------------------------------------------------------------------
+// Map of type → lazy loader — used by both profiles (all: called at startup,
+// claude-only: called on first use)
+// ---------------------------------------------------------------------------
 
-const cursorLocalAdapter: ServerAdapterModule = {
-  type: "cursor",
-  execute: cursorExecute,
-  testEnvironment: cursorTestEnvironment,
-  listSkills: listCursorSkills,
-  syncSkills: syncCursorSkills,
-  sessionCodec: cursorSessionCodec,
-  sessionManagement: getAdapterSessionManagement("cursor") ?? undefined,
-  models: cursorModels,
-  listModels: listCursorModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: true,
-  agentConfigurationDoc: cursorAgentConfigurationDoc,
-};
-
-const geminiLocalAdapter: ServerAdapterModule = {
-  type: "gemini_local",
-  execute: geminiExecute,
-  testEnvironment: geminiTestEnvironment,
-  listSkills: listGeminiSkills,
-  syncSkills: syncGeminiSkills,
-  sessionCodec: geminiSessionCodec,
-  sessionManagement: getAdapterSessionManagement("gemini_local") ?? undefined,
-  models: geminiModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: true,
-  agentConfigurationDoc: geminiAgentConfigurationDoc,
-};
-
-const openclawGatewayAdapter: ServerAdapterModule = {
-  type: "openclaw_gateway",
-  execute: openclawGatewayExecute,
-  testEnvironment: openclawGatewayTestEnvironment,
-  models: openclawGatewayModels,
-  supportsLocalAgentJwt: false,
-  supportsInstructionsBundle: false,
-  requiresMaterializedRuntimeSkills: false,
-  agentConfigurationDoc: openclawGatewayAgentConfigurationDoc,
-};
-
-const openCodeLocalAdapter: ServerAdapterModule = {
-  type: "opencode_local",
-  execute: openCodeExecute,
-  testEnvironment: openCodeTestEnvironment,
-  listSkills: listOpenCodeSkills,
-  syncSkills: syncOpenCodeSkills,
-  sessionCodec: openCodeSessionCodec,
-  models: openCodeModels,
-  sessionManagement: getAdapterSessionManagement("opencode_local") ?? undefined,
-  listModels: listOpenCodeModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: true,
-  agentConfigurationDoc: openCodeAgentConfigurationDoc,
-};
-
-const piLocalAdapter: ServerAdapterModule = {
-  type: "pi_local",
-  execute: piExecute,
-  testEnvironment: piTestEnvironment,
-  listSkills: listPiSkills,
-  syncSkills: syncPiSkills,
-  sessionCodec: piSessionCodec,
-  sessionManagement: getAdapterSessionManagement("pi_local") ?? undefined,
-  models: [],
-  listModels: listPiModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: true,
-  agentConfigurationDoc: piAgentConfigurationDoc,
-};
-
-const hermesLocalAdapter: ServerAdapterModule = {
-  type: "hermes_local",
-  execute: hermesExecute,
-  testEnvironment: hermesTestEnvironment,
-  sessionCodec: hermesSessionCodec,
-  listSkills: hermesListSkills,
-  syncSkills: hermesSyncSkills,
-  models: hermesModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
-  requiresMaterializedRuntimeSkills: false,
-  agentConfigurationDoc: hermesAgentConfigurationDoc,
-  detectModel: () => detectModelFromHermes(),
-};
-
-// Map of type → lazy loader (used only in claude-only profile)
 const LAZY_LOADER_FNS: Record<string, () => Promise<ServerAdapterModule>> = {};
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyModule = Record<string, any>;
-
 function buildLazyLoaders(): void {
-  // TRUE lazy load via dynamic import() — no adapter package is imported/parsed/JITted
-  // until first use in claude-only profile. In "all" profile this block is skipped
-  // and adapters are registered via registerAllAdaptersForAllProfile() instead.
-  if (ADAPTER_PROFILE !== "claude-only") return;
+  // LAZY_LOADER_FNS is populated in BOTH profiles:
+  // - "all" profile: loaders are called at startup in registerBuiltInAdapters()
+  // - "claude-only" profile: loaders are called on-demand in findActiveServerAdapter()
+  // The early return below only prevented population — we now build in both modes
+  // so findActiveServerAdapter can trigger on-demand loading in claude-only mode.
 
   LAZY_LOADER_FNS["codex_local"] = async () => {
     const [server, models] = await Promise.all([
@@ -268,7 +93,7 @@ function buildLazyLoaders(): void {
     const { listCodexModels } = await import("./codex-models.js") as { listCodexModels: AnyModule };
     return {
       type: "codex_local", execute: server.execute, testEnvironment: server.testEnvironment,
-      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      listSkills: server.listCodexSkills, syncSkills: server.syncCodexSkills,
       sessionCodec: server.sessionCodec,
       sessionManagement: getAdapterSessionManagement("codex_local") ?? undefined,
       models: models.models, listModels: listCodexModels,
@@ -286,7 +111,7 @@ function buildLazyLoaders(): void {
     const { listCursorModels } = await import("./cursor-models.js") as { listCursorModels: AnyModule };
     return {
       type: "cursor", execute: server.execute, testEnvironment: server.testEnvironment,
-      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      listSkills: server.listCursorSkills, syncSkills: server.syncCursorSkills,
       sessionCodec: server.sessionCodec,
       sessionManagement: getAdapterSessionManagement("cursor") ?? undefined,
       models: models.models, listModels: listCursorModels,
@@ -303,7 +128,7 @@ function buildLazyLoaders(): void {
     ]) as [AnyModule, AnyModule];
     return {
       type: "gemini_local", execute: server.execute, testEnvironment: server.testEnvironment,
-      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      listSkills: server.listGeminiSkills, syncSkills: server.syncGeminiSkills,
       sessionCodec: server.sessionCodec,
       sessionManagement: getAdapterSessionManagement("gemini_local") ?? undefined,
       models: models.models,
@@ -320,8 +145,8 @@ function buildLazyLoaders(): void {
     ]) as [AnyModule, AnyModule];
     return {
       type: "opencode_local", execute: server.execute, testEnvironment: server.testEnvironment,
-      listSkills: server.listSkills, syncSkills: server.syncSkills,
-      sessionCodec: server.sessionCodec, models: models.models, listModels: server.listModels,
+      listSkills: server.listOpenCodeSkills, syncSkills: server.syncOpenCodeSkills,
+      sessionCodec: server.sessionCodec, models: models.models, listModels: server.listOpenCodeModels,
       sessionManagement: getAdapterSessionManagement("opencode_local") ?? undefined,
       supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
       instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
@@ -336,10 +161,10 @@ function buildLazyLoaders(): void {
     ]) as [AnyModule, AnyModule];
     return {
       type: "pi_local", execute: server.execute, testEnvironment: server.testEnvironment,
-      listSkills: server.listSkills, syncSkills: server.syncSkills,
+      listSkills: server.listPiSkills, syncSkills: server.syncPiSkills,
       sessionCodec: server.sessionCodec,
       sessionManagement: getAdapterSessionManagement("pi_local") ?? undefined,
-      models: [], listModels: server.listModels,
+      models: [], listModels: server.listPiModels,
       supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
       instructionsPathKey: "instructionsFilePath", requiresMaterializedRuntimeSkills: true,
       agentConfigurationDoc: models.agentConfigurationDoc,
@@ -411,34 +236,35 @@ function ensureLazyAdapterLoaded(type: string): void {
 // ---------------------------------------------------------------------------
 // Register built-in adapters
 //
-// - "all" profile: ALL adapters are synchronously registered at module load
+// - "all" profile: ALL adapters are registered at module load via dynamic
+//   import (packages are imported at startup, same as original static import)
 // - "claude-only" profile: only claude_local + process + http are registered.
 //   Other adapters are loaded lazily on first use via findActiveServerAdapter.
 // ---------------------------------------------------------------------------
 
-function registerBuiltInAdapters(): void {
+async function registerBuiltInAdapters(): Promise<void> {
   // Always-on adapters: claude_local + process + http
   adaptersByType.set(claudeLocalAdapter.type, claudeLocalAdapter);
   adaptersByType.set(processAdapter.type, processAdapter);
   adaptersByType.set(httpAdapter.type, httpAdapter);
 
   if (ADAPTER_PROFILE === "all") {
-    // In "all" profile, register all other adapters immediately (same as original)
-    adaptersByType.set(codexLocalAdapter.type, codexLocalAdapter);
-    adaptersByType.set(cursorLocalAdapter.type, cursorLocalAdapter);
-    adaptersByType.set(geminiLocalAdapter.type, geminiLocalAdapter);
-    adaptersByType.set(openclawGatewayAdapter.type, openclawGatewayAdapter);
-    adaptersByType.set(openCodeLocalAdapter.type, openCodeLocalAdapter);
-    adaptersByType.set(piLocalAdapter.type, piLocalAdapter);
-    adaptersByType.set(hermesLocalAdapter.type, hermesLocalAdapter);
+    // In "all" profile, register all other adapters via their lazy loaders.
+    // The dynamic import() inside each loader runs now (at startup), making
+    // adapters available synchronously after this function resolves.
+    for (const type of Object.keys(LAZY_LOADER_FNS)) {
+      const loader = LAZY_LOADER_FNS[type]!;
+      const module = await loader();
+      adaptersByType.set(type, module);
+    }
   }
   // In "claude-only" profile, other adapters remain unloaded until first use
 }
 
-registerBuiltInAdapters();
+await registerBuiltInAdapters();
 
 export function waitForBuiltInAdapters(): Promise<void> {
-  // In "all" profile, adapters are already registered synchronously
+  // In "all" profile, adapters are already registered (awaited above)
   // In "claude-only" profile, only the always-on adapters are registered
   return Promise.resolve();
 }
