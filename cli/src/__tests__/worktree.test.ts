@@ -41,19 +41,19 @@ import {
 } from "../commands/worktree-lib.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
+  getTestDatabaseSupport,
+  startTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_ENV = { ...process.env };
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const itEmbeddedPostgres = embeddedPostgresSupport.supported ? it : it.skip;
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const dbSupport = await getTestDatabaseSupport();
+const itEmbeddedPostgres = dbSupport.provider === "embedded" ? it : it.skip;
+const describeEmbeddedPostgres = dbSupport.provider === "embedded" ? describe : describe.skip;
 
-if (!embeddedPostgresSupport.supported) {
+if (dbSupport.provider !== "embedded") {
   console.warn(
-    `Skipping embedded Postgres worktree CLI tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+    `Skipping embedded Postgres worktree CLI tests: provider=${dbSupport.provider}, skipReason=${dbSupport.skipReason ?? "none"}`,
   );
 }
 
@@ -387,7 +387,7 @@ describe("worktree helpers", () => {
       const sourceKeyPath = path.join(sourceConfigDir, "secrets", "master.key");
       const worktreeHome = path.join(tempRoot, ".paperclip-worktrees");
       const originalCwd = process.cwd();
-      const sourceDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-auth-source-");
+      const sourceDb = await startTestDatabase("paperclip-worktree-auth-source-");
 
       try {
         const sourceDbClient = createDb(sourceDb.connectionString);
@@ -667,7 +667,7 @@ describe("worktree helpers", () => {
     }
   });
 
-  it("reseed preserves the current worktree ports, instance id, and branding", async () => {
+  itEmbeddedPostgres("reseed preserves the current worktree ports, instance id, and branding", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-reseed-"));
     const repoRoot = path.join(tempRoot, "repo");
     const sourceRoot = path.join(tempRoot, "source");
@@ -1049,7 +1049,7 @@ describe("worktree helpers", () => {
 
 describeEmbeddedPostgres("pauseSeededScheduledRoutines", () => {
   it("pauses only routines with enabled schedule triggers", async () => {
-    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-routines-");
+    const tempDb = await startTestDatabase("paperclip-worktree-routines-");
     const db = createDb(tempDb.connectionString);
     const companyId = randomUUID();
     const projectId = randomUUID();
