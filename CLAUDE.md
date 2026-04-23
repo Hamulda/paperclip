@@ -4,13 +4,13 @@
 
 ## Quick Ref
 
-| Phase | Role | Artifact | Přechází do |
-|-------|------|----------|-------------|
-| planning | planner | `{ plan: { goals, tasks } }` | plan_review |
-| plan_review | plan_reviewer | `{ verdict, feedback }` | executing / planning |
-| executing | executor | `{ changes, completedTasks }` | code_review |
-| code_review | reviewer | `{ verdict, comments }` | integration / executing |
-| integration | integrator | `{ merged, notes }` | — |
+| Phase | Role | Artifact fields | Přechází do |
+|-------|------|------------------|-------------|
+| planning | planner | `goal`, `acceptanceCriteria[]`, `touchedFiles[]`, `forbiddenFiles[]`, `testPlan`, `risks[]` | plan_review |
+| plan_review | plan_reviewer | `verdict`, `scopeChanges[]`, `notes[]` | ready_for_execution / planning |
+| executing | executor | `filesChanged[]`, `changesSummary`, `deviationsFromPlan[]`, `testsRun[]`, `remainingWork[]` | code_review |
+| code_review | reviewer | `verdict`, `issuesFound[]`, `fixesMade[]`, `verificationStatus`, `mergeReadiness` | integration / executing / planning |
+| integration | integrator | `finalVerification`, `deploymentNotes[]`, `signoffs[]`, `remainingOpenIssues[]`, `rollbackPlan` | done / blocked |
 
 Bounce limit: 3 backward transitions. Rework limit: 2 artifacty per phase.
 

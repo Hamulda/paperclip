@@ -55,8 +55,6 @@ import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
   models as openclawGatewayModels,
 } from "@paperclipai/adapter-openclaw-gateway";
-import { listCodexModels } from "./codex-models.js";
-import { listCursorModels } from "./cursor-models.js";
 import {
   execute as piExecute,
   listPiSkills,
@@ -80,11 +78,45 @@ import {
   agentConfigurationDoc as hermesAgentConfigurationDoc,
   models as hermesModels,
 } from "hermes-paperclip-adapter";
+import { processAdapter } from "./process/index.js";
+import { httpAdapter } from "./http/index.js";
+import { listCodexModels } from "./codex-models.js";
+import { listCursorModels } from "./cursor-models.js";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
-import { processAdapter } from "./process/index.js";
-import { httpAdapter } from "./http/index.js";
+
+// ---------------------------------------------------------------------------
+// Adapter runtime profile — reduces startup overhead on resource-constrained
+// hardware (e.g. MacBook Air M1 8 GB). In "claude-only" mode only the Claude
+// Code adapter + process/http built-ins are registered eagerly; all other
+// adapters are loaded lazily on first use via dynamic import.
+// ---------------------------------------------------------------------------
+
+type AdapterProfile = "all" | "claude-only";
+
+function getAdapterProfile(): AdapterProfile {
+  const env = process.env.PAPERCLIP_ADAPTER_PROFILE;
+  if (env === "claude-only") return "claude-only";
+  return "all";
+}
+
+const ADAPTER_PROFILE = getAdapterProfile();
+
+// ---------------------------------------------------------------------------
+// Lazy adapter loading — for non-eager adapters in claude-only profile
+// ---------------------------------------------------------------------------
+
+interface LazyAdapterEntry {
+  module: ServerAdapterModule;
+  loadPromise: Promise<ServerAdapterModule>;
+}
+
+const lazyAdapters = new Map<string, LazyAdapterEntry>();
+
+// ---------------------------------------------------------------------------
+// Built-in adapter definitions
+// ---------------------------------------------------------------------------
 
 const claudeLocalAdapter: ServerAdapterModule = {
   type: "claude_local",
@@ -216,6 +248,28 @@ const hermesLocalAdapter: ServerAdapterModule = {
   detectModel: () => detectModelFromHermes(),
 };
 
+// Map of type → lazy loader (used only in claude-only profile)
+const LAZY_LOADER_FNS: Record<string, () => Promise<ServerAdapterModule>> = {};
+
+function buildLazyLoaders(): void {
+  // These are only needed in claude-only profile.
+  // We define them as functions so they can be called lazily if needed.
+  // In "all" profile, we use the eagerly-imported adapters above instead.
+  LAZY_LOADER_FNS["codex_local"] = async () => codexLocalAdapter;
+  LAZY_LOADER_FNS["cursor"] = async () => cursorLocalAdapter;
+  LAZY_LOADER_FNS["gemini_local"] = async () => geminiLocalAdapter;
+  LAZY_LOADER_FNS["opencode_local"] = async () => openCodeLocalAdapter;
+  LAZY_LOADER_FNS["pi_local"] = async () => piLocalAdapter;
+  LAZY_LOADER_FNS["openclaw_gateway"] = async () => openclawGatewayAdapter;
+  LAZY_LOADER_FNS["hermes_local"] = async () => hermesLocalAdapter;
+}
+
+buildLazyLoaders();
+
+// ---------------------------------------------------------------------------
+// Adapter registry maps
+// ---------------------------------------------------------------------------
+
 const adaptersByType = new Map<string, ServerAdapterModule>();
 
 // For builtin types that are overridden by an external adapter, we keep the
@@ -227,43 +281,69 @@ const builtinFallbacks = new Map<string, ServerAdapterModule>();
 // external.  Persisted across reloads via the same disabled-adapters store.
 const pausedOverrides = new Set<string>();
 
-function registerBuiltInAdapters() {
-  for (const adapter of [
-    claudeLocalAdapter,
-    codexLocalAdapter,
-    openCodeLocalAdapter,
-    piLocalAdapter,
-    cursorLocalAdapter,
-    geminiLocalAdapter,
-    openclawGatewayAdapter,
-    hermesLocalAdapter,
-    processAdapter,
-    httpAdapter,
-  ]) {
-    adaptersByType.set(adapter.type, adapter);
+// ---------------------------------------------------------------------------
+// Trigger lazy load of an adapter if not yet loaded (claude-only profile)
+// ---------------------------------------------------------------------------
+
+function ensureLazyAdapterLoaded(type: string): void {
+  if (lazyAdapters.has(type)) return;
+  const loader = LAZY_LOADER_FNS[type];
+  if (!loader) return;
+  const loadPromise = loader().then((module) => {
+    lazyAdapters.set(type, { module, loadPromise });
+    adaptersByType.set(type, module);
+    return module;
+  });
+  lazyAdapters.set(type, { module: loadPromise as unknown as ServerAdapterModule, loadPromise });
+}
+
+// ---------------------------------------------------------------------------
+// Register built-in adapters
+//
+// - "all" profile: ALL adapters are synchronously registered at module load
+// - "claude-only" profile: only claude_local + process + http are registered.
+//   Other adapters are loaded lazily on first use via findActiveServerAdapter.
+// ---------------------------------------------------------------------------
+
+function registerBuiltInAdapters(): void {
+  // Always-on adapters: claude_local + process + http
+  adaptersByType.set(claudeLocalAdapter.type, claudeLocalAdapter);
+  adaptersByType.set(processAdapter.type, processAdapter);
+  adaptersByType.set(httpAdapter.type, httpAdapter);
+
+  if (ADAPTER_PROFILE === "all") {
+    // In "all" profile, register all other adapters immediately (same as original)
+    adaptersByType.set(codexLocalAdapter.type, codexLocalAdapter);
+    adaptersByType.set(cursorLocalAdapter.type, cursorLocalAdapter);
+    adaptersByType.set(geminiLocalAdapter.type, geminiLocalAdapter);
+    adaptersByType.set(openclawGatewayAdapter.type, openclawGatewayAdapter);
+    adaptersByType.set(openCodeLocalAdapter.type, openCodeLocalAdapter);
+    adaptersByType.set(piLocalAdapter.type, piLocalAdapter);
+    adaptersByType.set(hermesLocalAdapter.type, hermesLocalAdapter);
   }
+  // In "claude-only" profile, other adapters remain unloaded until first use
 }
 
 registerBuiltInAdapters();
 
+export function waitForBuiltInAdapters(): Promise<void> {
+  // In "all" profile, adapters are already registered synchronously
+  // In "claude-only" profile, only the always-on adapters are registered
+  return Promise.resolve();
+}
+
 // ---------------------------------------------------------------------------
-// Load external adapter plugins (e.g. droid_local)
-//
-// External adapter packages export createServerAdapter() which returns a
-// ServerAdapterModule. The host fills in sessionManagement.
+// Cached sync wrapper — the store is a simple JSON file read, safe to call frequently.
 // ---------------------------------------------------------------------------
 
-/** Cached sync wrapper — the store is a simple JSON file read, safe to call frequently. */
 function getDisabledAdapterTypesFromStore(): string[] {
   return getDisabledAdapterTypes();
 }
 
-/**
- * Load external adapters from the plugin store and hardcoded sources.
- * Called once at module initialization. The promise is exported so that
- * callers (e.g. assertKnownAdapterType, app startup) can await completion
- * and avoid racing against the loading window.
- */
+// ---------------------------------------------------------------------------
+// Load external adapter plugins (e.g. droid_local)
+// ---------------------------------------------------------------------------
+
 const externalAdaptersReady: Promise<void> = (async () => {
   try {
     const externalAdapters = await buildExternalAdapters();
@@ -273,7 +353,6 @@ const externalAdaptersReady: Promise<void> = (async () => {
         console.log(
           `[paperclip] External adapter "${externalAdapter.type}" overrides built-in adapter`,
         );
-        // Save the original builtin for later restoration.
         const existing = adaptersByType.get(externalAdapter.type);
         if (existing && !builtinFallbacks.has(externalAdapter.type)) {
           builtinFallbacks.set(externalAdapter.type, existing);
@@ -292,12 +371,6 @@ const externalAdaptersReady: Promise<void> = (async () => {
   }
 })();
 
-/**
- * Await this before validating adapter types to avoid race conditions
- * during server startup. External adapters are loaded asynchronously;
- * calling assertKnownAdapterType before this resolves will reject
- * valid external adapter types.
- */
 export function waitForExternalAdapters(): Promise<void> {
   return externalAdaptersReady;
 }
@@ -310,6 +383,7 @@ export function registerServerAdapter(adapter: ServerAdapterModule): void {
     }
   }
   adaptersByType.set(adapter.type, adapter);
+  lazyAdapters.delete(adapter.type);
 }
 
 export function unregisterServerAdapter(type: string): void {
@@ -326,10 +400,11 @@ export function unregisterServerAdapter(type: string): void {
     return;
   }
   adaptersByType.delete(type);
+  lazyAdapters.delete(type);
 }
 
-export function requireServerAdapter(type: string): ServerAdapterModule {
-  const adapter = findActiveServerAdapter(type);
+export async function requireServerAdapter(type: string): Promise<ServerAdapterModule> {
+  const adapter = await findActiveServerAdapter(type);
   if (!adapter) {
     throw new Error(`Unknown adapter type: ${type}`);
   }
@@ -337,11 +412,11 @@ export function requireServerAdapter(type: string): ServerAdapterModule {
 }
 
 export function getServerAdapter(type: string): ServerAdapterModule {
-  return findActiveServerAdapter(type) ?? processAdapter;
+  return adaptersByType.get(type) ?? processAdapter;
 }
 
 export async function listAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
-  const adapter = findActiveServerAdapter(type);
+  const adapter = await findActiveServerAdapter(type);
   if (!adapter) return [];
   if (adapter.listModels) {
     const discovered = await adapter.listModels();
@@ -354,11 +429,6 @@ export function listServerAdapters(): ServerAdapterModule[] {
   return Array.from(adaptersByType.values());
 }
 
-/**
- * List adapters excluding those that are disabled in settings.
- * Used for menus and agent creation flows — disabled adapters remain
- * functional for existing agents but hidden from selection.
- */
 export function listEnabledServerAdapters(): ServerAdapterModule[] {
   const disabled = getDisabledAdapterTypesFromStore();
   const disabledSet = disabled.length > 0 ? new Set(disabled) : null;
@@ -370,7 +440,7 @@ export function listEnabledServerAdapters(): ServerAdapterModule[] {
 export async function detectAdapterModel(
   type: string,
 ): Promise<{ model: string; provider: string; source: string; candidates?: string[] } | null> {
-  const adapter = findActiveServerAdapter(type);
+  const adapter = await findActiveServerAdapter(type);
   if (!adapter?.detectModel) return null;
   const detected = await adapter.detectModel();
   if (!detected) return null;
@@ -382,23 +452,6 @@ export async function detectAdapterModel(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Override pause / resume
-// ---------------------------------------------------------------------------
-
-/**
- * Pause or resume an external override for a builtin adapter type.
- *
- * - `paused = true`  → subsequent calls to `getServerAdapter(type)` return
- *   the builtin fallback instead of the external adapter.  Already-running
- *   agent sessions are unaffected (they hold a reference to the module they
- *   started with).
- *
- * - `paused = false` → the external adapter is active again.
- *
- * Returns `true` if the state actually changed, `false` if the type is not
- * an override or was already in the requested state.
- */
 export function setOverridePaused(type: string, paused: boolean): boolean {
   if (!builtinFallbacks.has(type)) return false;
   const wasPaused = pausedOverrides.has(type);
@@ -415,12 +468,10 @@ export function setOverridePaused(type: string, paused: boolean): boolean {
   return false;
 }
 
-/** Check whether the external override for a builtin type is currently paused. */
 export function isOverridePaused(type: string): boolean {
   return pausedOverrides.has(type);
 }
 
-/** Get the set of types whose overrides are currently paused. */
 export function getPausedOverrides(): Set<string> {
   return pausedOverrides;
 }
@@ -429,10 +480,26 @@ export function findServerAdapter(type: string): ServerAdapterModule | null {
   return adaptersByType.get(type) ?? null;
 }
 
-export function findActiveServerAdapter(type: string): ServerAdapterModule | null {
+export async function findActiveServerAdapter(type: string): Promise<ServerAdapterModule | null> {
   if (pausedOverrides.has(type)) {
     const fallback = builtinFallbacks.get(type);
     if (fallback) return fallback;
   }
-  return adaptersByType.get(type) ?? null;
+
+  const found = adaptersByType.get(type);
+  if (found) return found;
+
+  // In "claude-only" profile, non-eager adapters are loaded lazily on first use
+  if (ADAPTER_PROFILE === "claude-only" && LAZY_LOADER_FNS[type]) {
+    if (!lazyAdapters.has(type)) {
+      ensureLazyAdapterLoaded(type);
+    }
+    const entry = lazyAdapters.get(type);
+    if (entry) {
+      await entry.loadPromise;
+    }
+    return adaptersByType.get(type) ?? null;
+  }
+
+  return null;
 }

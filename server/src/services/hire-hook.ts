@@ -40,7 +40,7 @@ export async function notifyHireApproved(
   }
 
   const adapterType = row.adapterType ?? "process";
-  const adapter = findActiveServerAdapter(adapterType);
+  const adapter = await findActiveServerAdapter(adapterType);
   const onHireApproved = adapter?.onHireApproved;
   if (!onHireApproved) {
     return;

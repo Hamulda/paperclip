@@ -46,24 +46,24 @@ describe("server adapter registry", () => {
 
     registerServerAdapter(externalAdapter);
 
-    expect(requireServerAdapter("external_test")).toBe(externalAdapter);
+    expect(await requireServerAdapter("external_test")).toBe(externalAdapter);
     expect(await listAdapterModels("external_test")).toEqual([
       { id: "external-model", label: "External Model" },
     ]);
   });
 
-  it("removes external adapters when unregistered", () => {
+  it("removes external adapters when unregistered", async () => {
     registerServerAdapter(externalAdapter);
 
     unregisterServerAdapter("external_test");
 
     expect(findServerAdapter("external_test")).toBeNull();
-    expect(() => requireServerAdapter("external_test")).toThrow(
+    await expect(requireServerAdapter("external_test")).rejects.toThrow(
       "Unknown adapter type: external_test",
     );
   });
 
-  it("allows external plugin to override a built-in adapter type", () => {
+  it("allows external plugin to override a built-in adapter type", async () => {
     // claude_local is always built-in
     const builtIn = findServerAdapter("claude_local");
     expect(builtIn).not.toBeNull();
@@ -88,14 +88,14 @@ describe("server adapter registry", () => {
     registerServerAdapter(plugin);
 
     // Plugin wins
-    const resolved = requireServerAdapter("claude_local");
+    const resolved = await requireServerAdapter("claude_local");
     expect(resolved).toBe(plugin);
     expect(resolved.models).toEqual([
       { id: "plugin-model", label: "Plugin Override" },
     ]);
   });
 
-  it("exposes capability flags from registered adapters", () => {
+  it("exposes capability flags from registered adapters", async () => {
     const adapterWithCaps: ServerAdapterModule = {
       type: "external_test",
       execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
@@ -113,7 +113,7 @@ describe("server adapter registry", () => {
 
     registerServerAdapter(adapterWithCaps);
 
-    const resolved = findActiveServerAdapter("external_test");
+    const resolved = await findActiveServerAdapter("external_test");
     expect(resolved).not.toBeNull();
     expect(resolved!.supportsInstructionsBundle).toBe(true);
     expect(resolved!.instructionsPathKey).toBe("customPathKey");
@@ -121,18 +121,18 @@ describe("server adapter registry", () => {
     expect(resolved!.supportsLocalAgentJwt).toBe(true);
   });
 
-  it("returns undefined for capability flags on adapters that do not set them", () => {
+  it("returns undefined for capability flags on adapters that do not set them", async () => {
     registerServerAdapter(externalAdapter);
 
-    const resolved = findActiveServerAdapter("external_test");
+    const resolved = await findActiveServerAdapter("external_test");
     expect(resolved).not.toBeNull();
     expect(resolved!.supportsInstructionsBundle).toBeUndefined();
     expect(resolved!.instructionsPathKey).toBeUndefined();
     expect(resolved!.requiresMaterializedRuntimeSkills).toBeUndefined();
   });
 
-  it("built-in claude_local adapter declares capability flags", () => {
-    const adapter = findActiveServerAdapter("claude_local");
+  it("built-in claude_local adapter declares capability flags", async () => {
+    const adapter = await findActiveServerAdapter("claude_local");
     expect(adapter).not.toBeNull();
     expect(adapter!.supportsInstructionsBundle).toBe(true);
     expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
@@ -169,7 +169,7 @@ describe("server adapter registry", () => {
 
     registerServerAdapter(plugin);
 
-    expect(findActiveServerAdapter("claude_local")).toBe(plugin);
+    expect(await findActiveServerAdapter("claude_local")).toBe(plugin);
     expect(await listAdapterModels("claude_local")).toEqual([
       { id: "plugin-model", label: "Plugin Override" },
     ]);
@@ -180,7 +180,7 @@ describe("server adapter registry", () => {
 
     expect(setOverridePaused("claude_local", true)).toBe(true);
 
-    expect(findActiveServerAdapter("claude_local")).not.toBe(plugin);
+    expect(await findActiveServerAdapter("claude_local")).not.toBe(plugin);
     expect(await listAdapterModels("claude_local")).toEqual(builtIn?.models ?? []);
     expect(await detectAdapterModel("claude_local")).toBeNull();
     expect(detectModel).toHaveBeenCalledTimes(1);

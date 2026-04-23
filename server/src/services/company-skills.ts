@@ -1663,7 +1663,7 @@ export function companySkillService(db: Db) {
 
     return Promise.all(
       desiredAgents.map(async (agent) => {
-        const adapter = findActiveServerAdapter(agent.adapterType);
+        const adapter = await findActiveServerAdapter(agent.adapterType);
         let actualState: string | null = null;
 
         if (!adapter?.listSkills) {

@@ -616,7 +616,7 @@ export function adapterRoutes() {
     assertBoardOrgAccess(req);
     const { type } = req.params;
 
-    const adapter = findActiveServerAdapter(type);
+    const adapter = await findActiveServerAdapter(type);
     if (!adapter) {
       res.status(404).json({ error: `Adapter "${type}" is not registered.` });
       return;

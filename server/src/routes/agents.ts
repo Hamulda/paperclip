@@ -91,15 +91,15 @@ export function agentRoutes(db: Db) {
   const DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES = new Set(Object.keys(DEFAULT_INSTRUCTIONS_PATH_KEYS));
 
   /** Check if an adapter supports the managed instructions bundle. */
-  function adapterSupportsInstructionsBundle(adapterType: string): boolean {
-    const adapter = findActiveServerAdapter(adapterType);
+  async function adapterSupportsInstructionsBundle(adapterType: string): Promise<boolean> {
+    const adapter = await findActiveServerAdapter(adapterType);
     if (adapter?.supportsInstructionsBundle !== undefined) return adapter.supportsInstructionsBundle;
     return DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES.has(adapterType);
   }
 
   /** Resolve the adapter config key for the instructions file path. */
-  function resolveInstructionsPathKey(adapterType: string): string | null {
-    const adapter = findActiveServerAdapter(adapterType);
+  async function resolveInstructionsPathKey(adapterType: string): Promise<string | null> {
+    const adapter = await findActiveServerAdapter(adapterType);
     if (adapter?.instructionsPathKey) return adapter.instructionsPathKey;
     if (adapter?.supportsInstructionsBundle === true) return "instructionsFilePath";
     if (adapter?.supportsInstructionsBundle === false) return null;
@@ -608,7 +608,7 @@ export function agentRoutes(db: Db) {
     adapterType: string;
     adapterConfig: unknown;
   }>(agent: T): Promise<T> {
-    if (!adapterSupportsInstructionsBundle(agent.adapterType)) {
+    if (!await adapterSupportsInstructionsBundle(agent.adapterType)) {
       return agent;
     }
 
@@ -703,8 +703,8 @@ export function agentRoutes(db: Db) {
     "pi_local",
   ]);
 
-  function shouldMaterializeRuntimeSkillsForAdapter(adapterType: string) {
-    const adapter = findActiveServerAdapter(adapterType);
+  async function shouldMaterializeRuntimeSkillsForAdapter(adapterType: string): Promise<boolean> {
+    const adapter = await findActiveServerAdapter(adapterType);
     if (adapter?.requiresMaterializedRuntimeSkills !== undefined) {
       return adapter.requiresMaterializedRuntimeSkills;
     }
@@ -717,7 +717,7 @@ export function agentRoutes(db: Db) {
     config: Record<string, unknown>,
   ) {
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
-      materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
+      materializeMissing: await shouldMaterializeRuntimeSkillsForAdapter(adapterType),
     });
     return {
       ...config,
@@ -744,7 +744,7 @@ export function agentRoutes(db: Db) {
       requestedDesiredSkills,
     );
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
-      materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
+      materializeMissing: await shouldMaterializeRuntimeSkillsForAdapter(adapterType),
     });
     const requiredSkills = runtimeSkillEntries
       .filter((entry) => entry.required)
@@ -864,7 +864,7 @@ export function agentRoutes(db: Db) {
       const type = assertKnownAdapterType(req.params.type as string);
       await assertCanReadConfigurations(req, companyId);
 
-      const adapter = requireServerAdapter(type);
+      const adapter = await requireServerAdapter(type);
 
       const inputAdapterConfig =
         (req.body?.adapterConfig ?? {}) as Record<string, unknown>;
@@ -897,7 +897,7 @@ export function agentRoutes(db: Db) {
     }
     await assertCanReadConfigurations(req, agent.companyId);
 
-    const adapter = findActiveServerAdapter(agent.adapterType);
+    const adapter = await findActiveServerAdapter(agent.adapterType);
     if (!adapter?.listSkills) {
       const preference = readPaperclipSkillSyncPreference(
         agent.adapterConfig as Record<string, unknown>,
@@ -975,7 +975,7 @@ export function agentRoutes(db: Db) {
         return;
       }
 
-      const adapter = findActiveServerAdapter(updated.adapterType);
+      const adapter = await findActiveServerAdapter(updated.adapterType);
       const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
         updated.companyId,
         updated.adapterConfig,
@@ -1693,7 +1693,7 @@ export function agentRoutes(db: Db) {
 
     const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
-    const defaultKey = resolveInstructionsPathKey(existing.adapterType);
+    const defaultKey = await resolveInstructionsPathKey(existing.adapterType);
     const adapterConfigKey = explicitKey ?? defaultKey;
     if (!adapterConfigKey) {
       res.status(422).json({

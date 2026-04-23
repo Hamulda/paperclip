@@ -102,17 +102,31 @@ describe("startTestDatabase", () => {
     await expect(startTestDatabase("paperclip-test-")).rejects.toThrow("Cannot start test database");
   });
 
-  it("returns external DB when TEST_DB_PROVIDER=external and URL is set", async () => {
-    // Note: startTestDatabase() calls applyPendingMigrations() which requires
-    // a live Postgres. We verify the shape via getTestDatabaseSupport() instead.
-    process.env.TEST_DB_PROVIDER = "external";
-    process.env.TEST_DATABASE_URL = "postgres://user:pass@localhost:5432/testdb";
+  it("returns external DB when TEST_DB_PROVIDER=auto and URL is set", async () => {
+    process.env.TEST_DB_PROVIDER = "auto";
+    process.env.TEST_DATABASE_URL = "postgres://user:pass@localhost:5432/autoroute";
     vi.resetModules();
     const { getTestDatabaseSupport } = await import("./test-database-provider.js");
     const support = await getTestDatabaseSupport();
     expect(support.provider).toBe("external");
-    expect(support.connectionString).toBe("postgres://user:pass@localhost:5432/testdb");
+    expect(support.connectionString).toBe("postgres://user:pass@localhost:5432/autoroute");
     expect(support.skipReason).toBeUndefined();
+  });
+
+  it("returns embedded DB when TEST_DB_PROVIDER=auto with no URL and embedded is supported", async () => {
+    // This test relies on embedded-postgres being available on the machine
+    // and uses the default "auto" provider. We only assert on shape since
+    // embedded-postgres startup may be slow.
+    process.env.TEST_DB_PROVIDER = "auto";
+    process.env.TEST_DATABASE_URL = "";
+    vi.resetModules();
+    const { getTestDatabaseSupport } = await import("./test-database-provider.js");
+    const support = await getTestDatabaseSupport();
+    // In auto mode with no URL, embedded is probed — if unsupported, skipReason is set
+    if (!support.skipReason) {
+      expect(support.provider).toBe("embedded");
+      expect(support.connectionString).toContain("127.0.0.1");
+    }
   });
 });
 
@@ -141,5 +155,35 @@ describe("provider type exports", () => {
     const { getTestDatabaseSupport } = await import("./test-database-provider.js");
     const s = await getTestDatabaseSupport();
     expect(s.skipReason).toContain("TEST_DATABASE_URL is not set");
+  });
+});
+
+describe("startTestDatabase — embedded provider", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  it("starts embedded DB, runs migrations, cleanup stops instance and removes data dir", async () => {
+    process.env.TEST_DB_PROVIDER = "embedded";
+    vi.resetModules();
+    const { startTestDatabase } = await import("./test-database-provider.js");
+    const db = await startTestDatabase("paperclip-test-embedded-");
+    expect(db.provider).toBe("embedded");
+    expect(db.connectionString).toContain("127.0.0.1");
+    expect(typeof db.cleanup).toBe("function");
+
+    // Verify cleanupfn is callable and does not throw
+    await expect(db.cleanup()).resolves.toBeUndefined();
+  });
+
+  it("cleanup is a no-op for external provider", async () => {
+    process.env.TEST_DB_PROVIDER = "external";
+    process.env.TEST_DATABASE_URL = "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip";
+    vi.resetModules();
+    const { startTestDatabase } = await import("./test-database-provider.js");
+    const db = await startTestDatabase("paperclip-test-external-");
+    expect(db.provider).toBe("external");
+    await expect(db.cleanup()).resolves.toBeUndefined();
   });
 });
