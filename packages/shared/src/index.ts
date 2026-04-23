@@ -553,6 +553,7 @@ export {
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
   createIssueArtifactSchema,
+  artifactMetadataSchema,
   type CreateIssue,
   type CreateIssueLabel,
   type UpdateIssue,

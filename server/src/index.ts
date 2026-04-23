@@ -466,6 +466,10 @@ export async function startServer(): Promise<StartedServer> {
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
   if (config.deploymentMode === "local_trusted") {
+    console.warn(
+      "[auth] WARNING: local_trusted mode is active — all requests are authenticated as the local board admin. " +
+      "Do NOT use this mode in production.",
+    );
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
   if (config.deploymentMode === "authenticated") {
@@ -576,10 +580,14 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
   
+  // Timer handles declared at outer scope so shutdown can clear them.
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let backupTimer: ReturnType<typeof setInterval> | null = null;
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
-  
+
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
@@ -598,7 +606,8 @@ export async function startServer(): Promise<StartedServer> {
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
-    setInterval(() => {
+
+    heartbeatTimer = setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
         .then((result) => {
@@ -690,7 +699,7 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
+    backupTimer = setInterval(() => {
       void runScheduledBackup();
     }, backupIntervalMs);
   }
@@ -778,6 +787,9 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
         }
       }
+
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (backupTimer) clearInterval(backupTimer);
 
       process.exit(0);
     };

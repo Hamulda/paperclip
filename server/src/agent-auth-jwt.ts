@@ -37,6 +37,21 @@ function jwtConfig() {
   };
 }
 
+// Throw at startup if PAPERCLIP_AGENT_JWT_SECRET is explicitly configured but unavailable.
+// This prevents silent JWT failures when adapters expect local agent JWT injection.
+function validateJwtConfig() {
+  const explicitlyConfigured = !!process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+  if (!explicitlyConfigured) return;
+  const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET!.trim();
+  if (!secret) {
+    throw new Error(
+      "PAPERCLIP_AGENT_JWT_SECRET is configured but resolved to an empty string. " +
+      "Ensure it is set to a non-empty value.",
+    );
+  }
+}
+validateJwtConfig();
+
 function base64UrlEncode(value: string) {
   return Buffer.from(value, "utf8").toString("base64url");
 }

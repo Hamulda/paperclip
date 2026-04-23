@@ -36,27 +36,33 @@ Atomicky: validuje phase↔role kompatibilitu → nahradí předchozí artifact 
 ```typescript
 // PLANNER — vytvoř plán
 await publishForCurrentPhase(db, companyId, "planner", {
-  issueId, plan: { goals: [...], tasks: [...] },
+  issueId, goal: "...", acceptanceCriteria: ["..."],
+  touchedFiles: ["..."], forbiddenFiles: [], testPlan: "...", risks: [],
 });
 
 // PLAN_REVIEWER — schvalení plánu
 await publishForCurrentPhase(db, companyId, "plan_reviewer", {
-  issueId, verdict: "approved" | "rejected", feedback: "...",
+  issueId, verdict: "approved" | "rejected",
+  scopeChanges: [], notes: ["..."],
 });
 
 // EXECUTOR — proveď změny
 await publishForCurrentPhase(db, companyId, "executor", {
-  issueId, changes: [{ file: "...", diff: "..." }], completedTasks: [...],
+  issueId, filesChanged: ["..."], changesSummary: "...",
+  deviationsFromPlan: [], testsRun: ["..."], remainingWork: [],
 });
 
 // REVIEWER — code review
 await publishForCurrentPhase(db, companyId, "reviewer", {
-  issueId, verdict: "approved" | "changes_requested", comments: [...],
+  issueId, verdict: "approved" | "changes_requested" | "rejected",
+  issuesFound: [], fixesMade: [], verificationStatus: "verified" | "needs_verification" | "blocked",
+  mergeReadiness: "ready" | "blocked" | "conditional",
 });
 
 // INTEGRATOR — merge
 await publishForCurrentPhase(db, companyId, "integrator", {
-  issueId, merged: boolean, notes: "...",
+  issueId, finalVerification: "passed" | "failed" | "skipped",
+  deploymentNotes: [], signoffs: [], remainingOpenIssues: [], rollbackPlan: "...",
 });
 ```
 

@@ -82,6 +82,7 @@ const tracking = new Map<string, IssueTracking>();
 // Ensures concurrent calls for the same issueId are serialised, preventing
 // read→decide→apply races in single-node deployments.
 const inFlight = new Map<string, Promise<OrchestrationDecision | null>>();
+const inFlightCreatedAt = new Map<string, number>();
 
 export function clearTracking(issueId: string): void {
   tracking.delete(issueId);
@@ -118,6 +119,17 @@ export function cleanupTracking(): void {
       tracking.delete(id);
     }
   }
+  // Evict in-flight entries that have been stuck for too long.
+  // This is a safety net: normally the finally-block in withIssueLock cleans up
+  // on promise settlement, but pathological unhandled-rejection scenarios could
+  // leave entries dangling.
+  const staleCutoff = now - MAX_TRACKING_AGE_MS;
+  for (const [id, createdAt] of inFlightCreatedAt.entries()) {
+    if (createdAt < staleCutoff) {
+      inFlight.delete(id);
+      inFlightCreatedAt.delete(id);
+    }
+  }
 }
 
 /**
@@ -135,10 +147,16 @@ async function withIssueLock<T>(
     return fn();
   })();
   inFlight.set(issueId, next as any);
+  inFlightCreatedAt.set(issueId, Date.now());
   try {
     return await next;
   } finally {
-    if (inFlight.get(issueId) === next) inFlight.delete(issueId);
+    if (inFlight.get(issueId) === next) {
+      inFlight.delete(issueId);
+    }
+    // Always clean up the timestamp so cleanupTracking doesn't evict a
+    // superseded entry that is still running (stale TTL on inFlightCreatedAt).
+    inFlightCreatedAt.delete(issueId);
   }
 }
 
@@ -227,34 +245,47 @@ export function checkReworkLimit(issueId: string, phase: IssuePhase): boolean {
 /**
  * Full decision function with all guards.
  * Returns an action or marks blocked when guards fire.
+ * @returns The orchestration action and whether a rework was consumed.
+ *          consumeRework is true when the current phase's rework budget
+ *          should be decremented (phase_transition, or rework-limit block).
+ *          It is NOT set for bounce-limit blocks or noop.
  */
 export function decideFromArtifact(
   artifact: PlannerArtifact | PlanReviewerArtifact | ExecutorArtifact | ReviewerArtifact | IntegratorArtifact,
   artifactType: ArtifactType,
   phase: IssuePhase,
   issueId: string,
-): OrchestrationAction {
+): { action: OrchestrationAction; consumedRework: boolean } {
   // Guard: phase compatibility
   if (!isArtifactPhaseCompatible(artifactType, phase)) {
     return {
-      type: "noop",
-      reason: `artifact type '${artifactType}' not compatible with current phase '${phase}'`,
+      action: {
+        type: "noop",
+        reason: `artifact type '${artifactType}' not compatible with current phase '${phase}'`,
+      },
+      consumedRework: false,
     };
   }
 
   // Guard: bounce/loop detection — checked first as it indicates a systemic issue
   if (checkBounceLimit(issueId)) {
     return {
-      type: "mark_blocked",
-      reason: `bounce limit reached (${MAX_BOUNCES} consecutive phase bounces)`,
+      action: {
+        type: "mark_blocked",
+        reason: `bounce limit reached (${MAX_BOUNCES} consecutive phase bounces)`,
+      },
+      consumedRework: false,
     };
   }
 
   // Guard: rework budget per phase — prevents same-phase repeated work
   if (checkReworkLimit(issueId, phase)) {
     return {
-      type: "mark_blocked",
-      reason: `rework budget exhausted for phase '${phase}' (${MAX_REWORKS_PER_PHASE} max)`,
+      action: {
+        type: "mark_blocked",
+        reason: `rework budget exhausted for phase '${phase}' (${MAX_REWORKS_PER_PHASE} max)`,
+      },
+      consumedRework: true,
     };
   }
 
@@ -262,95 +293,120 @@ export function decideFromArtifact(
     case "planner": {
       const art = artifact as PlannerArtifact;
       if (!plannerReached(art)) {
-        return { type: "noop", reason: "planner artifact incomplete" };
+        return { action: { type: "noop", reason: "planner artifact incomplete" }, consumedRework: false };
       }
-      recordRework(issueId, phase);
       return {
-        type: "phase_transition",
-        to: "plan_review",
-        reason: "plan ready for review",
+        action: {
+          type: "phase_transition",
+          to: "plan_review",
+          reason: "plan ready for review",
+        },
+        consumedRework: true,
       };
     }
 
     case "plan_reviewer": {
       const art = artifact as PlanReviewerArtifact;
-      recordRework(issueId, phase);
       if (art.verdict === "approved") {
         return {
-          type: "phase_transition",
-          to: "ready_for_execution",
-          reason: "plan approved, ready for execution",
+          action: {
+            type: "phase_transition",
+            to: "ready_for_execution",
+            reason: "plan approved, ready for execution",
+          },
+          consumedRework: true,
         };
       }
       return {
-        type: "phase_transition",
-        to: "planning",
-        reason: `plan rejected: ${art.scopeChanges.join("; ")}`,
+        action: {
+          type: "phase_transition",
+          to: "planning",
+          reason: `plan rejected: ${art.scopeChanges.join("; ")}`,
+        },
+        consumedRework: true,
       };
     }
 
     case "executor": {
       const art = artifact as ExecutorArtifact;
       if (art.remainingWork.length > 0 && art.filesChanged.length === 0) {
-        return { type: "noop", reason: "executor has remaining work, staying in executing" };
+        return { action: { type: "noop", reason: "executor has remaining work, staying in executing" }, consumedRework: false };
       }
-      recordRework(issueId, phase);
       return {
-        type: "phase_transition",
-        to: "code_review",
-        reason: "execution complete",
+        action: {
+          type: "phase_transition",
+          to: "code_review",
+          reason: "execution complete",
+        },
+        consumedRework: true,
       };
     }
 
     case "reviewer": {
       const art = artifact as ReviewerArtifact;
-      recordRework(issueId, phase);
       if (art.verdict === "approved") {
         return {
-          type: "phase_transition",
-          to: "integration",
-          reason: "code review approved",
+          action: {
+            type: "phase_transition",
+            to: "integration",
+            reason: "code review approved",
+          },
+          consumedRework: true,
         };
       }
       if (art.verdict === "changes_requested") {
         return {
-          type: "phase_transition",
-          to: "executing",
-          reason: `changes requested: ${art.issuesFound.join("; ")}`,
+          action: {
+            type: "phase_transition",
+            to: "executing",
+            reason: `changes requested: ${art.issuesFound.join("; ")}`,
+          },
+          consumedRework: true,
         };
       }
       return {
-        type: "phase_transition",
-        to: "planning",
-        reason: `review rejected: ${art.issuesFound.join("; ")}`,
+        action: {
+          type: "phase_transition",
+          to: "planning",
+          reason: `review rejected: ${art.issuesFound.join("; ")}`,
+        },
+        consumedRework: true,
       };
     }
 
     case "integrator": {
       const art = artifact as IntegratorArtifact;
-      recordRework(issueId, phase);
 
       if (art.finalVerification === "failed") {
         return {
-          type: "phase_transition",
-          to: "blocked",
-          reason: `integration verification failed: ${art.remainingOpenIssues.join("; ") || "unresolved issues"}`,
+          action: {
+            type: "phase_transition",
+            to: "blocked",
+            reason: `integration verification failed: ${art.remainingOpenIssues.join("; ") || "unresolved issues"}`,
+          },
+          consumedRework: true,
         };
       }
 
       // skipped: only done if no remaining open issues
       if (art.finalVerification === "skipped" && art.remainingOpenIssues.length > 0) {
         return {
-          type: "mark_blocked",
-          reason: `integration skipped with open issues: ${art.remainingOpenIssues.join("; ")}`,
+          action: {
+            type: "mark_blocked",
+            reason: `integration skipped with open issues: ${art.remainingOpenIssues.join("; ")}`,
+          },
+          consumedRework: true,
         };
       }
 
       // passed or skipped (with no open issues) → done
       return {
-        type: "phase_transition",
-        to: "done",
-        reason: "integration complete",
+        action: {
+          type: "phase_transition",
+          to: "done",
+          reason: "integration complete",
+        },
+        consumedRework: true,
       };
     }
   }
@@ -457,9 +513,9 @@ export async function applyOrchestrationDecision(
         {},
         resolvedDb,
       );
-      // Only update in-memory tracking AFTER the DB write succeeds.
-      // If the transaction rolls back, we must NOT update the bounce counter.
-      recordPhaseTransition(decision.issueId, decision.phase, action.to);
+      // NOTE: recordPhaseTransition is called by the caller of applyOrchestrationDecision,
+      // AFTER the transaction commits. Do NOT call it here — if the transaction rolls back,
+      // in-memory tracking would be mutated for a DB state that never existed.
       break;
     }
 
@@ -471,8 +527,7 @@ export async function applyOrchestrationDecision(
         {},
         resolvedDb,
       );
-      // Only update in-memory tracking AFTER the DB write succeeds.
-      recordPhaseTransition(decision.issueId, decision.phase, "blocked");
+      // NOTE: recordPhaseTransition is called by the caller after the transaction commits.
       break;
     }
 
@@ -611,7 +666,7 @@ async function orchestrateIssueInner(
   const meta = chainHead.metadata;
   if (!meta) return null;
 
-  const action = decideFromArtifact(meta as any, artifactType, phase, issueId);
+  const { action, consumedRework } = decideFromArtifact(meta as any, artifactType, phase, issueId);
   const decision: OrchestrationDecision = { issueId, phase, action, artifactType };
 
   if (action.type !== "noop") {
@@ -620,6 +675,15 @@ async function orchestrateIssueInner(
     await db.transaction(async (tx) => {
       await applyOrchestrationDecision(db, decision, tx);
     });
+    // recordPhaseTransition is safe here: called AFTER the transaction commits.
+    // (It was previously called INSIDE the transaction — a bug since in-memory
+    // state was mutated before the DB write was confirmed.)
+    recordPhaseTransition(issueId, decision.phase, action.type === "phase_transition" ? action.to : "blocked");
+    // recordRework is only called when the artifact consumption itself consumed
+    // the rework budget (phase_transition paths), not for bounce-limit blocks.
+    if (consumedRework) {
+      recordRework(issueId, phase);
+    }
   }
 
   return decision;

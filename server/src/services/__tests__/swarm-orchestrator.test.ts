@@ -8,6 +8,7 @@ import {
   checkBounceLimit,
   checkReworkLimit,
   recordPhaseTransition,
+  recordRework,
   clearTracking,
   getTracking,
   cleanupTracking,
@@ -36,7 +37,7 @@ describe("decideFromArtifact", () => {
         testPlan: "Run integration tests",
         risks: [],
       };
-      const action = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const { action } = decideFromArtifact(artifact, "planner", "planning", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "plan_review", reason: "plan ready for review" });
     });
 
@@ -49,7 +50,7 @@ describe("decideFromArtifact", () => {
         testPlan: "Run tests",
         risks: [],
       };
-      const action = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const { action } = decideFromArtifact(artifact, "planner", "planning", ISSUE);
       expect(action).toEqual({ type: "noop", reason: "planner artifact incomplete" });
     });
 
@@ -62,7 +63,7 @@ describe("decideFromArtifact", () => {
         testPlan: "Run tests",
         risks: [],
       };
-      const action = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const { action } = decideFromArtifact(artifact, "planner", "planning", ISSUE);
       expect(action).toEqual({ type: "noop", reason: "planner artifact incomplete" });
     });
 
@@ -75,7 +76,7 @@ describe("decideFromArtifact", () => {
         testPlan: "Run tests",
         risks: [],
       };
-      const action = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const { action } = decideFromArtifact(artifact, "planner", "planning", ISSUE);
       expect(action).toEqual({ type: "noop", reason: "planner artifact incomplete" });
     });
 
@@ -88,10 +89,16 @@ describe("decideFromArtifact", () => {
         testPlan: "t",
         risks: [],
       };
+      // In the real orchestration flow, recordRework is called by orchestrateIssue
+      // AFTER the DB transaction commits. simulate that here.
       expect(checkReworkLimit(ISSUE, "planning")).toBe(false);
-      decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const r1 = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      expect(r1.consumedRework).toBe(true);
+      recordRework(ISSUE, "planning"); // simulate post-tx commit
       expect(checkReworkLimit(ISSUE, "planning")).toBe(false);
-      decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      const r2 = decideFromArtifact(artifact, "planner", "planning", ISSUE);
+      expect(r2.consumedRework).toBe(true);
+      recordRework(ISSUE, "planning"); // second reword consumed
       expect(checkReworkLimit(ISSUE, "planning")).toBe(true);
     });
   });
@@ -99,13 +106,13 @@ describe("decideFromArtifact", () => {
   describe("plan_reviewer", () => {
     it("transitions to ready_for_execution when plan is approved", () => {
       const artifact: PlanReviewerArtifact = { verdict: "approved", scopeChanges: [], notes: ["looks good"] };
-      const action = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
+      const { action } = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "ready_for_execution", reason: "plan approved, ready for execution" });
     });
 
     it("returns to planning when plan is rejected", () => {
       const artifact: PlanReviewerArtifact = { verdict: "rejected", scopeChanges: ["missing auth tests"], notes: [] };
-      const action = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
+      const { action } = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "planning", reason: "plan rejected: missing auth tests" });
     });
   });
@@ -116,7 +123,7 @@ describe("decideFromArtifact", () => {
         filesChanged: ["src/auth.ts"], changesSummary: "Added login",
         deviationsFromPlan: [], testsRun: ["auth tests"], remainingWork: [],
       };
-      const action = decideFromArtifact(artifact, "executor", "executing", ISSUE);
+      const { action } = decideFromArtifact(artifact, "executor", "executing", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "code_review", reason: "execution complete" });
     });
 
@@ -130,7 +137,7 @@ describe("decideFromArtifact", () => {
         filesChanged: [], changesSummary: "",
         deviationsFromPlan: [], testsRun: [], remainingWork: ["write tests"],
       };
-      const action = decideFromArtifact(artifact, "executor", "executing", ISSUE);
+      const { action } = decideFromArtifact(artifact, "executor", "executing", ISSUE);
       expect(action).toEqual({ type: "noop", reason: "executor has remaining work, staying in executing" });
     });
 
@@ -139,7 +146,7 @@ describe("decideFromArtifact", () => {
         filesChanged: ["src/auth.ts"], changesSummary: "Added login",
         deviationsFromPlan: [], testsRun: [], remainingWork: ["update docs"],
       };
-      const action = decideFromArtifact(artifact, "executor", "executing", ISSUE);
+      const { action } = decideFromArtifact(artifact, "executor", "executing", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "code_review", reason: "execution complete" });
     });
   });
@@ -153,7 +160,7 @@ describe("decideFromArtifact", () => {
         remainingOpenIssues: [],
         rollbackPlan: "revert commit",
       };
-      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      const { action } = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "done", reason: "integration complete" });
     });
 
@@ -165,7 +172,7 @@ describe("decideFromArtifact", () => {
         remainingOpenIssues: ["auth regression", "memory leak in worker"],
         rollbackPlan: "revert commit",
       };
-      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      const { action } = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
       expect(action.type).toBe("phase_transition");
       expect((action as any).to).toBe("blocked");
       expect((action as any).reason).toContain("integration verification failed");
@@ -179,7 +186,7 @@ describe("decideFromArtifact", () => {
         remainingOpenIssues: [],
         rollbackPlan: "",
       };
-      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      const { action } = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "done", reason: "integration complete" });
     });
 
@@ -191,7 +198,7 @@ describe("decideFromArtifact", () => {
         remainingOpenIssues: ["docs follow-up"],
         rollbackPlan: "rollback",
       };
-      const action = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      const { action } = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
       expect(action.type).toBe("mark_blocked");
       expect((action as any).reason).toContain("open issues");
     });
@@ -201,11 +208,12 @@ describe("decideFromArtifact", () => {
       const artifact: IntegratorArtifact = {
         finalVerification: "passed", deploymentNotes: [], signoffs: [], remainingOpenIssues: [], rollbackPlan: "",
       };
-      decideFromArtifact(artifact, "integrator", "integration", ISSUE);
-      decideFromArtifact(artifact, "integrator", "integration", ISSUE);
+      // recordRework must be called explicitly now (decideFromArtifact no longer has side effects)
+      recordRework(ISSUE, "integration");
+      recordRework(ISSUE, "integration");
       const third = decideFromArtifact(artifact, "integrator", "integration", ISSUE);
-      expect(third.type).toBe("mark_blocked");
-      expect((third as any).reason).toContain("rework budget exhausted");
+      expect(third.action.type).toBe("mark_blocked");
+      expect((third.action as any).reason).toContain("rework budget exhausted");
     });
   });
 
@@ -215,7 +223,7 @@ describe("decideFromArtifact", () => {
         verdict: "approved", issuesFound: [], fixesMade: [],
         verificationStatus: "verified", mergeReadiness: "ready",
       };
-      const action = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
+      const { action } = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "integration", reason: "code review approved" });
     });
 
@@ -224,7 +232,7 @@ describe("decideFromArtifact", () => {
         verdict: "changes_requested", issuesFound: ["null pointer risk"],
         fixesMade: [], verificationStatus: "needs_verification", mergeReadiness: "conditional",
       };
-      const action = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
+      const { action } = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "executing", reason: "changes requested: null pointer risk" });
     });
 
@@ -233,7 +241,7 @@ describe("decideFromArtifact", () => {
         verdict: "rejected", issuesFound: ["security issue", "naming convention violated"],
         fixesMade: [], verificationStatus: "blocked", mergeReadiness: "blocked",
       };
-      const action = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
+      const { action } = decideFromArtifact(artifact, "reviewer", "code_review", ISSUE);
       expect(action).toEqual({ type: "phase_transition", to: "planning", reason: "review rejected: security issue; naming convention violated" });
     });
   });
@@ -266,7 +274,7 @@ describe("artifact-phase compatibility guard", () => {
       filesChanged: ["a.ts"], changesSummary: "x",
       deviationsFromPlan: [], testsRun: [], remainingWork: [],
     };
-    const action = decideFromArtifact(artifact, "executor", "planning", ISSUE);
+    const { action } = decideFromArtifact(artifact, "executor", "planning", ISSUE);
     expect(action.type).toBe("noop");
     expect((action as any).reason).toContain("not compatible with current phase");
   });
@@ -276,7 +284,7 @@ describe("artifact-phase compatibility guard", () => {
       goal: "auth", acceptanceCriteria: ["x"], touchedFiles: ["a.ts"],
       forbiddenFiles: [], testPlan: "t", risks: [],
     };
-    const action = decideFromArtifact(artifact, "planner", "code_review", ISSUE);
+    const { action } = decideFromArtifact(artifact, "planner", "code_review", ISSUE);
     expect(action.type).toBe("noop");
     expect((action as any).reason).toContain("not compatible with current phase");
   });
@@ -294,9 +302,9 @@ describe("bounce / loop detection", () => {
     // Simulate: planning -> plan_review -> planning (bounce 1)
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "planning");
-    // Still under limit — first rework should work
-    const a = decideFromArtifact(planner, "planner", "planning", ISSUE);
-    expect(a.type).not.toBe("mark_blocked");
+    // Still under limit — first rework should work (recordRework is called by orchestrateIssue after tx)
+    const { action: aAction } = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    expect(aAction.type).not.toBe("mark_blocked");
   });
 
   it("marks blocked when bounce limit (3) is exceeded", () => {
@@ -315,7 +323,7 @@ describe("bounce / loop detection", () => {
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "planning"); // bounce 3
     // 4th planner arrival should trigger bounce limit
-    const action = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(planner, "planner", "planning", ISSUE);
     expect(action.type).toBe("mark_blocked");
     expect((action as any).reason).toContain("bounce limit");
   });
@@ -327,13 +335,17 @@ describe("rework budget per phase", () => {
       goal: "auth", acceptanceCriteria: ["x"], touchedFiles: ["a.ts"],
       forbiddenFiles: [], testPlan: "t", risks: [],
     };
-    const a1 = decideFromArtifact(planner, "planner", "planning", ISSUE);
-    expect(a1.type).toBe("phase_transition");
-    const a2 = decideFromArtifact(planner, "planner", "planning", ISSUE);
-    expect(a2.type).toBe("phase_transition");
-    const a3 = decideFromArtifact(planner, "planner", "planning", ISSUE);
-    expect(a3.type).toBe("mark_blocked");
-    expect((a3 as any).reason).toContain("rework budget exhausted");
+    // recordRework must be called explicitly to consume the rework budget
+    // (decideFromArtifact no longer has side effects — rework tracking is done by orchestrateIssue)
+    const r1 = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    expect(r1.consumedRework).toBe(true);
+    recordRework(ISSUE, "planning"); // simulate orchestrateIssue calling this after tx
+    const r2 = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    expect(r2.consumedRework).toBe(true);
+    recordRework(ISSUE, "planning"); // second reword consumed
+    const r3 = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    expect(r3.action.type).toBe("mark_blocked");
+    expect((r3.action as any).reason).toContain("rework budget exhausted");
   });
 
   it("rework budgets are phase-specific", () => {
@@ -344,14 +356,14 @@ describe("rework budget per phase", () => {
     const reviewer: PlanReviewerArtifact = {
       verdict: "approved", scopeChanges: [], notes: [],
     };
-    // Exhaust planning budget
-    decideFromArtifact(planner, "planner", "planning", ISSUE);
-    decideFromArtifact(planner, "planner", "planning", ISSUE);
+    // Exhaust planning budget: 2 reworks allowed
+    recordRework(ISSUE, "planning"); // first reword consumed
+    recordRework(ISSUE, "planning"); // second reword consumed
     const blockedPlanning = decideFromArtifact(planner, "planner", "planning", ISSUE);
-    expect(blockedPlanning.type).toBe("mark_blocked");
+    expect(blockedPlanning.action.type).toBe("mark_blocked");
     // plan_review budget is independent — should work
     const pr = decideFromArtifact(reviewer, "plan_reviewer", "plan_review", ISSUE);
-    expect(pr.type).toBe("phase_transition");
+    expect(pr.action.type).toBe("phase_transition");
   });
 });
 
@@ -492,7 +504,7 @@ describe("orchestrateIssue — expected artifact type gate", () => {
       testPlan: "Run tests", risks: [],
     };
     // Sending planner artifact during executing phase → noop
-    const action = decideFromArtifact(plannerArtifact, "planner", "executing", ISSUE);
+    const { action } = decideFromArtifact(plannerArtifact, "planner", "executing", ISSUE);
     expect(action.type).toBe("noop");
     expect((action as any).reason).toContain("not compatible with current phase");
   });
@@ -518,7 +530,7 @@ describe("orchestrateIssue — valid chain selection", () => {
       touchedFiles: ["file.ts"], forbiddenFiles: [],
       testPlan: "Run tests", risks: [],
     };
-    const action = decideFromArtifact(plannerArtifact, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(plannerArtifact, "planner", "planning", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("plan_review");
   });
@@ -536,14 +548,14 @@ const plannerMeta: PlannerArtifact = {
 
 describe("orchestrateIssue wiring — decision logic coverage", () => {
   it("decides plan_review transition for complete planner artifact", () => {
-    const action = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("plan_review");
   });
 
   it("decides ready_for_execution for approved plan_reviewer", () => {
     const meta: PlanReviewerArtifact = { verdict: "approved", scopeChanges: [], notes: [] };
-    const action = decideFromArtifact(meta, "plan_reviewer", "plan_review", ISSUE);
+    const { action } = decideFromArtifact(meta, "plan_reviewer", "plan_review", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("ready_for_execution");
   });
@@ -553,7 +565,7 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
       filesChanged: ["a.ts"], changesSummary: "Done",
       deviationsFromPlan: [], testsRun: [], remainingWork: [],
     };
-    const action = decideFromArtifact(meta, "executor", "executing", ISSUE);
+    const { action } = decideFromArtifact(meta, "executor", "executing", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("code_review");
   });
@@ -563,14 +575,14 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
       verdict: "approved", issuesFound: [], fixesMade: [],
       verificationStatus: "verified", mergeReadiness: "ready",
     };
-    const action = decideFromArtifact(meta, "reviewer", "code_review", ISSUE);
+    const { action } = decideFromArtifact(meta, "reviewer", "code_review", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("integration");
   });
 
   it("decides planning (rejection) for rejected plan_reviewer", () => {
     const meta: PlanReviewerArtifact = { verdict: "rejected", scopeChanges: ["missing tests"], notes: [] };
-    const action = decideFromArtifact(meta, "plan_reviewer", "plan_review", ISSUE);
+    const { action } = decideFromArtifact(meta, "plan_reviewer", "plan_review", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("planning");
   });
@@ -580,7 +592,7 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
       verdict: "changes_requested", issuesFound: ["bug"],
       fixesMade: [], verificationStatus: "needs_verification", mergeReadiness: "conditional",
     };
-    const action = decideFromArtifact(meta, "reviewer", "code_review", ISSUE);
+    const { action } = decideFromArtifact(meta, "reviewer", "code_review", ISSUE);
     expect(action.type).toBe("phase_transition");
     expect((action as any).to).toBe("executing");
   });
@@ -590,16 +602,16 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
       goal: "", acceptanceCriteria: [], touchedFiles: [],
       forbiddenFiles: [], testPlan: "", risks: [],
     };
-    const action = decideFromArtifact(incomplete, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(incomplete, "planner", "planning", ISSUE);
     expect(action.type).toBe("noop");
   });
 
   it("marks blocked when rework budget exhausted for planner", () => {
     clearTracking(ISSUE);
-    // Exhaust the budget: 2 reworks allowed
-    decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
-    decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
-    const action = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
+    // Exhaust the budget: 2 reworks allowed — recordRework must be called explicitly
+    recordRework(ISSUE, "planning"); // first reword consumed
+    recordRework(ISSUE, "planning"); // second reword consumed
+    const { action } = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
     expect(action.type).toBe("mark_blocked");
     expect((action as any).reason).toContain("rework budget exhausted");
   });
@@ -613,13 +625,13 @@ describe("orchestrateIssue wiring — decision logic coverage", () => {
     recordPhaseTransition(ISSUE, "plan_review", "planning");
     recordPhaseTransition(ISSUE, "planning", "plan_review");
     recordPhaseTransition(ISSUE, "plan_review", "planning");
-    const action = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(plannerMeta, "planner", "planning", ISSUE);
     expect(action.type).toBe("mark_blocked");
     expect((action as any).reason).toContain("bounce limit");
   });
 
   it("returns noop when artifact type is incompatible with current phase", () => {
-    const action = decideFromArtifact(plannerMeta, "planner", "executing", ISSUE);
+    const { action } = decideFromArtifact(plannerMeta, "planner", "executing", ISSUE);
     expect(action.type).toBe("noop");
     expect((action as any).reason).toContain("not compatible");
   });
@@ -750,7 +762,7 @@ describe("planner → plan_review transition", () => {
       goal: "x", acceptanceCriteria: ["y"], touchedFiles: ["f.ts"],
       forbiddenFiles: [], testPlan: "t", risks: [],
     };
-    const action = decideFromArtifact(planner, "planner", "planning", ISSUE);
+    const { action } = decideFromArtifact(planner, "planner", "planning", ISSUE);
     expect(action.type).toBe("phase_transition");
   });
 });
@@ -764,7 +776,7 @@ describe("plan_review approved → ready_for_execution", () => {
     expect(getTrackingField(ISSUE, "bounces")).toBe(1);
     // Now a clean forward approval — counter does NOT reset
     const artifact: PlanReviewerArtifact = { verdict: "approved", scopeChanges: [], notes: [] };
-    const action = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
+    const { action } = decideFromArtifact(artifact, "plan_reviewer", "plan_review", ISSUE);
     expect(action).toEqual({ type: "phase_transition", to: "ready_for_execution", reason: "plan approved, ready for execution" });
     expect(getTrackingField(ISSUE, "bounces")).toBe(1);
   });
@@ -789,7 +801,7 @@ describe("executing → code_review", () => {
       filesChanged: ["a.ts"], changesSummary: "done",
       deviationsFromPlan: [], testsRun: [], remainingWork: [],
     };
-    const action = decideFromArtifact(executor, "executor", "executing", ISSUE);
+    const { action } = decideFromArtifact(executor, "executor", "executing", ISSUE);
     expect(action).toEqual({ type: "phase_transition", to: "code_review", reason: "execution complete" });
   });
 

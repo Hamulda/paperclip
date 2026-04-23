@@ -10,7 +10,7 @@ import type {
   IssuePhase,
 } from "@paperclipai/shared";
 import type { CreateIssueArtifact } from "@paperclipai/shared";
-import { createIssueArtifactSchema } from "@paperclipai/shared";
+import { createIssueArtifactSchema, artifactMetadataSchema } from "@paperclipai/shared";
 import { PHASE_FOR_ARTIFACT_TYPE, ARTIFACT_TYPE_FOR_PHASE } from "@paperclipai/db";
 import type { OrchestrationDecision } from "./swarm-orchestrator.js";
 
@@ -96,6 +96,17 @@ export async function publishArtifactForPhase(
   const issueId = metadata["issueId"];
   if (!issueId || typeof issueId !== "string" || issueId.length === 0) {
     throw new Error("publishArtifactForPhase requires metadata.issueId to be a non-empty string");
+  }
+
+  // Validate artifact metadata against the appropriate Zod schema BEFORE processing.
+  // This catches type errors (e.g. goal: 123 instead of goal: "string") early,
+  // preventing malformed artifacts from bypassing orchestration guards that expect specific types.
+  // issueId is validated separately above and not part of artifactMetadataSchema.
+  const { issueId: _issueId, ...artifactFields } = metadata;
+  try {
+    artifactMetadataSchema.parse(artifactFields);
+  } catch (err: any) {
+    throw new Error(`Invalid artifact metadata for ${artifactType}: ${err.message}`);
   }
 
   return issueArtifactService(db).replace(
@@ -660,7 +671,10 @@ export async function publishForCurrentPhase(
   }
 
   const phase = (issue.phase as IssuePhase | null) ?? "triage";
-  return publishArtifactForPhase(db, companyId, phase, artifactType, metadata, actorAgentId, summary);
+  // Inject artifactType into metadata for schema validation in publishArtifactForPhase.
+  // The caller passes role (planner, executor, etc.) as a separate param, not in metadata.
+  const metadataWithType = { ...metadata, artifactType };
+  return publishArtifactForPhase(db, companyId, phase, artifactType, metadataWithType, actorAgentId, summary);
 }
 
 /**

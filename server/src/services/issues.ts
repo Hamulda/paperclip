@@ -2467,17 +2467,22 @@ export function issueService(db: Db) {
     },
 
     getAncestors: async (issueId: string) => {
-      // Phase 1: Collect all ancestor IDs via narrow parent-chain traversal (N queries, 2 cols each)
-      const ancestorIds: string[] = [];
-      const visited = new Set<string>([issueId]);
-      const start = await db.select({ parentId: issues.parentId }).from(issues).where(eq(issues.id, issueId)).then(r => r[0] ?? null);
-      let currentId = start?.parentId ?? null;
-      while (currentId && !visited.has(currentId) && ancestorIds.length < 49) {
-        visited.add(currentId);
-        ancestorIds.push(currentId);
-        const parent = await db.select({ parentId: issues.parentId }).from(issues).where(eq(issues.id, currentId)).then(r => r[0] ?? null);
-        currentId = parent?.parentId ?? null;
-      }
+      // Phase 1: Collect all ancestor IDs via recursive CTE — single query regardless of depth.
+      // Replaces O(depth) sequential queries with O(1) round-trip.
+      const ancestorResult = await db.execute<{ id: string }>(sql`
+        WITH RECURSIVE ancestor_chain AS (
+          SELECT id, parent_id, 1 AS depth
+          FROM issues
+          WHERE id = ${issueId}
+          UNION ALL
+          SELECT i.id, i.parent_id, ac.depth + 1
+          FROM issues i
+          JOIN ancestor_chain ac ON i.id = ac.parent_id
+          WHERE ac.depth < 50
+        )
+        SELECT id FROM ancestor_chain WHERE depth > 1 LIMIT 49
+      `);
+      const ancestorIds = ancestorResult.rows.map(r => r.id as string);
 
       if (ancestorIds.length === 0) return [];
 

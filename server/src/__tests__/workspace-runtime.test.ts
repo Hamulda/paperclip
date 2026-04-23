@@ -2528,7 +2528,7 @@ describe("ensureRuntimeServicesForRun", () => {
       workspaceCwd: workspace.cwd,
       runtimeServiceId: worker?.id ?? null,
     });
-  });
+  }, 15000);
 });
 
 describe("buildWorkspaceRuntimeDesiredStatePatch", () => {

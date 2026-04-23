@@ -3896,7 +3896,8 @@ export function heartbeatService(db: Db) {
     reconcileStrandedAssignedIssues,
 
     tickTimers: async (now = new Date()) => {
-      const allAgents = await db.select().from(agents);
+      // Only check active agents — terminated agents are excluded at query level.
+      const allAgents = await db.select().from(agents).where(ne(agents.status, "terminated"));
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
