@@ -132,5 +132,28 @@ describe("adapter registry lazy import (claude-only profile)", () => {
       expect(result.before).not.toContain("opencode_local");
       expect(result.stillNoOpencode).not.toContain("opencode_local");
     });
+
+    it("listKnownServerAdapterTypes returns all builtin types without triggering lazy load", async () => {
+      const result = (await runInClaudeOnlyProfile(`
+        const { listServerAdapters, listKnownServerAdapterTypes } = await import("./server/src/adapters/registry.js");
+        const before = listServerAdapters().map(a => a.type);
+        const catalog = listKnownServerAdapterTypes();
+        const after = listServerAdapters().map(a => a.type);
+        process.stdout.write(JSON.stringify({ before, catalog, after }));
+      `)) as { before: string[]; catalog: string[]; after: string[] };
+
+      // listServerAdapters should still only show the 3 always-on adapters
+      expect(result.before).not.toContain("codex_local");
+      expect(result.after).not.toContain("codex_local");
+      // But listKnownServerAdapterTypes must include all builtins (metadata only)
+      expect(result.catalog).toContain("claude_local");
+      expect(result.catalog).toContain("codex_local");
+      expect(result.catalog).toContain("cursor");
+      expect(result.catalog).toContain("gemini_local");
+      expect(result.catalog).toContain("opencode_local");
+      expect(result.catalog).toContain("pi_local");
+      expect(result.catalog).toContain("hermes_local");
+      expect(result.catalog).toContain("openclaw_gateway");
+    });
   });
 });

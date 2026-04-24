@@ -206,8 +206,21 @@ export async function startTestDatabase(
     throw new Error(`Cannot start test database: ${support.skipReason}`);
   }
 
+  const testDbProvider = resolveTestDbProvider();
+
   if (support.provider === "external") {
-    // External DB — run migrations and return (no cleanup needed beyond connection close)
+    // External DB — skip migrations if TEST_DB_PROVIDER=external was explicitly set
+    // (the DB is pre-managed; migrations would require a live server which may not be available)
+    // When URL is auto-detected (auto mode with TEST_DATABASE_URL set), still run migrations.
+    if (testDbProvider === "external") {
+      return {
+        provider: "external",
+        connectionString: support.connectionString,
+        cleanup: async () => {
+          // External DB is managed externally — nothing to clean up
+        },
+      };
+    }
     await applyPendingMigrations(support.connectionString);
     return {
       provider: "external",

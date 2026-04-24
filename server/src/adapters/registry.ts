@@ -14,7 +14,7 @@ import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
-import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
+import { getDisabledAdapterTypes, listAdapterPlugins } from "../services/adapter-plugin-store.js";
 
 // ---------------------------------------------------------------------------
 // Adapter runtime profile — reduces startup overhead on resource-constrained
@@ -362,8 +362,28 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
   return adapter.models ?? [];
 }
 
+/**
+ * List adapter types currently registered and loaded in the runtime registry.
+ * In "claude-only" profile this only includes the 3 always-on adapters
+ * (claude_local, process, http) until a specific adapter is first accessed
+ * via findActiveServerAdapter(), which triggers lazy loading.
+ */
 export function listServerAdapters(): ServerAdapterModule[] {
   return Array.from(adaptersByType.values());
+}
+
+/**
+ * Metadata-only catalog of all known adapter types — does NOT trigger lazy
+ * loading. Returns builtin types from BUILTIN_ADAPTER_TYPES plus any
+ * externally registered plugin types from the adapter-plugin store.
+ *
+ * Use this when you need to enumerate or display the full adapter catalog
+ * without caring about which ones are currently loaded in the runtime.
+ */
+export function listKnownServerAdapterTypes(): string[] {
+  const builtinTypes = Array.from(BUILTIN_ADAPTER_TYPES);
+  const externalTypes = listAdapterPlugins().map((p) => p.type);
+  return [...builtinTypes, ...externalTypes];
 }
 
 export function listEnabledServerAdapters(): ServerAdapterModule[] {

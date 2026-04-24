@@ -12,12 +12,6 @@ export {
   type Db,
 } from "./client.js";
 export {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-  type EmbeddedPostgresTestDatabase,
-  type EmbeddedPostgresTestSupport,
-} from "./test-database-provider.js"; // Points to new module with provider-aware compat wrapper
-export {
   getTestDatabaseSupport,
   startTestDatabase,
   type TestDatabaseSupport,
