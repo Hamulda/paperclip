@@ -12,7 +12,7 @@ vi.mock("../swarm-orchestrator.js", () => ({
 // Mock issueService so getById doesn't go through getIssueByIdentifier → innerJoin
 vi.mock("../issues.js", () => ({
   issueService: vi.fn().mockReturnValue({
-    getById: vi.fn(),
+    getById: vi.fn().mockResolvedValue({ id: "mock-issue-id", companyId: "company-1" }),
   }),
 }));
 

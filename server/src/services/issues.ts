@@ -2469,7 +2469,7 @@ export function issueService(db: Db) {
     getAncestors: async (issueId: string) => {
       // Phase 1: Collect all ancestor IDs via recursive CTE — single query regardless of depth.
       // Replaces O(depth) sequential queries with O(1) round-trip.
-      const ancestorResult = await db.execute<{ id: string }>(sql`
+      const ancestorResult = await (db.execute as any)(sql`
         WITH RECURSIVE ancestor_chain AS (
           SELECT id, parent_id, 1 AS depth
           FROM issues
@@ -2480,8 +2480,8 @@ export function issueService(db: Db) {
           JOIN ancestor_chain ac ON i.id = ac.parent_id
           WHERE ac.depth < 50
         )
-        SELECT id FROM ancestor_chain WHERE depth > 1 LIMIT 49
-      `);
+        SELECT id FROM ancestor_chain WHERE depth > 1 ORDER BY depth ASC LIMIT 49
+      `) as { rows: { id: string }[] };
       const ancestorIds = ancestorResult.rows.map(r => r.id as string);
 
       if (ancestorIds.length === 0) return [];

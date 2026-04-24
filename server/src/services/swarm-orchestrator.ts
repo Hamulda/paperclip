@@ -3,7 +3,7 @@
 
 import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issues } from "@paperclipai/db";
+import { issues as issuesTable } from "@paperclipai/db";
 import type {
   PlannerArtifact,
   PlanReviewerArtifact,
@@ -507,54 +507,36 @@ export async function applyOrchestrationDecision(
   switch (action.type) {
     case "phase_transition": {
       assertPhaseTransition(decision.phase, action.to);
-      await issues.update(
-        decision.issueId,
-        { phase: action.to },
-        {},
-        resolvedDb,
-      );
-      // NOTE: recordPhaseTransition is called by the caller of applyOrchestrationDecision,
-      // AFTER the transaction commits. Do NOT call it here — if the transaction rolls back,
-      // in-memory tracking would be mutated for a DB state that never existed.
+      await resolvedDb
+        .update(issuesTable)
+        .set({ phase: action.to })
+        .where(eq(issuesTable.id, decision.issueId));
       break;
     }
 
     case "mark_blocked": {
       assertPhaseTransition(decision.phase, "blocked");
-      await issues.update(
-        decision.issueId,
-        { phase: "blocked" },
-        {},
-        resolvedDb,
-      );
-      // NOTE: recordPhaseTransition is called by the caller after the transaction commits.
+      await resolvedDb
+        .update(issuesTable)
+        .set({ phase: "blocked" })
+        .where(eq(issuesTable.id, decision.issueId));
       break;
     }
 
     case "mark_ready_for_execution": {
       assertPhaseTransition(decision.phase, "ready_for_execution");
-      await issues.update(
-        decision.issueId,
-        {
-          phase: "ready_for_execution",
-          assigneeAgentId: action.assigneeAgentId,
-        },
-        {},
-        resolvedDb,
-      );
+      await resolvedDb
+        .update(issuesTable)
+        .set({ phase: "ready_for_execution", assigneeAgentId: action.assigneeAgentId })
+        .where(eq(issuesTable.id, decision.issueId));
       break;
     }
 
     case "reassign": {
-      await issues.update(
-        decision.issueId,
-        {
-          assigneeAgentId: action.toAgentId,
-          phase: decision.phase,
-        },
-        {},
-        resolvedDb,
-      );
+      await resolvedDb
+        .update(issuesTable)
+        .set({ assigneeAgentId: action.toAgentId, phase: decision.phase })
+        .where(eq(issuesTable.id, decision.issueId));
       break;
     }
 
@@ -595,19 +577,19 @@ async function orchestrateIssueInner(
   // This prevents concurrent orchestrateIssue calls for the same issue from
   // racing: the second caller blocks on the SELECT FOR UPDATE until the first
   // commits or rolls back, ensuring decisions are based on committed state.
-  let phase: IssuePhase;
-  let verificationStatus: VerificationStatus | null;
-  let blockedBy: string[];
+  let phase: IssuePhase = "triage" as IssuePhase;
+  let verificationStatus: VerificationStatus | null = null;
+  let blockedBy: string[] = [];
 
   await db.transaction(async (tx) => {
     // Acquire row-level lock on the issue row to serialise concurrent callers.
     await tx.execute(sql`select id from issues where id = ${issueId} for update`);
 
     // Read within the same transaction — sees the locked row state.
-    const rows = await tx
+    const rows: typeof issuesTable.$inferSelect[] = await tx
       .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
+      .from(issuesTable)
+      .where(eq(issuesTable.id, issueId))
       .limit(1);
     const issue = rows[0] ?? null;
 
@@ -619,8 +601,8 @@ async function orchestrateIssueInner(
     }
 
     phase = (issue.phase as IssuePhase | null) ?? "triage";
-    verificationStatus = issue.verificationStatus as VerificationStatus | null;
-    blockedBy = issue.blockedBy ?? [];
+    verificationStatus = (issue as any).verificationStatus as VerificationStatus | null ?? null;
+    blockedBy = (issue as any).blockedBy as string[] ?? [];
   });
 
   // ── Blocked state: consult review queue for unblock signal ────────────────

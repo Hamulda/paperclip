@@ -300,7 +300,7 @@ export function issueArtifactService(db: Db) {
 
       // Trigger orchestration after artifact is published
       if (row.status === "published") {
-        await triggerOrchestration(db, parsed.issueId);
+        await triggerOrchestration(db, companyId, parsed.issueId);
       }
 
       return toIssueArtifact(row);
@@ -422,7 +422,7 @@ export function issueArtifactService(db: Db) {
       });
 
       // Trigger orchestration after artifact is published
-      await triggerOrchestration(db, issueId);
+      await triggerOrchestration(db, companyId, issueId);
 
       return toIssueArtifact(newRow);
     },
@@ -688,8 +688,15 @@ export async function publishForCurrentPhase(
  */
 async function triggerOrchestration(
   db: Db,
+  companyId: string,
   issueId: string,
 ): Promise<OrchestrationDecision | null> {
+  // Authorize: verify the issue belongs to the calling company before orchestrating.
+  // This prevents cross-company orchestration if the service boundary is breached.
+  const issue = await issueService(db).getById(issueId);
+  if (!issue || issue.companyId !== companyId) {
+    throw new Error(`triggerOrchestration: issue '${issueId}' not found or does not belong to company '${companyId}'`);
+  }
   try {
     const { orchestrateIssue } = await import("./swarm-orchestrator.js");
     return await orchestrateIssue(db, issueId);

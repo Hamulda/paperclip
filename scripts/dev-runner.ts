@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --import tsx
 import { spawn } from "node:child_process";
+import { config as loadDotenv } from "dotenv";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -8,6 +9,15 @@ import { createCapturedOutputBuffer, parseJsonResponseWithLimit } from "./dev-ru
 import { shouldTrackDevServerPath } from "./dev-runner-paths.mjs";
 import { createDevServiceIdentity, repoRoot } from "./dev-service-profile.ts";
 import { bootstrapDevRunnerWorktreeEnv } from "../server/src/dev-runner-worktree.ts";
+
+// Load user-local env first so shell overrides take precedence, then load
+// .env.local (user overrides) which are never committed. Shell env vars are
+// already in process.env at this point — loadDotenv with override=false leaves
+// them untouched.
+const envLocalPath = path.join(repoRoot, ".env.local");
+if (existsSync(envLocalPath)) {
+  loadDotenv({ path: envLocalPath, override: false, quiet: true });
+}
 import {
   findAdoptableLocalService,
   removeLocalServiceRegistryRecord,

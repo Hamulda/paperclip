@@ -172,7 +172,7 @@ export async function buildSwarmDigest(
   const { companyId, projectId, currentRunId = null, currentAgentId = null } = input;
 
   if (!companyId) {
-    return buildEmptyDigest(companyId, projectId);
+    return buildEmptyDigest(companyId, projectId) as SwarmDigest & { reviewQueue: SwarmDigestReviewQueue; collaborationHints: SwarmDigestCollaborationHint[] };
   }
 
   const now = new Date();
@@ -753,7 +753,6 @@ export async function buildSwarmDigest(
 
     for (const [source, field] of [
       ["issue_description", { description: issue.description }] as const,
-      ["issue_labels", { labels: issue.labels as string[] | undefined }] as const,
       ["issue_title", { description: issue.title }] as const,
     ] as const) {
       const claims = extractClaimPathsFromIssue(field);
@@ -801,7 +800,7 @@ export async function buildSwarmDigest(
       recentHandoffs,
       fileClaimConflicts,
     } as SwarmDigest),
-  };
+  } as SwarmDigest & { reviewQueue: SwarmDigestReviewQueue; collaborationHints: SwarmDigestCollaborationHint[] };
 }
 
 export function formatSwarmDigestForPrompt(digest: SwarmDigest & { collaborationHints?: SwarmDigestCollaborationHint[] }): string {

@@ -414,6 +414,13 @@
       "when": 1776807484472,
       "tag": "0058_swarm_file_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1776892800000,
+      "tag": "0059_swarm_heartbeat_index",
+      "breakpoints": true
     }
   ]
 }
