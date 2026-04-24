@@ -1912,6 +1912,27 @@ export function heartbeatService(db: Db) {
       return;
     }
 
+    // Guard: process adapter requires config.command — fail fast with a clear error instead of
+    // letting the adapter throw "Process adapter missing command" as an internal error.
+    if (agent.adapterType === "process") {
+      const config = parseObject(agent.adapterConfig);
+      if (!config["command"] || typeof config["command"] !== "string" || !config["command"].trim()) {
+        logger.warn({ agentId: agent.id, runId }, "heartbeat run cancelled: process agent is missing config.command");
+        await setRunStatus(runId, "failed", {
+          error: "Agent adapterConfig is missing required field: config.command (process adapter)",
+          errorCode: "invalid_agent_config",
+          finishedAt: new Date(),
+        });
+        await setWakeupStatus(run.wakeupRequestId, "failed", {
+          finishedAt: new Date(),
+          error: "Agent adapterConfig is missing required field: config.command (process adapter)",
+        });
+        const cancelledRun = await getRun(runId);
+        if (cancelledRun) await releaseIssueExecutionAndPromote(cancelledRun);
+        return;
+      }
+    }
+
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
